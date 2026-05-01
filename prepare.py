@@ -276,6 +276,11 @@ class MP3SliceDataset(Dataset):
         with open(json_file_path, "r") as f:
             metadata: list[dict[str, Any]] = json.load(f)
 
+        for dp in metadata:
+            dp["track_path"] = os.path.expanduser(dp["track_path"])
+            if dp.get("slice_file_path"):
+                dp["slice_file_path"] = os.path.expanduser(dp["slice_file_path"])
+
         if not use_preloaded:
             for slice_data_point in metadata:
                 loaded_data.append(DataPoint(**{**slice_data_point, "slice": None}))  # type: ignore
@@ -383,11 +388,11 @@ class SplitDatasetModule(L.LightningDataModule):
 
 def build_data_module(learning_params: LearningParameters) -> SplitDatasetModule:
     dataset = MP3SliceDataset(
-        data_path="data/tracks",
+        data_path=os.path.expanduser("~/.cache/infected_pbm/tracks"),
         sample_rate=44100,
         slice_length=32768,
         device="cpu",
-        processed_path="data/slices",
+        processed_path=os.path.expanduser("~/.cache/infected_pbm/slices"),
         save_processed=True,
         use_preloaded=False,
     )
