@@ -2094,8 +2094,6 @@ def main() -> None:
     module = build_module(
         learning_params, loss_aggregator, optimizer_cfg, scheduler_cfg
     )
-    if torch.cuda.is_available():
-        module = module.to("cuda")
 
     print("Starting training...")
     trainer.fit(module, data_module)
