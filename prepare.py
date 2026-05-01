@@ -146,6 +146,7 @@ class MP3SliceDataset(Dataset):
         self._data_path = data_path
         self._slice_length = slice_length
         self._device = device
+        self._file_cache: dict[str, torch.Tensor] = {}
 
         if processed_path and os.path.exists(processed_path):
             logger.info(f"Loading processed data from {processed_path}...")
@@ -303,8 +304,10 @@ class MP3SliceDataset(Dataset):
             assert (
                 data_point.slice_file_path is not None
             ), f"Missing sample for sample {index}: {data_point.slice_idx}"
-            slices = torch.load(data_point.slice_file_path, mmap=True)
-            slice_tensor = slices[data_point.slice_idx].clone()
+            fp = data_point.slice_file_path
+            if fp not in self._file_cache:
+                self._file_cache[fp] = torch.load(fp, mmap=True)
+            slice_tensor = self._file_cache[fp][data_point.slice_idx].clone()
         else:
             slice_tensor = data_point.slice
         return {**data_point.get_metadata(), "slice": slice_tensor.to(self._device)}
