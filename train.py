@@ -626,7 +626,7 @@ class VQCodeBookFunc(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             grad_input = grad_outputs
         if ctx.needs_input_grad[1]:
-            embedding_weights, indices = ctx.saved_variables
+            embedding_weights, indices = ctx.saved_tensors
             grad_emb = torch.zeros_like(embedding_weights)
             for batch_idx, batch in enumerate(indices.flatten(start_dim=1)):
                 running_idx = 0
@@ -1805,7 +1805,7 @@ def build_learning_params() -> LearningParameters:
         val_split=0.04,
         test_split=0.01,
         devices="auto",
-        num_workers=min(8, os.cpu_count() or 1),
+        num_workers=8,
         loss_monitor="validation/total loss",
         trigger_loss=1e-8,
         interval="step",
@@ -2076,7 +2076,7 @@ def build_module(
 
 
 def main() -> None:
-    torch.autograd.set_detect_anomaly(True)
+    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
     torch.set_float32_matmul_precision("high")
 
     learning_params = build_learning_params()

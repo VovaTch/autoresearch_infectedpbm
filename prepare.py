@@ -108,7 +108,7 @@ class SimpleMelSpecConverter(MelSpecConverter):
 @dataclass
 class DataPoint:
     _id: int
-    slice: torch.Tensor
+    slice: torch.Tensor | None
     slice_file_path: str | None
     track_path: str
     track_idx: int
@@ -139,6 +139,7 @@ class MP3SliceDataset(Dataset):
         device: str = "cpu",
         processed_path: str | None = None,
         save_processed: bool = False,
+        use_preloaded: bool = False,
     ) -> None:
         super().__init__()
         self._sample_rate = sample_rate
@@ -148,7 +149,7 @@ class MP3SliceDataset(Dataset):
 
         if processed_path and os.path.exists(processed_path):
             logger.info(f"Loading processed data from {processed_path}...")
-            self.buffer = self._load_data(processed_path)
+            self.buffer = self._load_data(processed_path, use_preloaded)
             logger.info("Loaded processed data")
             return
 
@@ -263,16 +264,22 @@ class MP3SliceDataset(Dataset):
                 extracted_data_points, key=lambda x: x.slice_idx
             )
             aggregate_slices = torch.stack(
-                [dp.slice for dp in sorted_data_points], dim=0
+                [dp.slice for dp in sorted_data_points], dim=0  # type: ignore
             )
             if slice_file is not None:
                 torch.save(aggregate_slices, slice_file)
 
-    def _load_data(self, path: str) -> list[DataPoint]:
+    def _load_data(self, path: str, use_preloaded: bool = True) -> list[DataPoint]:
         loaded_data = []
         json_file_path = os.path.join(path, "_metadata.json")
         with open(json_file_path, "r") as f:
             metadata: list[dict[str, Any]] = json.load(f)
+
+        if not use_preloaded:
+            for slice_data_point in metadata:
+                loaded_data.append(DataPoint(**{**slice_data_point, "slice": None}))  # type: ignore
+            logger.info("Parsed metadata to the buffer (lazy mode)")
+            return loaded_data
 
         slice_files: list[str] = list(
             sorted({dp["slice_file_path"] for dp in metadata})
@@ -284,8 +291,7 @@ class MP3SliceDataset(Dataset):
             )
             slice_metadata = sorted(slice_metadata, key=lambda x: x["slice_idx"])
             for idx, slice_data_point in enumerate(slice_metadata):
-                chopped_slice = loaded_slice[idx, ...]
-                new_data_point = DataPoint(**{**slice_data_point, "slice": chopped_slice})  # type: ignore
+                new_data_point = DataPoint(**{**slice_data_point, "slice": loaded_slice[idx, ...]})  # type: ignore
                 loaded_data.append(new_data_point)
 
         logger.info("Parsed metadata and the slices to the buffer")
@@ -293,7 +299,15 @@ class MP3SliceDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         data_point = self.buffer[index]
-        return {**data_point.get_metadata(), "slice": data_point.slice.to(self._device)}
+        if data_point.slice is None:
+            assert (
+                data_point.slice_file_path is not None
+            ), f"Missing sample for sample {index}: {data_point.slice_idx}"
+            slices = torch.load(data_point.slice_file_path, mmap=True)
+            slice_tensor = slices[data_point.slice_idx].clone()
+        else:
+            slice_tensor = data_point.slice
+        return {**data_point.get_metadata(), "slice": slice_tensor.to(self._device)}
 
     def __len__(self) -> int:
         return len(self.buffer)
@@ -372,5 +386,6 @@ def build_data_module(learning_params: LearningParameters) -> SplitDatasetModule
         device="cpu",
         processed_path="data/slices",
         save_processed=True,
+        use_preloaded=False,
     )
     return SplitDatasetModule(learning_params=learning_params, dataset=dataset)
