@@ -2021,7 +2021,7 @@ def build_discriminator() -> EnsembleDiscriminator:
         )
 
     disc1 = MelSpecDiscriminator(
-        channel_list=[2, 4, 8, 16, 32],
+        channel_list=[4, 8, 16, 32, 64],
         stride=2,
         kernel_size=3,
         activation_fn=nn.GELU(),
@@ -2029,7 +2029,7 @@ def build_discriminator() -> EnsembleDiscriminator:
         mel_spec_converter=make_mel_conv(1024, 256, 128, 1.0),
     )
     disc2 = MelSpecDiscriminator(
-        channel_list=[2, 4, 8, 16, 32],
+        channel_list=[4, 8, 16, 32, 64],
         stride=2,
         kernel_size=3,
         activation_fn=nn.GELU(),
@@ -2037,7 +2037,7 @@ def build_discriminator() -> EnsembleDiscriminator:
         mel_spec_converter=make_mel_conv(2048, 512, 256, 1.0),
     )
     disc3 = MelSpecDiscriminator(
-        channel_list=[2, 4, 8, 16, 32],
+        channel_list=[4, 8, 16, 32, 64],
         stride=2,
         kernel_size=3,
         activation_fn=nn.GELU(),
