@@ -1726,7 +1726,7 @@ class VqganMusicLightningModule(MusicLightningModule):
         disc_loss = self._discriminator_loss(disc_outputs, {})
         if phase == "training" and self._current_step >= self._generator_start_step:
             self.manual_backward(disc_loss * self._discriminator_loss.weight)
-            self.clip_gradients(optimizer_d, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+            self.clip_gradients(optimizer_d, gradient_clip_val=2.0, gradient_clip_algorithm="norm")
             optimizer_d.step()
             optimizer_d.zero_grad()
         self.log(
@@ -1790,7 +1790,7 @@ class VqganMusicLightningModule(MusicLightningModule):
             self.log("d_weight", 0, sync_dist=True)
             self.manual_backward(loss.total)
 
-        self.clip_gradients(optimizer_g, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+        self.clip_gradients(optimizer_g, gradient_clip_val=2.0, gradient_clip_algorithm="norm")
         optimizer_g.step()
         optimizer_g.zero_grad()
         if scheduler_g is not None and phase == "training":
