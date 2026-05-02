@@ -2099,6 +2099,7 @@ def build_module(
 def main() -> None:
     torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
     torch.set_float32_matmul_precision("high")
+    L.seed_everything(42, workers=True)
 
     learning_params = build_learning_params()
     optimizer_cfg = build_optimizer_cfg()
