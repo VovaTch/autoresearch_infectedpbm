@@ -27,6 +27,7 @@ from lightning.pytorch.callbacks import (
     LearningRateMonitor,
     ModelCheckpoint,
     ModelSummary,
+    Timer,
 )
 from lightning.pytorch.loggers import Logger, TensorBoardLogger
 from lightning.pytorch.utilities.exceptions import MisconfigurationException
@@ -366,6 +367,7 @@ def get_trainer(learning_parameters: LearningParameters) -> L.Trainer:
 
     precision = 16 if learning_parameters.amp else 32
     model_summary = ModelSummary(max_depth=2)
+    timer = Timer(duration={"minutes": 15})
 
     trainer = L.Trainer(
         gradient_clip_val=learning_parameters.gradient_clip,
@@ -376,6 +378,7 @@ def get_trainer(learning_parameters: LearningParameters) -> L.Trainer:
             model_summary,
             learning_rate_monitor,
             ema,
+            timer,
         ],
         strategy="ddp_find_unused_parameters_true",
         devices=devices,
@@ -2100,8 +2103,13 @@ def main() -> None:
     print("Training complete.")
 
     print("\nRunning test evaluation...")
-    trainer.test(module, data_module)
+    results = trainer.test(module, data_module)
     print("Test complete. Results printed above.")
+
+    total = results[0].get("test/total", 0.0) if results else 0.0
+    peak_vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024) if torch.cuda.is_available() else 0.0
+    print(f"total: {total:.6f}")
+    print(f"peak_vram_mb: {peak_vram_mb:.0f}")
 
 
 if __name__ == "__main__":
