@@ -1804,7 +1804,7 @@ def build_learning_params() -> LearningParameters:
         grad_accumulation=1,
         epochs=2,
         beta_ema=0.99,
-        gradient_clip=None,
+        gradient_clip=1.0,
         save_path="saved/",
         amp=False,
         val_split=0.04,
