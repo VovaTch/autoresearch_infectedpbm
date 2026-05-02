@@ -39,6 +39,8 @@ from prepare import (
     MelSpecParameters,
     SimpleMelSpecConverter,
     build_data_module,
+    cdpam_distance,
+    make_cdpam_evaluator,
 )
 
 # ===========================================================================
@@ -1496,6 +1498,18 @@ class BaseLightningModule(L.LightningModule):
             sync_dist=True,
             batch_size=self.learning_params.batch_size,
         )
+        if not hasattr(self, "_cdpam_fn"):
+            self._cdpam_fn = make_cdpam_evaluator(str(self.device))
+        cdpam_score = cdpam_distance(self._cdpam_fn, output["slice"].detach(), batch["slice"])
+        self.log(
+            "test/cdpam",
+            cdpam_score,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=self.learning_params.batch_size,
+        )
 
     @abstractmethod
     def step(self, batch, phase) -> torch.Tensor | None: ...
@@ -2110,9 +2124,9 @@ def main() -> None:
     results = trainer.test(module, data_module)
     print("Test complete. Results printed above.")
 
-    total = results[0].get("test/total", 0.0) if results else 0.0
+    cdpam_val = results[0].get("test/cdpam", 0.0) if results else 0.0
     peak_vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024) if torch.cuda.is_available() else 0.0
-    print(f"total: {total:.6f}")
+    print(f"cdpam: {cdpam_val:.6f}")
     print(f"peak_vram_mb: {peak_vram_mb:.0f}")
 
 

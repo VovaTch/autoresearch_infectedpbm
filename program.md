@@ -47,6 +47,7 @@ Once the script finishes it prints a summary like this:
        Test metric             DataLoader 0
    test/alignment_loss       15.3800048828125
   test/commitment_loss       15.3800048828125
+      test/cdpam            0.1234567890123456
       test/edge_rec         0.4438638389110565
    test/melspec_loss_1      0.2734729051589966
    test/melspec_loss_2      0.21718014776706696
@@ -58,11 +59,11 @@ Once the script finishes it prints a summary like this:
        test/total            24.59703826904297
 ```
 
-Note that the script is configured to always stop after 15 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+The key metric is `test/cdpam` — a perceptual audio distance (lower = better reconstruction). Note that the script is configured to always stop after 15 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
 
 ```
 
-grep "total:" run.log
+grep "cdpam:" run.log
 
 ```
 
@@ -74,12 +75,12 @@ The TSV has a header row and 5 columns:
 
 ```
 
-commit total memory_gb status description
+commit cdpam memory_gb status description
 
 ```
 
 1. git commit hash (short, 7 chars)
-2. total achieved (e.g. 1.234567) — use 0.000000 for crashes
+2. cdpam achieved (e.g. 0.123456) — use 0.000000 for crashes
 3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
 4. status: `keep`, `discard`, or `crash`
 5. short text description of what this experiment tried
@@ -88,10 +89,10 @@ Example:
 
 ```
 
-commit total memory_gb status description
-a1b2c3d 0.997900 44.0 keep baseline
-b2c3d4e 0.993200 44.2 keep increase LR to 0.04
-c3d4e5f 1.005000 44.0 discard switch to GeLU activation
+commit cdpam memory_gb status description
+a1b2c3d 0.123456 44.0 keep baseline
+b2c3d4e 0.119200 44.2 keep increase LR to 0.04
+c3d4e5f 0.131000 44.0 discard switch to GeLU activation
 d4e5f6g 0.000000 0.0 crash double model width (OOM)
 
 ```
@@ -106,11 +107,11 @@ LOOP FOREVER:
 2. Tune `train.py` with an experimental idea by directly hacking the code.
 3. git commit
 4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^total:\|^peak_vram_mb:" run.log`
+5. Read out the results: `grep "^cdpam:\|^peak_vram_mb:" run.log`
 6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
 7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If total improved (lower), you "advance" the branch, keeping the git commit
-9. If total is equal or worse, you git reset back to where you started
+8. If cdpam improved (lower), you "advance" the branch, keeping the git commit
+9. If cdpam is equal or worse, you git reset back to where you started
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 

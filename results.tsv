@@ -1,0 +1,8 @@
+commit	total	memory_gb	status	description
+9767612	15.070635	2.4	keep	baseline
+1e9d7e6	8.141500	2.4	keep	L2-normalize encoder output and codebook
+56cfd48	8.423319	4.2	discard	LSTM hidden 64->256 batch 16->32 (fewer steps hurt)
+7403259	9.791394	2.5	discard	CosineAnnealingLR + disc start 300 (worse)
+3f3837c	9.372637	2.1	discard	skip disc pre-warmup (disc BN stats not warmed up)
+1898458	0.000000	1.9	crash	AMP fp16 NaN overflow
+7742479	8.742042	2.5	discard	LR 3e-4 (worse)

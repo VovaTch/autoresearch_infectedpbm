@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 import lightning as L
 from lightning.pytorch.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
 
+import cdpam as _cdpam_lib
 import tqdm
 
 logging.basicConfig(
@@ -384,6 +385,27 @@ class SplitDatasetModule(L.LightningDataModule):
 # ---------------------------------------------------------------------------
 # Build data module from hardcoded lvl1_vqgan config
 # ---------------------------------------------------------------------------
+
+
+CDPAM_SAMPLE_RATE = 22050
+
+
+def make_cdpam_evaluator(device: str = "cpu") -> _cdpam_lib.CDPAM:
+    return _cdpam_lib.CDPAM(dev=device)
+
+
+def cdpam_distance(
+    evaluator: _cdpam_lib.CDPAM,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    src_sr: int = 44100,
+) -> torch.Tensor:
+    """Compute mean CDPAM perceptual distance. pred/target: [B, 1, L] at src_sr."""
+    resampler = torchaudio.transforms.Resample(src_sr, CDPAM_SAMPLE_RATE)
+    pred_r = resampler(pred.cpu().float()).squeeze(1) * 32768.0
+    target_r = resampler(target.cpu().float()).squeeze(1) * 32768.0
+    with torch.no_grad():
+        return evaluator.forward(target_r, pred_r).mean()  # type: ignore[union-attr]
 
 
 def build_data_module(learning_params: LearningParameters) -> SplitDatasetModule:

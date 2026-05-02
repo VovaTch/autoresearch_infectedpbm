@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "cdpam>=0.0.6",
     "gdown>=6.0.0",
     "ipython>=9.13.0",
     "lightning>=2.6.1",
