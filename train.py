@@ -676,12 +676,13 @@ class VQCodeBook(CodeBook):
         self.register_buffer("usage", torch.ones(self.num_tokens), persistent=False)
 
     def embed_codebook(self, indices: torch.Tensor) -> torch.Tensor:
-        return self.code_embedding[indices]
+        return F.normalize(self.code_embedding[indices], dim=-1)
 
     def apply_codebook(self, x_in: torch.Tensor, code_sg: bool = False):
-        embedding_weights = self.code_embedding.transpose(0, 1).contiguous()
+        x_in_norm = F.normalize(x_in, dim=1)
+        embedding_weights = F.normalize(self.code_embedding, dim=-1).transpose(0, 1).contiguous()
         z_q, indices = vq_code_book_select(
-            x_in, embedding_weights.detach() if code_sg else embedding_weights
+            x_in_norm, embedding_weights.detach() if code_sg else embedding_weights
         )  # type: ignore
         self.update_usage(indices)
         return z_q.unsqueeze(1), indices
@@ -1206,7 +1207,8 @@ class MultiLvlVQVariationalAutoEncoder(Tokenizer):
             .permute((0, 2, 1))
             .contiguous()
         )
-        return self.encoder(x_reshaped.float())
+        z_e = self.encoder(x_reshaped.float())
+        return F.normalize(z_e, dim=1)
 
     def tokenize(self, x: torch.Tensor) -> torch.Tensor:
         z_e = self.encode(x)
