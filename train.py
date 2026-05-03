@@ -1962,7 +1962,7 @@ def build_encoder() -> EncoderConv2D:
     return EncoderConv2D(
         channel_list=[2, 32, 64, 128, 256, 512, 768],
         dim_change_list=[2, 2, 2, 2, 2, 2],
-        kernel_size=3,
+        kernel_size=5,
         num_res_block_conv=3,
         dilation_factor=2,
         n_fft=512,
@@ -1976,7 +1976,7 @@ def build_decoder() -> StftDecoder2D:
     return StftDecoder2D(
         channel_list=[768, 768, 512, 256],
         dim_change_list=[2, 2, 2],
-        kernel_size=3,
+        kernel_size=5,
         dim_add_kernel_add=0,
         num_res_block_conv=2,
         activation_fn=nn.GELU(),
