@@ -1960,7 +1960,7 @@ def build_loss_aggregator() -> WeightedSumAggregator:
 
 def build_encoder() -> EncoderConv2D:
     return EncoderConv2D(
-        channel_list=[2, 32, 64, 128, 256, 512, 768],
+        channel_list=[2, 32, 64, 128, 256, 384, 512],
         dim_change_list=[2, 2, 2, 2, 2, 2],
         kernel_size=5,
         num_res_block_conv=3,
@@ -1974,7 +1974,7 @@ def build_encoder() -> EncoderConv2D:
 
 def build_decoder() -> StftDecoder2D:
     return StftDecoder2D(
-        channel_list=[768, 768, 512, 256],
+        channel_list=[512, 512, 384, 256],
         dim_change_list=[2, 2, 2],
         kernel_size=5,
         dim_add_kernel_add=0,
@@ -1989,7 +1989,7 @@ def build_decoder() -> StftDecoder2D:
 
 
 def build_vq_module() -> VQ1D:
-    return VQ1D(token_dim=768, num_tokens=2048, num_rq_steps=1)
+    return VQ1D(token_dim=512, num_tokens=2048, num_rq_steps=1)
 
 
 def build_generator(
