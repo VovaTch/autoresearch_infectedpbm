@@ -682,7 +682,9 @@ class VQCodeBook(CodeBook):
 
     def apply_codebook(self, x_in: torch.Tensor, code_sg: bool = False):
         x_in_norm = F.normalize(x_in, dim=1)
-        embedding_weights = F.normalize(self.code_embedding, dim=-1).transpose(0, 1).contiguous()
+        embedding_weights = (
+            F.normalize(self.code_embedding, dim=-1).transpose(0, 1).contiguous()
+        )
         z_q, indices = vq_code_book_select(
             x_in_norm, embedding_weights.detach() if code_sg else embedding_weights
         )  # type: ignore
@@ -1500,7 +1502,9 @@ class BaseLightningModule(L.LightningModule):
         )
         if not hasattr(self, "_cdpam_fn"):
             self._cdpam_fn = make_cdpam_evaluator(str(self.device))
-        cdpam_score = cdpam_distance(self._cdpam_fn, output["slice"].detach(), batch["slice"])
+        cdpam_score = cdpam_distance(
+            self._cdpam_fn, output["slice"].detach(), batch["slice"]
+        )
         self.log(
             "test/cdpam",
             cdpam_score,
@@ -1726,7 +1730,9 @@ class VqganMusicLightningModule(MusicLightningModule):
         disc_loss = self._discriminator_loss(disc_outputs, {})
         if phase == "training" and self._current_step >= self._generator_start_step:
             self.manual_backward(disc_loss * self._discriminator_loss.weight)
-            self.clip_gradients(optimizer_d, gradient_clip_val=2.0, gradient_clip_algorithm="norm")
+            self.clip_gradients(
+                optimizer_d, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+            )
             optimizer_d.step()
             optimizer_d.zero_grad()
         self.log(
@@ -1790,7 +1796,9 @@ class VqganMusicLightningModule(MusicLightningModule):
             self.log("d_weight", 0, sync_dist=True)
             self.manual_backward(loss.total)
 
-        self.clip_gradients(optimizer_g, gradient_clip_val=2.0, gradient_clip_algorithm="norm")
+        self.clip_gradients(
+            optimizer_g, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+        )
         optimizer_g.step()
         optimizer_g.zero_grad()
         if scheduler_g is not None and phase == "training":
@@ -1925,7 +1933,7 @@ def build_loss_aggregator() -> WeightedSumAggregator:
         ),
         MelSpecLoss(
             name="melspec_loss_4",
-            weight=5.0,
+            weight=10.0,
             pred_key="slice",
             ref_key="slice",
             base_loss=nn.L1Loss(),
@@ -2126,7 +2134,11 @@ def main() -> None:
     print("Test complete. Results printed above.")
 
     cdpam_val = results[0].get("test/cdpam", 0.0) if results else 0.0
-    peak_vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024) if torch.cuda.is_available() else 0.0
+    peak_vram_mb = (
+        torch.cuda.max_memory_allocated() / (1024 * 1024)
+        if torch.cuda.is_available()
+        else 0.0
+    )
     print(f"cdpam: {cdpam_val:.6f}")
     print(f"peak_vram_mb: {peak_vram_mb:.0f}")
 

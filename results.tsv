@@ -1,0 +1,12 @@
+commit	cdpam	memory_gb	status	description
+9767612	15.070635	2.4	(old-total)	baseline
+1e9d7e6	8.141500	2.4	(old-total)	L2-normalize encoder output and codebook
+56cfd48	8.423319	4.2	(old-total)	LSTM hidden 64->256 batch 16->32 (fewer steps hurt)
+7403259	9.791394	2.5	(old-total)	CosineAnnealingLR + disc start 300 (worse)
+3f3837c	9.372637	2.1	(old-total)	skip disc pre-warmup (disc BN stats not warmed up)
+1898458	0.000000	1.9	(old-total)	AMP fp16 NaN overflow
+7742479	8.742042	2.5	(old-total)	LR 3e-4 (worse)
+3e02cfe	0.469916	2.4	keep	CDPAM baseline (new metric)
+817dd70	0.519039	2.4	discard	reduce alignment/commitment weight 0.5->0.1 (worse)
+099a8a6	0.362919	1.7	keep	batch_size 16->8 (2x more steps, big improvement)
+980a51b	0.498490	1.7	discard	codebook 2048->4096 (needs more time to converge)
