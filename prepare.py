@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 # Containers
 # ---------------------------------------------------------------------------
 
+SLICE_DATASET_SIZE = 128
+
 
 @dataclass
 class LearningParameters:
@@ -141,6 +143,7 @@ class MP3SliceDataset(Dataset):
         processed_path: str | None = None,
         save_processed: bool = False,
         use_preloaded: bool = False,
+        slice_dataset_size: int = 0,
     ) -> None:
         super().__init__()
         self._sample_rate = sample_rate
@@ -163,6 +166,8 @@ class MP3SliceDataset(Dataset):
             os.makedirs(processed_path, exist_ok=True)
             self._dump_data(processed_path)
             logger.info(f"Saved processed data to {processed_path}")
+
+        self._slice_dataset_size = slice_dataset_size
 
     def _generate_data(
         self, data_path: str, processed_path: str | None
@@ -319,7 +324,10 @@ class MP3SliceDataset(Dataset):
         return {**data_point.get_metadata(), "slice": slice_tensor.to(self._device)}
 
     def __len__(self) -> int:
-        return len(self.buffer)
+        if self._slice_dataset_size == 0:
+            return len(self.buffer)
+        else:
+            return min(len(self.buffer), self._slice_dataset_size)
 
 
 # ---------------------------------------------------------------------------
@@ -417,5 +425,6 @@ def build_data_module(learning_params: LearningParameters) -> SplitDatasetModule
         processed_path=os.path.expanduser("~/.cache/infected_pbm/slices"),
         save_processed=True,
         use_preloaded=False,
+        slice_dataset_size=SLICE_DATASET_SIZE,
     )
     return SplitDatasetModule(learning_params=learning_params, dataset=dataset)
