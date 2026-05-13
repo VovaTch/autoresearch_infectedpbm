@@ -1988,7 +1988,7 @@ def build_decoder() -> StftDecoder2D:
         dim_add_kernel_add=0,
         num_res_block_conv=2,
         activation_fn=nn.GELU(),
-        dropout=0.1,
+        dropout=0.2,
         dilation_factor=2,
         n_fft=1024,
         hop_length=256,
