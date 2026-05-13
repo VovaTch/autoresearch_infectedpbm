@@ -30,8 +30,8 @@ from lightning.pytorch.callbacks import (
     Timer,
 )
 from lightning.pytorch.loggers import Logger, TensorBoardLogger
-from lightning.pytorch.utilities.exceptions import MisconfigurationException
-from lightning.pytorch.utilities.rank_zero import rank_zero_info
+from lightning.fabric.utilities.exceptions import MisconfigurationException
+from lightning_utilities.core.rank_zero import rank_zero_info
 from lightning.pytorch.utilities.types import STEP_OUTPUT, OptimizerLRScheduler
 
 from prepare import (
