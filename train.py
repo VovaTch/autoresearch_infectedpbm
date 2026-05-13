@@ -1968,7 +1968,7 @@ def build_loss_aggregator() -> WeightedSumAggregator:
 
 def build_encoder() -> EncoderConv2D:
     return EncoderConv2D(
-        channel_list=[2, 32, 64, 128, 256, 384, 512],
+        channel_list=[2, 16, 32, 64, 128, 256, 512],
         dim_change_list=[2, 2, 2, 2, 2, 2],
         kernel_size=5,
         num_res_block_conv=3,
