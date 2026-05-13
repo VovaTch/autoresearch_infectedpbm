@@ -19,7 +19,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment on the number of GPUs available to the system, might be 1, might be 2. The training script runs for a **fixed time budget of 15 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`. If it doesn't, modify it to be so.
+Each experiment on the number of GPUs available to the system, might be 1, might be 2. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`. If it doesn't, modify it to be so.
 
 **What you CAN do:**
 
@@ -59,7 +59,7 @@ Once the script finishes it prints a summary like this:
        test/total            24.59703826904297
 ```
 
-The key metric is `test/cdpam` — a perceptual audio distance (lower = better reconstruction). Note that the script is configured to always stop after 15 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+The key metric is `test/cdpam` — a perceptual audio distance (lower = better reconstruction). Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
 
 ```
 
@@ -115,7 +115,7 @@ LOOP FOREVER:
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
-**Timeout**: Each experiment should take ~15 total (+ a few seconds for startup and eval overhead). If a run exceeds 20 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: Each experiment should take ~5 total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 

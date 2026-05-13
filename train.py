@@ -369,7 +369,7 @@ def get_trainer(learning_parameters: LearningParameters) -> L.Trainer:
 
     precision = 16 if learning_parameters.amp else 32
     model_summary = ModelSummary(max_depth=2)
-    timer = Timer(duration={"minutes": 15})
+    timer = Timer(duration={"minutes": 5})
 
     trainer = L.Trainer(
         gradient_clip_val=learning_parameters.gradient_clip,
