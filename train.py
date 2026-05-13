@@ -1826,7 +1826,7 @@ def build_learning_params() -> LearningParameters:
         weight_decay=0.0,
         batch_size=8,
         grad_accumulation=1,
-        epochs=2,
+        epochs=10000,
         beta_ema=0.998,
         gradient_clip=None,
         save_path="saved/",

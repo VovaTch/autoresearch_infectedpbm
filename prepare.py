@@ -151,6 +151,7 @@ class MP3SliceDataset(Dataset):
         self._slice_length = slice_length
         self._device = device
         self._file_cache: dict[str, torch.Tensor] = {}
+        self._slice_dataset_size = slice_dataset_size
 
         if processed_path and os.path.exists(processed_path):
             logger.info(f"Loading processed data from {processed_path}...")
@@ -166,8 +167,6 @@ class MP3SliceDataset(Dataset):
             os.makedirs(processed_path, exist_ok=True)
             self._dump_data(processed_path)
             logger.info(f"Saved processed data to {processed_path}")
-
-        self._slice_dataset_size = slice_dataset_size
 
     def _generate_data(
         self, data_path: str, processed_path: str | None
