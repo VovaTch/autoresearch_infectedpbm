@@ -1912,7 +1912,7 @@ def build_loss_aggregator() -> WeightedSumAggregator:
         ),
         MelSpecLoss(
             name="melspec_loss_2",
-            weight=1.0,
+            weight=2.0,
             pred_key="slice",
             ref_key="slice",
             base_loss=nn.L1Loss(),
