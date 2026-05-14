@@ -1898,8 +1898,8 @@ def build_loss_aggregator() -> WeightedSumAggregator:
             edge_power=3.0,
             base_loss=nn.MSELoss(),
         ),
-        AlignLoss(name="alignment_loss", weight=0.5, base_loss=nn.MSELoss()),
-        CommitLoss(name="commitment_loss", weight=0.5, base_loss=nn.MSELoss()),
+        AlignLoss(name="alignment_loss", weight=0.75, base_loss=nn.MSELoss()),
+        CommitLoss(name="commitment_loss", weight=0.75, base_loss=nn.MSELoss()),
         MelSpecLoss(
             name="melspec_loss_1",
             weight=1.0,
