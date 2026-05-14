@@ -1986,7 +1986,7 @@ def build_decoder() -> StftDecoder2D:
         dim_change_list=[2, 2, 2],
         kernel_size=5,
         dim_add_kernel_add=0,
-        num_res_block_conv=2,
+        num_res_block_conv=1,
         activation_fn=nn.GELU(),
         dropout=0.2,
         dilation_factor=2,
