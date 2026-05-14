@@ -1916,8 +1916,8 @@ def build_loss_aggregator() -> WeightedSumAggregator:
             pred_key="slice",
             ref_key="slice",
             base_loss=nn.L1Loss(),
-            lin_start=1.0,
-            lin_end=1.0,
+            lin_start=0.5,
+            lin_end=5.0,
             mel_spec_converter=make_mel_converter(1024, 256, 64, 2.0),
         ),
         MelSpecLoss(
