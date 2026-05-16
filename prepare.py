@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Containers
 # ---------------------------------------------------------------------------
 
-SLICE_DATASET_SIZE = 128
+SLICE_DATASET_SIZE = 0
 
 
 @dataclass

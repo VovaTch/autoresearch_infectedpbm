@@ -6,6 +6,7 @@ Run: python train.py
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import copy
 import importlib
@@ -334,7 +335,9 @@ class EMA(L.Callback):
 # ===========================================================================
 
 
-def get_trainer(learning_parameters: LearningParameters) -> L.Trainer:
+def get_trainer(
+    learning_parameters: LearningParameters, minutes: float = 9 * 60
+) -> L.Trainer:
     if not torch.cuda.is_available():
         warnings.warn("CUDA is not available, using CPU")
         devices = "auto"
@@ -369,7 +372,7 @@ def get_trainer(learning_parameters: LearningParameters) -> L.Trainer:
 
     precision = 16 if learning_parameters.amp else 32
     model_summary = ModelSummary(max_depth=2)
-    timer = Timer(duration={"minutes": 5})
+    timer = Timer(duration={"minutes": minutes})
 
     trainer = L.Trainer(
         gradient_clip_val=learning_parameters.gradient_clip,
@@ -2104,7 +2107,26 @@ def build_module(
 # ===========================================================================
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train lvl1_vqgan.")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from. Default: train from scratch.",
+    )
+    parser.add_argument(
+        "--minutes",
+        type=float,
+        default=5.0,
+        help="Maximum training duration in minutes. Default: 5.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+
     torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
     torch.set_float32_matmul_precision("high")
     L.seed_everything(42, workers=True)
@@ -2118,7 +2140,7 @@ def main() -> None:
     data_module = build_data_module(learning_params)
 
     print("Initializing trainer...")
-    trainer = get_trainer(learning_params)
+    trainer = get_trainer(learning_params, minutes=args.minutes)
 
     print("Initializing module...")
     module = build_module(
@@ -2126,7 +2148,7 @@ def main() -> None:
     )
 
     print("Starting training...")
-    trainer.fit(module, data_module)
+    trainer.fit(module, data_module, ckpt_path=args.checkpoint)
     print("Training complete.")
 
     print("\nRunning test evaluation...")
