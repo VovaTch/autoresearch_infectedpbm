@@ -2000,7 +2000,7 @@ def build_decoder() -> StftDecoder2D:
 
 
 def build_vq_module() -> VQ1D:
-    return VQ1D(token_dim=512, num_tokens=2048, num_rq_steps=1)
+    return VQ1D(token_dim=512, num_tokens=2048, num_rq_steps=2)
 
 
 def build_generator(
@@ -2147,8 +2147,14 @@ def main() -> None:
         learning_params, loss_aggregator, optimizer_cfg, scheduler_cfg
     )
 
+    if args.checkpoint is not None:
+        print(f"Loading model weights from {args.checkpoint}...")
+        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+        module.load_state_dict(state_dict, strict=True)
+
     print("Starting training...")
-    trainer.fit(module, data_module, ckpt_path=args.checkpoint)
+    trainer.fit(module, data_module)
     print("Training complete.")
 
     print("\nRunning test evaluation...")
