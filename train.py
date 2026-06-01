@@ -557,6 +557,56 @@ class MelSpecLoss:
 
 
 @dataclass
+class CDPAMLoss:
+    """Directly optimize the CDPAM perceptual metric (the eval target).
+
+    CDPAM.forward() runs under torch.no_grad(), so we replicate its computation
+    (base_encoder embeddings -> L2 normalize -> dist_model) WITHOUT no_grad to
+    let gradients flow back to the generator. The pretrained CDPAM weights are
+    frozen. Inputs are resampled to 22050 Hz and scaled to int16 range, matching
+    prepare.cdpam_distance.
+    """
+
+    name: str
+    weight: float
+    pred_key: str
+    ref_key: str
+    src_sr: int = 44100
+    cdpam_sr: int = 22050
+    differentiable: bool = True
+    _evaluator: Any = None
+    _resampler: Any = None
+
+    def _ensure(self, device: torch.device) -> None:
+        if self._evaluator is None:
+            import cdpam
+            import torchaudio
+
+            self._evaluator = cdpam.CDPAM(dev=str(device))
+            for p in self._evaluator.model.parameters():
+                p.requires_grad_(False)
+            self._resampler = torchaudio.transforms.Resample(
+                self.src_sr, self.cdpam_sr
+            ).to(device)
+
+    def __call__(self, estimation, target):
+        pred = estimation[self.pred_key]
+        ref = target[self.ref_key]
+        self._ensure(pred.device)
+        # Replicate CDPAM.forward (which uses no_grad): base_encoder -> acoustics
+        # embedding (2nd of 3 returns) -> L2 normalize -> model_dist. Inputs are
+        # [N, L] at 22050 Hz scaled to int16 range; encoder does unsqueeze(1).
+        pred_w = (self._resampler(pred.float()) * 32768.0).reshape(pred.shape[0], -1)
+        ref_w = (self._resampler(ref.float()) * 32768.0).reshape(ref.shape[0], -1)
+        model = self._evaluator.model
+        _, a1, _ = model.base_encoder.forward(ref_w.unsqueeze(1))
+        _, a2, _ = model.base_encoder.forward(pred_w.unsqueeze(1))
+        a1 = F.normalize(a1, dim=1)
+        a2 = F.normalize(a2, dim=1)
+        return model.model_dist.forward(a1, a2).mean()
+
+
+@dataclass
 class DiscriminatorHingeLoss:
     name: str
     weight: float
@@ -1964,6 +2014,12 @@ def build_loss_aggregator() -> WeightedSumAggregator:
             lin_end=1.0,
             transform_func=transparent,
             mel_spec_converter=make_mel_converter(4096, 1024, 256, 1.0),
+        ),
+        CDPAMLoss(
+            name="cdpam",
+            weight=10.0,
+            pred_key="slice",
+            ref_key="slice",
         ),
     ]
     return WeightedSumAggregator(components)
