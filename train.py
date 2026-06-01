@@ -2017,7 +2017,7 @@ def build_loss_aggregator() -> WeightedSumAggregator:
         ),
         CDPAMLoss(
             name="cdpam",
-            weight=10.0,
+            weight=25.0,
             pred_key="slice",
             ref_key="slice",
         ),
