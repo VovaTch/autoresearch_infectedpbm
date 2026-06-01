@@ -599,11 +599,15 @@ class CDPAMLoss:
         pred_w = (self._resampler(pred.float()) * 32768.0).reshape(pred.shape[0], -1)
         ref_w = (self._resampler(ref.float()) * 32768.0).reshape(ref.shape[0], -1)
         model = self._evaluator.model
-        _, a1, _ = model.base_encoder.forward(ref_w.unsqueeze(1))
-        _, a2, _ = model.base_encoder.forward(pred_w.unsqueeze(1))
-        a1 = F.normalize(a1, dim=1)
-        a2 = F.normalize(a2, dim=1)
-        return model.model_dist.forward(a1, a2).mean()
+        # bf16 autocast for the frozen cdpam net: it is Conv1d/BN/relu (no complex
+        # ops), so half precision is safe and ~halves this loss's compute/memory.
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, a1, _ = model.base_encoder.forward(ref_w.unsqueeze(1))
+            _, a2, _ = model.base_encoder.forward(pred_w.unsqueeze(1))
+            a1 = F.normalize(a1, dim=1)
+            a2 = F.normalize(a2, dim=1)
+            dist = model.model_dist.forward(a1, a2).mean()
+        return dist.float()
 
 
 @dataclass
