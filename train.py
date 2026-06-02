@@ -2060,7 +2060,7 @@ def build_decoder() -> StftDecoder2D:
 
 
 def build_vq_module() -> VQ1D:
-    return VQ1D(token_dim=512, num_tokens=2048, num_rq_steps=2)
+    return VQ1D(token_dim=512, num_tokens=2048, num_rq_steps=3)
 
 
 def build_generator(
