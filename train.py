@@ -1757,7 +1757,8 @@ class VqganMusicLightningModule(MusicLightningModule):
         if scheduler_list is not None and len(scheduler_list) > 0:  # type: ignore
             scheduler_d, scheduler_g = scheduler_list  # type: ignore
 
-        self._discriminator_step(batch, phase, optimizer_d, scheduler_d)
+        if self._current_step >= self._generator_start_step or phase != "training":
+            self._discriminator_step(batch, phase, optimizer_d, scheduler_d)
         return self._generator_step(batch, phase, optimizer_g, scheduler_g)
 
     def _close_generator_phase(
@@ -1807,10 +1808,14 @@ class VqganMusicLightningModule(MusicLightningModule):
     ) -> torch.Tensor | None:
         self.toggle_optimizer(optimizer_g)
         restructured_outputs = self.forward(batch)
-        disc_outputs_fake = self.discriminator(restructured_outputs["slice"])
-        restructured_outputs["d_output"] = disc_outputs_fake["logits"]
-        disc_outputs_real = self.discriminator(batch["slice"])
-        restructured_outputs["d_input"] = disc_outputs_real["logits"]
+        gan_active = (
+            self._current_step >= self._generator_start_step or phase != "training"
+        )
+        if gan_active:
+            disc_outputs_fake = self.discriminator(restructured_outputs["slice"])
+            restructured_outputs["d_output"] = disc_outputs_fake["logits"]
+            disc_outputs_real = self.discriminator(batch["slice"])
+            restructured_outputs["d_input"] = disc_outputs_real["logits"]
         targets = {
             "z_e": restructured_outputs["z_e"],
             "slice": batch["slice"],
@@ -1821,7 +1826,9 @@ class VqganMusicLightningModule(MusicLightningModule):
             return None
 
         loss = self.loss_aggregator(restructured_outputs, targets)
-        generator_loss = self._generator_loss(restructured_outputs, {})
+        generator_loss = (
+            self._generator_loss(restructured_outputs, {}) if gan_active else 0
+        )
 
         if phase != "training":
             self._close_generator_phase(
