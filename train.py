@@ -1888,7 +1888,7 @@ def build_learning_params() -> LearningParameters:
         model_name="lvl1_vqgan",
         learning_rate=0.0001,
         weight_decay=0.0,
-        batch_size=16,
+        batch_size=12,
         grad_accumulation=1,
         epochs=10000,
         beta_ema=0.95,
