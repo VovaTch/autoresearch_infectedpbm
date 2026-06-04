@@ -25,6 +25,7 @@ Each experiment on the number of GPUs available to the system, might be 1, might
 
 - Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
 - Modify the losses in train.py. Eventually, I want you to have the most fateful reconstruction of music to the human ear, everything else is fair game.
+- If memory and speed permits, run multiple training runs concurrently, keep in mind that too many processes slows the GPUs even if we don't run out of memory.
 
 **What you CANNOT do:**
 
