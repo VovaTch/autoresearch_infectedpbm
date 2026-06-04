@@ -19,7 +19,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment on the number of GPUs available to the system, might be 1, might be 2. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`. If it doesn't, modify it to be so.
+Each experiment on the number of GPUs available to the system, might be 1, might be 2. The training script runs for a **fixed time budget of 15 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`. If it doesn't, modify it to be so.
 
 **What you CAN do:**
 
@@ -32,7 +32,7 @@ Each experiment on the number of GPUs available to the system, might be 1, might
 - Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
 
-**The goal is to have the most fateful reconstruction of the music to human ear.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything else is up to change in train.py, if need be, construct an evaluation function to evaluate sound reconstruction quality.
+**The goal is to have the most fateful reconstruction of the music to human ear.** Since the time budget is fixed, you don't need to worry about training time — it's always 15 minutes. Everything else is up to change in train.py, if need be, construct an evaluation function to evaluate sound reconstruction quality.
 
 **VRAM** is a soft constraint. Some increase is acceptable for meaningful gains, but it should not blow up dramatically. Do not hesitate to do performance boosting modifications, such as doing torch.compile if it helps.
 
@@ -60,7 +60,7 @@ Once the script finishes it prints a summary like this:
        test/total            24.59703826904297
 ```
 
-The key metric is `test/cdpam` — a perceptual audio distance (lower = better reconstruction). Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+The key metric is `test/cdpam` — a perceptual audio distance (lower = better reconstruction). Note that the script is configured to always stop after 15 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
 
 ```
 
@@ -116,13 +116,13 @@ LOOP FOREVER:
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
-**Timeout**: Each experiment should take ~5 total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: Each experiment should take ~15 total (+ a few seconds for startup and eval overhead). If a run exceeds 25 minutes, kill it and treat it as a failure (discard and revert).
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working _indefinitely_ until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+As an example use case, a user might leave you running while they sleep. If each experiment takes you ~15 minutes then you can run approx 4/hour, for a total of about 30 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
 
 ```
 

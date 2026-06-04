@@ -2161,7 +2161,7 @@ def build_module(
         learning_params=learning_params,
         discriminator_loss=discriminator_loss,
         generator_loss=generator_loss,
-        generator_start_step=2000,
+        generator_start_step=20000,
         loss_aggregator=loss_aggregator,
         optimizer_cfg=optimizer_cfg,
         scheduler_cfg=scheduler_cfg,
@@ -2185,8 +2185,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--minutes",
         type=float,
-        default=5.0,
-        help="Maximum training duration in minutes. Default: 5.",
+        default=15.0,
+        help="Maximum training duration in minutes. Default: 15.",
     )
     return parser.parse_args()
 
