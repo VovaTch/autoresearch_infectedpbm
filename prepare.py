@@ -415,6 +415,111 @@ def cdpam_distance(
         return evaluator.forward(target_r, pred_r).mean()  # type: ignore[union-attr]
 
 
+# ---------------------------------------------------------------------------
+# Additional perceptual metrics (differentiable, torch-only) — used both as
+# eval metrics here and as training losses in train.py. cdpam alone is blind to
+# melody/pitch; these add overall spectral fidelity (multi-res STFT) and a
+# melody-specific term (chroma = pitch-class energy over time).
+# ---------------------------------------------------------------------------
+
+
+def _stft_mag(x: torch.Tensor, n_fft: int, hop: int) -> torch.Tensor:
+    """Magnitude STFT. x: [B,1,L] or [B,L] -> [B, 1+n_fft//2, T]. Differentiable."""
+    if x.dim() == 3:
+        x = x.squeeze(1)
+    window = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
+    spec = torch.stft(
+        x, n_fft=n_fft, hop_length=hop, window=window, return_complex=True
+    )
+    return spec.abs()
+
+
+def multi_res_stft_distance(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    ffts: tuple[int, ...] = (512, 1024, 2048),
+) -> torch.Tensor:
+    """Spectral-convergence + log-magnitude L1 over several FFT sizes (lower=better).
+
+    The neural-vocoder workhorse: captures harmonic + transient fidelity across
+    resolutions. pred/target: [B,1,L] at the same sample rate.
+    """
+    total = pred.new_zeros(())
+    for n_fft in ffts:
+        hop = n_fft // 4
+        mp = _stft_mag(pred, n_fft, hop)
+        mt = _stft_mag(target, n_fft, hop)
+        sc = torch.norm(mt - mp) / (torch.norm(mt) + 1e-7)
+        lm = F.l1_loss(torch.log(mp + 1e-5), torch.log(mt + 1e-5))
+        total = total + sc + lm
+    return total / len(ffts)
+
+
+_CHROMA_FB: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _chroma_filterbank(n_fft: int, sr: int, device: torch.device) -> torch.Tensor:
+    """Cached [12, 1+n_fft//2] pitch-class filterbank (librosa, fixed weights)."""
+    key = (n_fft, sr)
+    if key not in _CHROMA_FB:
+        import librosa
+        import numpy as np
+
+        fb = librosa.filters.chroma(sr=sr, n_fft=n_fft)  # [12, 1+n_fft//2]
+        _CHROMA_FB[key] = torch.tensor(np.ascontiguousarray(fb), dtype=torch.float32)
+    return _CHROMA_FB[key].to(device)
+
+
+def chroma_cosine_distance(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    sr: int = 44100,
+    n_fft: int = 2048,
+) -> torch.Tensor:
+    """1 - mean per-frame cosine similarity of chroma (pitch-class) vectors.
+
+    MELODY/harmony metric: robust to timbre/octave, measures whether the right
+    notes are present over time. Differentiable. pred/target: [B,1,L].
+    """
+    hop = n_fft // 4
+    mp = _stft_mag(pred, n_fft, hop)  # [B,F,T]
+    mt = _stft_mag(target, n_fft, hop)
+    fb = _chroma_filterbank(n_fft, sr, pred.device).to(mp.dtype)  # [12,F]
+    cp = torch.einsum("cf,bft->bct", fb, mp)  # [B,12,T]
+    ct = torch.einsum("cf,bft->bct", fb, mt)
+    cp = F.normalize(cp, dim=1)
+    ct = F.normalize(ct, dim=1)
+    cos = (cp * ct).sum(dim=1)  # [B,T]
+    return 1.0 - cos.mean()
+
+
+# Composite headline weights. cdpam ~0.1-0.3, mrstft ~0.2-0.5, chroma ~0.1-0.5;
+# chroma weighted up to emphasize melody (the current weak spot). Heuristic —
+# tune as listening tests dictate.
+COMPOSITE_WEIGHTS = {"cdpam": 1.0, "mrstft": 1.0, "chroma": 2.0}
+
+
+def perceptual_eval(
+    evaluator: _cdpam_lib.CDPAM,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    src_sr: int = 44100,
+) -> dict[str, float]:
+    """Panel of perceptual metrics + a composite headline (all lower=better).
+
+    pred/target: [B,1,L] at src_sr. Reports cdpam (timbre similarity), mrstft
+    (spectral fidelity), chroma (melody), and a weighted composite so progress
+    can't hide melody loss behind a good cdpam.
+    """
+    with torch.no_grad():
+        cd = float(cdpam_distance(evaluator, pred, target, src_sr).item())
+        mr = float(multi_res_stft_distance(pred, target).item())
+        ch = float(chroma_cosine_distance(pred, target, sr=src_sr).item())
+    w = COMPOSITE_WEIGHTS
+    composite = w["cdpam"] * cd + w["mrstft"] * mr + w["chroma"] * ch
+    return {"cdpam": cd, "mrstft": mr, "chroma": ch, "composite": composite}
+
+
 def build_data_module(learning_params: LearningParameters) -> SplitDatasetModule:
     dataset = MP3SliceDataset(
         data_path=os.path.expanduser("~/.cache/infected_pbm/tracks"),

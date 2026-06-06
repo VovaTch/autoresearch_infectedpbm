@@ -222,3 +222,5 @@ data/
 saved/
 results.tsv
 weights/
+renders/
+saved_*/

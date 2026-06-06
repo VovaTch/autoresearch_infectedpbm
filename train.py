@@ -39,9 +39,12 @@ from prepare import (
     LearningParameters,
     MelSpecParameters,
     SimpleMelSpecConverter,
+    COMPOSITE_WEIGHTS,
     build_data_module,
     cdpam_distance,
+    chroma_cosine_distance,
     make_cdpam_evaluator,
+    multi_res_stft_distance,
 )
 
 # ===========================================================================
@@ -362,6 +365,7 @@ def get_trainer(
         save_weights_only=True,
         save_top_k=1,
         monitor=learning_parameters.loss_monitor,
+        save_last=True,
         enable_version_counter=False,
     )
     early_stopping = EarlyStopping(
@@ -608,6 +612,53 @@ class CDPAMLoss:
             a2 = F.normalize(a2, dim=1)
             dist = model.model_dist.forward(a1, a2).mean()
         return dist.float()
+
+
+@dataclass
+class MultiResSTFTLoss:
+    """Multi-resolution STFT loss (spectral convergence + log-mag L1).
+
+    Overall harmonic + transient fidelity across FFT sizes; the standard
+    neural-vocoder reconstruction loss. Differentiable (torch.stft).
+    """
+
+    name: str
+    weight: float
+    pred_key: str = "slice"
+    ref_key: str = "slice"
+    ffts: tuple[int, ...] = (512, 1024, 2048)
+    differentiable: bool = True
+
+    def __call__(self, estimation, target):
+        return multi_res_stft_distance(
+            estimation[self.pred_key], target[self.ref_key], ffts=self.ffts
+        )
+
+
+@dataclass
+class ChromaLoss:
+    """Chroma (pitch-class) cosine distance — the MELODY/harmony term.
+
+    Maps STFT magnitude to 12 pitch classes via a fixed librosa filterbank and
+    penalizes per-frame cosine mismatch. Robust to timbre/octave; targets the
+    melodic content cdpam is blind to. Differentiable.
+    """
+
+    name: str
+    weight: float
+    pred_key: str = "slice"
+    ref_key: str = "slice"
+    sr: int = 44100
+    n_fft: int = 2048
+    differentiable: bool = True
+
+    def __call__(self, estimation, target):
+        return chroma_cosine_distance(
+            estimation[self.pred_key],
+            target[self.ref_key],
+            sr=self.sr,
+            n_fft=self.n_fft,
+        )
 
 
 @dataclass
@@ -1571,6 +1622,23 @@ class BaseLightningModule(L.LightningModule):
             sync_dist=True,
             batch_size=self.learning_params.batch_size,
         )
+        # Composite headline (lower=better): cdpam (timbre) + mrstft (spectral) +
+        # chroma (melody). mrstft/chroma already logged via loss.individual above.
+        w = COMPOSITE_WEIGHTS
+        composite = (
+            w["cdpam"] * cdpam_score
+            + w["mrstft"] * loss.individual["mrstft"]
+            + w["chroma"] * loss.individual["chroma"]
+        )
+        self.log(
+            "test/composite",
+            composite,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=self.learning_params.batch_size,
+        )
 
     @abstractmethod
     def step(self, batch, phase) -> torch.Tensor | None: ...
@@ -2032,6 +2100,20 @@ def build_loss_aggregator() -> WeightedSumAggregator:
             pred_key="slice",
             ref_key="slice",
         ),
+        # Overall spectral fidelity (rhythm + harmonics). Starting weight; tune.
+        MultiResSTFTLoss(
+            name="mrstft",
+            weight=5.0,
+            pred_key="slice",
+            ref_key="slice",
+        ),
+        # MELODY term — weighted up since pitch is the current weak spot. Tune.
+        ChromaLoss(
+            name="chroma",
+            weight=10.0,
+            pred_key="slice",
+            ref_key="slice",
+        ),
     ]
     return WeightedSumAggregator(components)
 
@@ -2139,6 +2221,7 @@ def build_module(
     loss_aggregator: WeightedSumAggregator,
     optimizer_cfg: dict[str, Any],
     scheduler_cfg: dict[str, Any],
+    gss: int = 20000,
 ) -> VqganMusicLightningModule:
     generator = build_generator(loss_aggregator)
     discriminator = build_discriminator()
@@ -2161,7 +2244,7 @@ def build_module(
         learning_params=learning_params,
         discriminator_loss=discriminator_loss,
         generator_loss=generator_loss,
-        generator_start_step=20000,
+        generator_start_step=gss,
         loss_aggregator=loss_aggregator,
         optimizer_cfg=optimizer_cfg,
         scheduler_cfg=scheduler_cfg,
@@ -2188,6 +2271,26 @@ def parse_args() -> argparse.Namespace:
         default=15.0,
         help="Maximum training duration in minutes. Default: 15.",
     )
+    parser.add_argument(
+        "--gss",
+        type=int,
+        default=20000,
+        help="generator_start_step: step at which the GAN/discriminator engages. "
+        "Set above total steps to disable GAN. Default: 20000.",
+    )
+    parser.add_argument(
+        "--save-path",
+        type=str,
+        default=None,
+        help="Override checkpoint/log save folder. Default: from build_learning_params.",
+    )
+    parser.add_argument(
+        "--single-song",
+        type=str,
+        default=None,
+        help="If set, restrict the dataset to tracks whose path contains this substring "
+        "(single-song overfit experiments).",
+    )
     return parser.parse_args()
 
 
@@ -2199,6 +2302,8 @@ def main() -> None:
     L.seed_everything(42, workers=True)
 
     learning_params = build_learning_params()
+    if args.save_path is not None:
+        learning_params.save_path = args.save_path
     optimizer_cfg = build_optimizer_cfg()
     scheduler_cfg = build_scheduler_cfg()
     loss_aggregator = build_loss_aggregator()
@@ -2206,12 +2311,24 @@ def main() -> None:
     print("Initializing data...")
     data_module = build_data_module(learning_params)
 
+    if args.single_song is not None:
+        dataset = data_module._dataset  # type: ignore[attr-defined]
+        before = len(dataset.buffer)
+        dataset.buffer = [
+            dp for dp in dataset.buffer if args.single_song in dp.track_path
+        ]
+        print(
+            f"single-song filter '{args.single_song}': {before} -> {len(dataset.buffer)} slices"
+        )
+        if len(dataset.buffer) == 0:
+            raise ValueError(f"No tracks matched --single-song '{args.single_song}'")
+
     print("Initializing trainer...")
     trainer = get_trainer(learning_params, minutes=args.minutes)
 
     print("Initializing module...")
     module = build_module(
-        learning_params, loss_aggregator, optimizer_cfg, scheduler_cfg
+        learning_params, loss_aggregator, optimizer_cfg, scheduler_cfg, gss=args.gss
     )
 
     if args.checkpoint is not None:
