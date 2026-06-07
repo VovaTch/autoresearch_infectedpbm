@@ -493,10 +493,45 @@ def chroma_cosine_distance(
     return 1.0 - cos.mean()
 
 
-# Composite headline weights. cdpam ~0.1-0.3, mrstft ~0.2-0.5, chroma ~0.1-0.5;
-# chroma weighted up to emphasize melody (the current weak spot). Heuristic —
-# tune as listening tests dictate.
-COMPOSITE_WEIGHTS = {"cdpam": 1.0, "mrstft": 1.0, "chroma": 2.0}
+def _stft_complex(x: torch.Tensor, n_fft: int, hop: int) -> torch.Tensor:
+    """Complex STFT. x: [B,1,L] or [B,L] -> [B, 1+n_fft//2, T] complex."""
+    if x.dim() == 3:
+        x = x.squeeze(1)
+    window = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
+    return torch.stft(
+        x, n_fft=n_fft, hop_length=hop, window=window, return_complex=True
+    )
+
+
+def phase_distance(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    ffts: tuple[int, ...] = (512, 1024, 2048),
+) -> torch.Tensor:
+    """Magnitude-weighted phase incoherence (lower=better), differentiable.
+
+    For each resolution: cos(phase_pred - phase_target) via the normalized complex
+    inner product, weighted by target magnitude so silent bins are ignored. This
+    isolates PHASE coherence — what melody/pitched content needs and what the
+    magnitude-only mrstft/chroma terms are blind to. pred/target: [B,1,L].
+    """
+    total = pred.new_zeros(())
+    for n_fft in ffts:
+        hop = n_fft // 4
+        sp = _stft_complex(pred, n_fft, hop)
+        st = _stft_complex(target, n_fft, hop)
+        mp = sp.abs()
+        mt = st.abs()
+        cos = (sp.real * st.real + sp.imag * st.imag) / (mp * mt + 1e-7)
+        w = mt / (mt.mean() + 1e-7)  # emphasize energetic (pitched) bins
+        total = total + (w * (1.0 - cos)).mean()
+    return total / len(ffts)
+
+
+# Composite headline weights. cdpam ~0.1-0.3, mrstft ~2.2, chroma ~0.04, phase
+# ~0.5-1.5. chroma weighted up (tiny scale); phase added so the metric can see
+# the melody/pitch coherence the magnitude terms miss. Heuristic — tune by ear.
+COMPOSITE_WEIGHTS = {"cdpam": 1.0, "mrstft": 1.0, "chroma": 2.0, "phase": 1.0}
 
 
 def perceptual_eval(
@@ -515,9 +550,18 @@ def perceptual_eval(
         cd = float(cdpam_distance(evaluator, pred, target, src_sr).item())
         mr = float(multi_res_stft_distance(pred, target).item())
         ch = float(chroma_cosine_distance(pred, target, sr=src_sr).item())
+        ph = float(phase_distance(pred, target).item())
     w = COMPOSITE_WEIGHTS
-    composite = w["cdpam"] * cd + w["mrstft"] * mr + w["chroma"] * ch
-    return {"cdpam": cd, "mrstft": mr, "chroma": ch, "composite": composite}
+    composite = (
+        w["cdpam"] * cd + w["mrstft"] * mr + w["chroma"] * ch + w["phase"] * ph
+    )
+    return {
+        "cdpam": cd,
+        "mrstft": mr,
+        "chroma": ch,
+        "phase": ph,
+        "composite": composite,
+    }
 
 
 def build_data_module(learning_params: LearningParameters) -> SplitDatasetModule:

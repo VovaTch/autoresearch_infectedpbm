@@ -45,6 +45,7 @@ from prepare import (
     chroma_cosine_distance,
     make_cdpam_evaluator,
     multi_res_stft_distance,
+    phase_distance,
 )
 
 # ===========================================================================
@@ -658,6 +659,28 @@ class ChromaLoss:
             target[self.ref_key],
             sr=self.sr,
             n_fft=self.n_fft,
+        )
+
+
+@dataclass
+class PhaseLoss:
+    """Magnitude-weighted multi-resolution phase incoherence.
+
+    Penalizes phase mismatch (cos of phase diff, weighted by target energy)
+    across FFT sizes — the phase coherence that pitched/melodic content needs and
+    that the magnitude-only mrstft/chroma terms are blind to. Differentiable.
+    """
+
+    name: str
+    weight: float
+    pred_key: str = "slice"
+    ref_key: str = "slice"
+    ffts: tuple[int, ...] = (512, 1024, 2048)
+    differentiable: bool = True
+
+    def __call__(self, estimation, target):
+        return phase_distance(
+            estimation[self.pred_key], target[self.ref_key], ffts=self.ffts
         )
 
 
@@ -1629,6 +1652,7 @@ class BaseLightningModule(L.LightningModule):
             w["cdpam"] * cdpam_score
             + w["mrstft"] * loss.individual["mrstft"]
             + w["chroma"] * loss.individual["chroma"]
+            + w["phase"] * loss.individual["phase"]
         )
         self.log(
             "test/composite",
@@ -2111,6 +2135,13 @@ def build_loss_aggregator() -> WeightedSumAggregator:
         ChromaLoss(
             name="chroma",
             weight=10.0,
+            pred_key="slice",
+            ref_key="slice",
+        ),
+        # PHASE coherence (melody/pitch) — what magnitude terms miss. Tune.
+        PhaseLoss(
+            name="phase",
+            weight=5.0,
             pred_key="slice",
             ref_key="slice",
         ),
