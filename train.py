@@ -1727,6 +1727,7 @@ class VqganMusicLightningModule(MusicLightningModule):
         discriminator_loss,
         generator_loss,
         generator_start_step: int = 10000,
+        disc_warmup: int = 0,
         transforms: nn.Sequential | None = None,
         loss_aggregator=None,
         optimizer_cfg: dict[str, Any] | None = None,
@@ -1742,6 +1743,10 @@ class VqganMusicLightningModule(MusicLightningModule):
         )
         self.discriminator = discriminator
         self._generator_start_step = generator_start_step
+        # Disc trains alone for `disc_warmup` steps before generator gets the adversarial
+        # gradient — gives the cold discriminator a head start vs the converged generator.
+        self._disc_warmup = disc_warmup
+        self._adv_start = generator_start_step + disc_warmup
         self.optimizer_d = self._build_optimizer_gan(
             optimizer_cfg, ModelPart.DISCRIMINATOR
         )
@@ -1900,9 +1905,7 @@ class VqganMusicLightningModule(MusicLightningModule):
     ) -> torch.Tensor | None:
         self.toggle_optimizer(optimizer_g)
         restructured_outputs = self.forward(batch)
-        gan_active = (
-            self._current_step >= self._generator_start_step or phase != "training"
-        )
+        gan_active = self._current_step >= self._adv_start or phase != "training"
         if gan_active:
             disc_outputs_fake = self.discriminator(restructured_outputs["slice"])
             restructured_outputs["d_output"] = disc_outputs_fake["logits"]
@@ -1932,7 +1935,7 @@ class VqganMusicLightningModule(MusicLightningModule):
             )
             return loss.total.clone()
 
-        if self._current_step >= self._generator_start_step:
+        if self._current_step >= self._adv_start:
             d_weight = self.calculate_adaptive_weight(
                 loss.total, generator_loss, self.generator.last_layer  # type: ignore
             )
@@ -2138,10 +2141,11 @@ def build_loss_aggregator() -> WeightedSumAggregator:
             pred_key="slice",
             ref_key="slice",
         ),
-        # PHASE coherence (melody/pitch) — what magnitude terms miss. Tune.
+        # PHASE coherence — DIAGNOSTIC ONLY (weight 0). Absolute-phase cos-distance is
+        # ill-posed (time-shift variant), proven ineffective as a loss; GAN handles phase.
         PhaseLoss(
             name="phase",
-            weight=5.0,
+            weight=0.0,
             pred_key="slice",
             ref_key="slice",
         ),
@@ -2195,6 +2199,23 @@ def build_generator(
     )
 
 
+def _spectralize_disc(module: nn.Module) -> nn.Module:
+    """Discriminator hygiene: spectral-norm every conv (1-Lipschitz control, the
+    principled stabilizer) and drop BatchNorm (an anti-pattern in GAN discriminators —
+    leaks batch statistics across real/fake and fights the adversarial signal).
+    Recurses, mutates in place. Applied only to discriminators, never the generator."""
+    from torch.nn.utils.parametrizations import spectral_norm
+
+    for name, child in list(module.named_children()):
+        if isinstance(child, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            setattr(module, name, nn.Identity())
+        elif isinstance(child, (nn.Conv1d, nn.Conv2d)):
+            setattr(module, name, spectral_norm(child))
+        else:
+            _spectralize_disc(child)
+    return module
+
+
 def build_discriminator() -> EnsembleDiscriminator:
     def make_mel_conv(n_fft, hop_length, n_mels, power) -> SimpleMelSpecConverter:
         return SimpleMelSpecConverter(
@@ -2244,7 +2265,9 @@ def build_discriminator() -> EnsembleDiscriminator:
         input_channels=1,
         activation_fn=nn.GELU(),
     )
-    return EnsembleDiscriminator([disc1, disc2, disc3, disc4])
+    return EnsembleDiscriminator(
+        [_spectralize_disc(d) for d in (disc1, disc2, disc3, disc4)]
+    )
 
 
 def build_module(
@@ -2253,6 +2276,7 @@ def build_module(
     optimizer_cfg: dict[str, Any],
     scheduler_cfg: dict[str, Any],
     gss: int = 20000,
+    disc_warmup: int = 0,
 ) -> VqganMusicLightningModule:
     generator = build_generator(loss_aggregator)
     discriminator = build_discriminator()
@@ -2276,6 +2300,7 @@ def build_module(
         discriminator_loss=discriminator_loss,
         generator_loss=generator_loss,
         generator_start_step=gss,
+        disc_warmup=disc_warmup,
         loss_aggregator=loss_aggregator,
         optimizer_cfg=optimizer_cfg,
         scheduler_cfg=scheduler_cfg,
@@ -2308,6 +2333,13 @@ def parse_args() -> argparse.Namespace:
         default=20000,
         help="generator_start_step: step at which the GAN/discriminator engages. "
         "Set above total steps to disable GAN. Default: 20000.",
+    )
+    parser.add_argument(
+        "--disc-warmup",
+        type=int,
+        default=0,
+        help="Steps the discriminator trains alone (after --gss) before the generator "
+        "gets the adversarial gradient. Default: 0.",
     )
     parser.add_argument(
         "--save-path",
@@ -2359,7 +2391,12 @@ def main() -> None:
 
     print("Initializing module...")
     module = build_module(
-        learning_params, loss_aggregator, optimizer_cfg, scheduler_cfg, gss=args.gss
+        learning_params,
+        loss_aggregator,
+        optimizer_cfg,
+        scheduler_cfg,
+        gss=args.gss,
+        disc_warmup=args.disc_warmup,
     )
 
     if args.checkpoint is not None:
