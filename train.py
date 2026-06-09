@@ -2153,9 +2153,10 @@ def build_loss_aggregator() -> WeightedSumAggregator:
     return WeightedSumAggregator(components)
 
 
-def build_encoder() -> EncoderConv2D:
+def build_encoder(token_dim: int = 512) -> EncoderConv2D:
     return EncoderConv2D(
-        channel_list=[2, 16, 32, 64, 128, 256, 512],
+        # final channel == token_dim (encoder output is the pre-quantization latent z_e)
+        channel_list=[2, 16, 32, 64, 128, 256, token_dim],
         dim_change_list=[2, 2, 2, 2, 2, 2],
         kernel_size=5,
         num_res_block_conv=3,
@@ -2167,9 +2168,10 @@ def build_encoder() -> EncoderConv2D:
     )
 
 
-def build_decoder() -> StftDecoder2D:
+def build_decoder(token_dim: int = 512) -> StftDecoder2D:
     return StftDecoder2D(
-        channel_list=[512, 512, 384, 256],
+        # first channel == token_dim (decoder input is the quantized latent z_q)
+        channel_list=[token_dim, 512, 384, 256],
         dim_change_list=[2, 2, 2],
         kernel_size=5,
         dim_add_kernel_add=0,
@@ -2183,18 +2185,19 @@ def build_decoder() -> StftDecoder2D:
     )
 
 
-def build_vq_module() -> VQ1D:
-    return VQ1D(token_dim=512, num_tokens=2048, num_rq_steps=3)
+def build_vq_module(token_dim: int = 512) -> VQ1D:
+    return VQ1D(token_dim=token_dim, num_tokens=2048, num_rq_steps=3)
 
 
 def build_generator(
     loss_aggregator: WeightedSumAggregator,
+    token_dim: int = 512,
 ) -> MultiLvlVQVariationalAutoEncoder:
     return MultiLvlVQVariationalAutoEncoder(
         input_channels=1,
-        encoder=build_encoder(),
-        decoder=build_decoder(),
-        vq_module=build_vq_module(),
+        encoder=build_encoder(token_dim),
+        decoder=build_decoder(token_dim),
+        vq_module=build_vq_module(token_dim),
         loss_aggregator=loss_aggregator,
     )
 
@@ -2277,8 +2280,9 @@ def build_module(
     scheduler_cfg: dict[str, Any],
     gss: int = 20000,
     disc_warmup: int = 0,
+    token_dim: int = 512,
 ) -> VqganMusicLightningModule:
-    generator = build_generator(loss_aggregator)
+    generator = build_generator(loss_aggregator, token_dim=token_dim)
     discriminator = build_discriminator()
 
     discriminator_loss = DiscriminatorHingeLoss(
@@ -2333,6 +2337,13 @@ def parse_args() -> argparse.Namespace:
         default=20000,
         help="generator_start_step: step at which the GAN/discriminator engages. "
         "Set above total steps to disable GAN. Default: 20000.",
+    )
+    parser.add_argument(
+        "--token-dim",
+        type=int,
+        default=512,
+        help="VQ latent/token dimension (widens encoder output + decoder input to "
+        "match). Larger = richer per-token, same token count (NTP-friendly). Default: 512.",
     )
     parser.add_argument(
         "--disc-warmup",
@@ -2397,6 +2408,7 @@ def main() -> None:
         scheduler_cfg,
         gss=args.gss,
         disc_warmup=args.disc_warmup,
+        token_dim=args.token_dim,
     )
 
     if args.checkpoint is not None:

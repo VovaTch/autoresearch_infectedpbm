@@ -28,11 +28,10 @@ CACHE = os.path.expanduser("~/.cache/infected_pbm/slices")
 OUT = os.path.join(os.path.dirname(__file__), "renders")
 
 CKPTS = {
-    "gan12h_last": "saved_gan_12h/last.ckpt",       # 12h GAN, final adversarial state
-    "gan12h_best": "saved_gan_12h/lvl1_vqgan.ckpt",  # 12h GAN, best-recon-loss ckpt
-    "gan_3h":      "saved_gan/lvl1_vqgan.ckpt",      # 3h GAN, for reference
+    # 12h GAN v2: spectral-norm disc + disc warmup, PhaseLoss off. Final adversarial state.
+    "gan12h_v2_last": "saved_gan_12h_v2/last.ckpt",
 }
-TRACK_SUBSTR = "freemusbox"  # restrict clips to this song
+TRACK_SUBSTR = "A Cookie From Space"  # restrict clips to this song
 
 
 def multi_res_stft_dist(a: torch.Tensor, b: torch.Tensor) -> float:
