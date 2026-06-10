@@ -28,9 +28,9 @@ CACHE = os.path.expanduser("~/.cache/infected_pbm/slices")
 OUT = os.path.join(os.path.dirname(__file__), "renders")
 
 CKPTS = {
-    # tag: (ckpt_path, token_dim) -- token_dim must match the run's arch for strict load.
-    "cookie_td512": ("saved_cookie_td512/last.ckpt", 512),
-    "cookie_td1024": ("saved_cookie_td1024/last.ckpt", 1024),
+    # tag: (ckpt_path, token_dim, latent_grid) -- must match the run's arch for strict load.
+    "fixA_grid4": ("saved_cookie_fixA/last.ckpt", 512, 4),
+    "fixB_grid8": ("saved_cookie_fixB/last.ckpt", 512, 8),
 }
 TRACK_SUBSTR = "Cookie_From_Space"  # restrict clips to this song (slice filenames use underscores)
 
@@ -46,8 +46,8 @@ def multi_res_stft_dist(a: torch.Tensor, b: torch.Tensor) -> float:
     return tot / 3.0
 
 
-def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512):
-    module = build_module(lp, la, oc, sc, token_dim=token_dim)
+def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512, latent_grid: int = 4):
+    module = build_module(lp, la, oc, sc, token_dim=token_dim, latent_grid=latent_grid)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
     module.load_state_dict(sd, strict=True)
@@ -108,10 +108,12 @@ def main():
     print(f"Picked {len(clips)} clips.\n")
 
     modules = {}
-    for tag, (path, token_dim) in CKPTS.items():
+    for tag, (path, token_dim, latent_grid) in CKPTS.items():
         if os.path.exists(path):
-            print(f"Loading {tag} <- {path} (token_dim={token_dim})")
-            modules[tag] = load_module(path, lp, oc, sc, la, token_dim=token_dim)
+            print(f"Loading {tag} <- {path} (token_dim={token_dim}, grid={latent_grid})")
+            modules[tag] = load_module(
+                path, lp, oc, sc, la, token_dim=token_dim, latent_grid=latent_grid
+            )
         else:
             print(f"SKIP {tag}: {path} missing")
 

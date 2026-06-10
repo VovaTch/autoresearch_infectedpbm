@@ -804,20 +804,23 @@ class VQCodeBook(CodeBook):
     ) -> None:
         super().__init__()
         self.num_tokens = num_tokens
-        self.code_embedding = nn.Parameter(torch.rand(num_tokens, token_dim))
+        # randn (full space, not positive orthant) scaled to ~unit-norm codes
+        self.code_embedding = nn.Parameter(
+            torch.randn(num_tokens, token_dim) / token_dim**0.5
+        )
         self.usage_threshold = usage_threshold
         self.register_buffer("usage", torch.ones(self.num_tokens), persistent=False)
 
     def embed_codebook(self, indices: torch.Tensor) -> torch.Tensor:
-        return F.normalize(self.code_embedding[indices], dim=-1)
+        return self.code_embedding[indices]
 
     def apply_codebook(self, x_in: torch.Tensor, code_sg: bool = False):
-        x_in_norm = F.normalize(x_in, dim=1)
-        embedding_weights = (
-            F.normalize(self.code_embedding, dim=-1).transpose(0, 1).contiguous()
-        )
+        # Euclidean VQ on raw vectors: codes keep their magnitude so residual
+        # quantization (RQ) actually refines — normalizing here forced every RQ
+        # step to emit a unit-norm code for an ever-smaller residual.
+        embedding_weights = self.code_embedding.transpose(0, 1).contiguous()
         z_q, indices = vq_code_book_select(
-            x_in_norm, embedding_weights.detach() if code_sg else embedding_weights
+            x_in, embedding_weights.detach() if code_sg else embedding_weights
         )  # type: ignore
         self.update_usage(indices)
         return z_q.unsqueeze(1), indices
@@ -831,9 +834,16 @@ class VQCodeBook(CodeBook):
 
     def random_restart(self) -> float:
         dead_codes = torch.nonzero(self.usage < self.usage_threshold).squeeze(1)  # type: ignore
-        rand_codes = torch.randperm(self.num_tokens)[0 : len(dead_codes)]
-        with torch.no_grad():
-            self.code_embedding[dead_codes] = self.code_embedding[rand_codes]
+        alive_codes = torch.nonzero(self.usage >= self.usage_threshold).squeeze(1)  # type: ignore
+        if len(dead_codes) > 0 and len(alive_codes) > 0:
+            # revive dead codes near ALIVE ones (splits live clusters); copying
+            # from arbitrary codes could just clone another dead code
+            src = alive_codes[torch.randint(len(alive_codes), (len(dead_codes),))]
+            with torch.no_grad():
+                jitter = 0.1 * self.code_embedding[src].std()
+                self.code_embedding[dead_codes] = self.code_embedding[
+                    src
+                ] + jitter * torch.randn_like(self.code_embedding[src])
         return dead_codes.shape[0]
 
 
@@ -1342,8 +1352,9 @@ class MultiLvlVQVariationalAutoEncoder(Tokenizer):
             .permute((0, 2, 1))
             .contiguous()
         )
-        z_e = self.encoder(x_reshaped.float())
-        return F.normalize(z_e, dim=1)
+        # no normalize: unit-sphere latents erase frame energy and make the
+        # commitment target (sum of codes, norm != 1) unsatisfiable
+        return self.encoder(x_reshaped.float())
 
     def tokenize(self, x: torch.Tensor) -> torch.Tensor:
         z_e = self.encode(x)
@@ -2153,22 +2164,49 @@ def build_loss_aggregator() -> WeightedSumAggregator:
     return WeightedSumAggregator(components)
 
 
-def build_encoder(token_dim: int = 512) -> EncoderConv2D:
+def build_encoder(token_dim: int = 512, latent_grid: int = 4) -> EncoderConv2D:
+    # latent_grid: spatial size of the latent (grid x grid positions per slice).
+    # 4 = legacy (6 stride-2 stages, 16 positions, LSTM hidden 64 -> 128-dim cap).
+    # 8 = capacity arch (5 stages, 64 positions, LSTM hidden 256 -> full-rank 512).
+    if latent_grid == 8:
+        channel_list = [2, 16, 32, 64, 128, token_dim]
+        dim_change_list = [2, 2, 2, 2, 2]
+        lstm_hidden = 256
+    else:
+        channel_list = [2, 16, 32, 64, 128, 256, token_dim]
+        dim_change_list = [2, 2, 2, 2, 2, 2]
+        lstm_hidden = 64
     return EncoderConv2D(
         # final channel == token_dim (encoder output is the pre-quantization latent z_e)
-        channel_list=[2, 16, 32, 64, 128, 256, token_dim],
-        dim_change_list=[2, 2, 2, 2, 2, 2],
+        channel_list=channel_list,
+        dim_change_list=dim_change_list,
         kernel_size=5,
         num_res_block_conv=3,
         dilation_factor=2,
         n_fft=512,
         hop_length=128,
         win_length=512,
+        lstm_hiddem_dim=lstm_hidden,
         activation_fn=nn.GELU(),
     )
 
 
-def build_decoder(token_dim: int = 512) -> StftDecoder2D:
+def build_decoder(token_dim: int = 512, latent_grid: int = 4) -> StftDecoder2D:
+    if latent_grid == 8:
+        # 64 latent positions -> x4 -> 256 STFT frames, hop 128 -> 32768 samples
+        return StftDecoder2D(
+            channel_list=[token_dim, 512, 256],
+            dim_change_list=[2, 2],
+            kernel_size=5,
+            dim_add_kernel_add=0,
+            num_res_block_conv=1,
+            activation_fn=nn.GELU(),
+            dropout=0.0,
+            dilation_factor=2,
+            n_fft=512,
+            hop_length=128,
+            win_length=512,
+        )
     return StftDecoder2D(
         # first channel == token_dim (decoder input is the quantized latent z_q)
         channel_list=[token_dim, 512, 384, 256],
@@ -2192,11 +2230,12 @@ def build_vq_module(token_dim: int = 512) -> VQ1D:
 def build_generator(
     loss_aggregator: WeightedSumAggregator,
     token_dim: int = 512,
+    latent_grid: int = 4,
 ) -> MultiLvlVQVariationalAutoEncoder:
     return MultiLvlVQVariationalAutoEncoder(
         input_channels=1,
-        encoder=build_encoder(token_dim),
-        decoder=build_decoder(token_dim),
+        encoder=build_encoder(token_dim, latent_grid),
+        decoder=build_decoder(token_dim, latent_grid),
         vq_module=build_vq_module(token_dim),
         loss_aggregator=loss_aggregator,
     )
@@ -2281,8 +2320,11 @@ def build_module(
     gss: int = 20000,
     disc_warmup: int = 0,
     token_dim: int = 512,
+    latent_grid: int = 4,
 ) -> VqganMusicLightningModule:
-    generator = build_generator(loss_aggregator, token_dim=token_dim)
+    generator = build_generator(
+        loss_aggregator, token_dim=token_dim, latent_grid=latent_grid
+    )
     discriminator = build_discriminator()
 
     discriminator_loss = DiscriminatorHingeLoss(
@@ -2344,6 +2386,14 @@ def parse_args() -> argparse.Namespace:
         default=512,
         help="VQ latent/token dimension (widens encoder output + decoder input to "
         "match). Larger = richer per-token, same token count (NTP-friendly). Default: 512.",
+    )
+    parser.add_argument(
+        "--latent-grid",
+        type=int,
+        default=4,
+        choices=[4, 8],
+        help="Latent spatial grid per slice. 4 = legacy (16 positions). "
+        "8 = capacity arch (64 positions, LSTM 256, decoder n_fft 512). Default: 4.",
     )
     parser.add_argument(
         "--disc-warmup",
@@ -2409,6 +2459,7 @@ def main() -> None:
         gss=args.gss,
         disc_warmup=args.disc_warmup,
         token_dim=args.token_dim,
+        latent_grid=args.latent_grid,
     )
 
     if args.checkpoint is not None:
