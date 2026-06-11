@@ -73,10 +73,11 @@ def _apply_ema(module, ckpt) -> bool:
     return False
 
 
-def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512, latent_grid: int = 4, bypass_vq: bool = False, arch: str = "legacy"):
+def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512, latent_grid: int = 4, bypass_vq: bool = False, arch: str = "legacy", num_rq: int = 3):
     module = build_module(
         lp, la, oc, sc,
         token_dim=token_dim, latent_grid=latent_grid, bypass_vq=bypass_vq, arch=arch,
+        num_rq_steps=num_rq,
     )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt

@@ -2370,8 +2370,8 @@ def build_decoder(token_dim: int = 512, latent_grid: int = 4) -> StftDecoder2D:
     )
 
 
-def build_vq_module(token_dim: int = 512) -> VQ1D:
-    return VQ1D(token_dim=token_dim, num_tokens=2048, num_rq_steps=3)
+def build_vq_module(token_dim: int = 512, num_rq_steps: int = 3) -> VQ1D:
+    return VQ1D(token_dim=token_dim, num_tokens=2048, num_rq_steps=num_rq_steps)
 
 
 def build_generator(
@@ -2380,6 +2380,7 @@ def build_generator(
     latent_grid: int = 4,
     bypass_vq: bool = False,
     arch: str = "legacy",
+    num_rq_steps: int = 3,
 ) -> MultiLvlVQVariationalAutoEncoder:
     if arch == "temporal":
         # 32768-sample slice, hop 256 -> 128 STFT frames -> T_lat=64 (~86 fps latent)
@@ -2392,7 +2393,7 @@ def build_generator(
         input_channels=1,
         encoder=encoder,
         decoder=decoder,
-        vq_module=build_vq_module(token_dim),
+        vq_module=build_vq_module(token_dim, num_rq_steps=num_rq_steps),
         loss_aggregator=loss_aggregator,
         bypass_vq=bypass_vq,
     )
@@ -2480,6 +2481,7 @@ def build_module(
     latent_grid: int = 4,
     bypass_vq: bool = False,
     arch: str = "legacy",
+    num_rq_steps: int = 3,
 ) -> VqganMusicLightningModule:
     generator = build_generator(
         loss_aggregator,
@@ -2487,6 +2489,7 @@ def build_module(
         latent_grid=latent_grid,
         bypass_vq=bypass_vq,
         arch=arch,
+        num_rq_steps=num_rq_steps,
     )
     discriminator = build_discriminator()
 
@@ -2558,6 +2561,13 @@ def parse_args() -> argparse.Namespace:
         help="Model architecture. legacy = 2D grid latent (see --latent-grid). "
         "temporal = EnCodec-style: STFT freq->channels, stride time only, "
         "latent 64 frames/slice (~86 fps). Default: legacy.",
+    )
+    parser.add_argument(
+        "--num-rq",
+        type=int,
+        default=3,
+        help="Residual quantization depth (codes per latent frame). More = more "
+        "bits/fidelity, longer NTP token sequence. Default: 3.",
     )
     parser.add_argument(
         "--no-vq",
@@ -2647,6 +2657,7 @@ def main() -> None:
         latent_grid=args.latent_grid,
         bypass_vq=args.no_vq,
         arch=args.arch,
+        num_rq_steps=args.num_rq,
     )
 
     if args.checkpoint is not None:
