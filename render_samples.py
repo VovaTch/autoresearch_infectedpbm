@@ -29,8 +29,8 @@ OUT = os.path.join(os.path.dirname(__file__), "renders")
 
 CKPTS = {
     # tag: (ckpt_path, token_dim, latent_grid) -- must match the run's arch for strict load.
-    "fixA_grid4": ("saved_cookie_fixA/last.ckpt", 512, 4),
-    "fixB_grid8": ("saved_cookie_fixB/last.ckpt", 512, 8),
+    "cw10_g4": ("saved_cookie_cw10_g4/last.ckpt", 512, 4),
+    "cw10_g8": ("saved_cookie_cw10_g8/last.ckpt", 512, 8),
 }
 TRACK_SUBSTR = "Cookie_From_Space"  # restrict clips to this song (slice filenames use underscores)
 
@@ -46,11 +46,30 @@ def multi_res_stft_dist(a: torch.Tensor, b: torch.Tensor) -> float:
     return tot / 3.0
 
 
+def _apply_ema(module, ckpt) -> bool:
+    """Copy generator EMA weights from EMAOptimizer state into module.model.
+
+    state_dict holds RAW weights; test-time metrics use EMA (the EMA callback swaps
+    them in), so rendering raw weights misrepresents the model — match by copying
+    the ema params (stored in model.parameters() order) over the generator."""
+    gen_params = list(module.model.parameters())
+    for st in ckpt.get("optimizer_states") or []:
+        ema = st.get("ema") if isinstance(st, dict) else None
+        if ema is not None and len(ema) == len(gen_params):
+            with torch.no_grad():
+                for p, e in zip(gen_params, ema):
+                    p.copy_(e.to(dtype=p.dtype))
+            return True
+    return False
+
+
 def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512, latent_grid: int = 4):
     module = build_module(lp, la, oc, sc, token_dim=token_dim, latent_grid=latent_grid)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
     module.load_state_dict(sd, strict=True)
+    if isinstance(ckpt, dict):
+        print("  EMA weights applied" if _apply_ema(module, ckpt) else "  (raw weights, no EMA found)")
     module.eval()
     return module
 

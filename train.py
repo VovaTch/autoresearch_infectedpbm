@@ -363,7 +363,9 @@ def get_trainer(
     model_checkpoint_callback = ModelCheckpoint(
         dirpath=save_folder,
         filename=learning_parameters.model_name,
-        save_weights_only=True,
+        # weights-only discards optimizer_states, which is where EMAOptimizer keeps
+        # the EMA params — i.e. the model that val/test actually evaluates. Keep them.
+        save_weights_only=False,
         save_top_k=1,
         monitor=learning_parameters.loss_monitor,
         save_last=True,
