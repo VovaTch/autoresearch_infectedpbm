@@ -29,8 +29,8 @@ OUT = os.path.join(os.path.dirname(__file__), "renders")
 
 CKPTS = {
     # tag: (ckpt_path, token_dim, latent_grid) -- must match the run's arch for strict load.
-    "cw10_g4": ("saved_cookie_cw10_g4/last.ckpt", 512, 4),
-    "cw10_g8": ("saved_cookie_cw10_g8/last.ckpt", 512, 8),
+    "cw10_g4_ema": ("saved_cookie_cw10_g4_ema/last.ckpt", 512, 4),
+    "cw10_g8_ema": ("saved_cookie_cw10_g8_ema/last.ckpt", 512, 8),
 }
 TRACK_SUBSTR = "Cookie_From_Space"  # restrict clips to this song (slice filenames use underscores)
 
