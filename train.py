@@ -2034,7 +2034,7 @@ def build_scheduler_cfg() -> dict[str, Any]:
     }
 
 
-def build_loss_aggregator() -> WeightedSumAggregator:
+def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
     def make_mel_converter(
         n_fft, hop_length, n_mels, power, norm="slaney", mel_scale="htk"
     ) -> SimpleMelSpecConverter:
@@ -2069,7 +2069,9 @@ def build_loss_aggregator() -> WeightedSumAggregator:
             base_loss=nn.MSELoss(),
         ),
         AlignLoss(name="alignment_loss", weight=0.75, base_loss=nn.MSELoss()),
-        CommitLoss(name="commitment_loss", weight=0.75, base_loss=nn.MSELoss()),
+        # commit_weight anchors unnormalized z_e to the codebook; 0.75 was too weak
+        # (z_e magnitude outran codes -> alignment drifted unbounded over 3h runs)
+        CommitLoss(name="commitment_loss", weight=commit_weight, base_loss=nn.MSELoss()),
         MelSpecLoss(
             name="melspec_loss_1",
             weight=1.0,
@@ -2388,6 +2390,13 @@ def parse_args() -> argparse.Namespace:
         "match). Larger = richer per-token, same token count (NTP-friendly). Default: 512.",
     )
     parser.add_argument(
+        "--commit-weight",
+        type=float,
+        default=0.75,
+        help="Commitment loss weight (anchors z_e scale to the codebook; raise to "
+        "counter z_e magnitude drift). Default: 0.75.",
+    )
+    parser.add_argument(
         "--latent-grid",
         type=int,
         default=4,
@@ -2430,7 +2439,7 @@ def main() -> None:
         learning_params.save_path = args.save_path
     optimizer_cfg = build_optimizer_cfg()
     scheduler_cfg = build_scheduler_cfg()
-    loss_aggregator = build_loss_aggregator()
+    loss_aggregator = build_loss_aggregator(commit_weight=args.commit_weight)
 
     print("Initializing data...")
     data_module = build_data_module(learning_params)
