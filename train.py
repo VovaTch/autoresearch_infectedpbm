@@ -1339,6 +1339,7 @@ class MultiLvlVQVariationalAutoEncoder(Tokenizer):
         decoder: DecoderBase,
         vq_module: VQ1D,
         loss_aggregator=None,
+        bypass_vq: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -1347,6 +1348,9 @@ class MultiLvlVQVariationalAutoEncoder(Tokenizer):
         self.decoder = decoder
         self.vq_module = vq_module
         self.input_channels = input_channels
+        # ablation: decoder consumes continuous z_e; VQ still runs (and trains via
+        # alignment/commitment) but its output never reaches the decoder
+        self.bypass_vq = bypass_vq
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x_reshaped = (
@@ -1369,7 +1373,8 @@ class MultiLvlVQVariationalAutoEncoder(Tokenizer):
 
     def decode(self, z_e: torch.Tensor, origin_shape=None):
         vq_block_output = self.vq_module(z_e, extract_losses=True)
-        x_out = self.decoder(vq_block_output["v_q"][:, -1, ...])
+        dec_in = z_e if self.bypass_vq else vq_block_output["v_q"][:, -1, ...]
+        x_out = self.decoder(dec_in)
         if origin_shape is None:
             origin_shape = (int(z_e.shape[0]), self.input_channels, -1)
         x_out = x_out.permute((0, 2, 1)).contiguous().reshape(origin_shape)
@@ -2235,6 +2240,7 @@ def build_generator(
     loss_aggregator: WeightedSumAggregator,
     token_dim: int = 512,
     latent_grid: int = 4,
+    bypass_vq: bool = False,
 ) -> MultiLvlVQVariationalAutoEncoder:
     return MultiLvlVQVariationalAutoEncoder(
         input_channels=1,
@@ -2242,6 +2248,7 @@ def build_generator(
         decoder=build_decoder(token_dim, latent_grid),
         vq_module=build_vq_module(token_dim),
         loss_aggregator=loss_aggregator,
+        bypass_vq=bypass_vq,
     )
 
 
@@ -2325,9 +2332,13 @@ def build_module(
     disc_warmup: int = 0,
     token_dim: int = 512,
     latent_grid: int = 4,
+    bypass_vq: bool = False,
 ) -> VqganMusicLightningModule:
     generator = build_generator(
-        loss_aggregator, token_dim=token_dim, latent_grid=latent_grid
+        loss_aggregator,
+        token_dim=token_dim,
+        latent_grid=latent_grid,
+        bypass_vq=bypass_vq,
     )
     discriminator = build_discriminator()
 
@@ -2390,6 +2401,12 @@ def parse_args() -> argparse.Namespace:
         default=512,
         help="VQ latent/token dimension (widens encoder output + decoder input to "
         "match). Larger = richer per-token, same token count (NTP-friendly). Default: 512.",
+    )
+    parser.add_argument(
+        "--no-vq",
+        action="store_true",
+        help="Ablation: decoder consumes continuous z_e (VQ bypassed for synthesis; "
+        "codebook still trains on the side). Isolates the quantization bottleneck.",
     )
     parser.add_argument(
         "--commit-weight",
@@ -2471,6 +2488,7 @@ def main() -> None:
         disc_warmup=args.disc_warmup,
         token_dim=args.token_dim,
         latent_grid=args.latent_grid,
+        bypass_vq=args.no_vq,
     )
 
     if args.checkpoint is not None:
