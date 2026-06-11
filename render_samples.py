@@ -28,9 +28,10 @@ CACHE = os.path.expanduser("~/.cache/infected_pbm/slices")
 OUT = os.path.join(os.path.dirname(__file__), "renders")
 
 CKPTS = {
-    # tag: (ckpt_path, token_dim, latent_grid) -- must match the run's arch for strict load.
-    "cw10_g4_ema": ("saved_cookie_cw10_g4_ema/last.ckpt", 512, 4),
-    "cw10_g8_ema": ("saved_cookie_cw10_g8_ema/last.ckpt", 512, 8),
+    # tag: (ckpt_path, token_dim, latent_grid, bypass_vq) -- must match the run's arch.
+    "novq_g4": ("saved_cookie_novq_g4/last.ckpt", 512, 4, True),
+    "novq_g8": ("saved_cookie_novq_g8/last.ckpt", 512, 8, True),
+    "cw10_g8_ema": ("saved_cookie_cw10_g8_ema/last.ckpt", 512, 8, False),
 }
 TRACK_SUBSTR = "Cookie_From_Space"  # restrict clips to this song (slice filenames use underscores)
 
@@ -63,8 +64,10 @@ def _apply_ema(module, ckpt) -> bool:
     return False
 
 
-def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512, latent_grid: int = 4):
-    module = build_module(lp, la, oc, sc, token_dim=token_dim, latent_grid=latent_grid)
+def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512, latent_grid: int = 4, bypass_vq: bool = False):
+    module = build_module(
+        lp, la, oc, sc, token_dim=token_dim, latent_grid=latent_grid, bypass_vq=bypass_vq
+    )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
     module.load_state_dict(sd, strict=True)
@@ -127,11 +130,12 @@ def main():
     print(f"Picked {len(clips)} clips.\n")
 
     modules = {}
-    for tag, (path, token_dim, latent_grid) in CKPTS.items():
+    for tag, (path, token_dim, latent_grid, bypass_vq) in CKPTS.items():
         if os.path.exists(path):
-            print(f"Loading {tag} <- {path} (token_dim={token_dim}, grid={latent_grid})")
+            print(f"Loading {tag} <- {path} (td={token_dim}, grid={latent_grid}, novq={bypass_vq})")
             modules[tag] = load_module(
-                path, lp, oc, sc, la, token_dim=token_dim, latent_grid=latent_grid
+                path, lp, oc, sc, la,
+                token_dim=token_dim, latent_grid=latent_grid, bypass_vq=bypass_vq,
             )
         else:
             print(f"SKIP {tag}: {path} missing")
