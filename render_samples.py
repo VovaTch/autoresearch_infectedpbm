@@ -28,10 +28,19 @@ CACHE = os.path.expanduser("~/.cache/infected_pbm/slices")
 OUT = os.path.join(os.path.dirname(__file__), "renders")
 
 CKPTS = {
-    # tag: (ckpt_path, token_dim, latent_grid, bypass_vq) -- must match the run's arch.
-    "novq_g4": ("saved_cookie_novq_g4/last.ckpt", 512, 4, True),
-    "novq_g8": ("saved_cookie_novq_g8/last.ckpt", 512, 8, True),
-    "cw10_g8_ema": ("saved_cookie_cw10_g8_ema/last.ckpt", 512, 8, False),
+    # tag: cfg matching the run's arch (token_dim/latent_grid/bypass_vq/arch).
+    "temporal_vq": dict(
+        path="saved_cookie_temporal_vq/last.ckpt", token_dim=512, latent_grid=4,
+        bypass_vq=False, arch="temporal",
+    ),
+    "temporal_novq": dict(
+        path="saved_cookie_temporal_novq/last.ckpt", token_dim=512, latent_grid=4,
+        bypass_vq=True, arch="temporal",
+    ),
+    "cw10_g8_ema": dict(
+        path="saved_cookie_cw10_g8_ema/last.ckpt", token_dim=512, latent_grid=8,
+        bypass_vq=False, arch="legacy",
+    ),
 }
 TRACK_SUBSTR = "Cookie_From_Space"  # restrict clips to this song (slice filenames use underscores)
 
@@ -64,9 +73,10 @@ def _apply_ema(module, ckpt) -> bool:
     return False
 
 
-def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512, latent_grid: int = 4, bypass_vq: bool = False):
+def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512, latent_grid: int = 4, bypass_vq: bool = False, arch: str = "legacy"):
     module = build_module(
-        lp, la, oc, sc, token_dim=token_dim, latent_grid=latent_grid, bypass_vq=bypass_vq
+        lp, la, oc, sc,
+        token_dim=token_dim, latent_grid=latent_grid, bypass_vq=bypass_vq, arch=arch,
     )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
@@ -130,12 +140,14 @@ def main():
     print(f"Picked {len(clips)} clips.\n")
 
     modules = {}
-    for tag, (path, token_dim, latent_grid, bypass_vq) in CKPTS.items():
+    for tag, cfg in CKPTS.items():
+        path = cfg["path"]
         if os.path.exists(path):
-            print(f"Loading {tag} <- {path} (td={token_dim}, grid={latent_grid}, novq={bypass_vq})")
+            print(f"Loading {tag} <- {path} ({ {k: v for k, v in cfg.items() if k != 'path'} })")
             modules[tag] = load_module(
                 path, lp, oc, sc, la,
-                token_dim=token_dim, latent_grid=latent_grid, bypass_vq=bypass_vq,
+                token_dim=cfg["token_dim"], latent_grid=cfg["latent_grid"],
+                bypass_vq=cfg["bypass_vq"], arch=cfg["arch"],
             )
         else:
             print(f"SKIP {tag}: {path} missing")

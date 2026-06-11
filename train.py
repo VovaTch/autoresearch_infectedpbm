@@ -1309,6 +1309,144 @@ class StftDecoder2D(DecoderBase):
 
 
 # ===========================================================================
+# Temporal codec (EnCodec-style layout): STFT freq bins -> CHANNELS, conv
+# stride along TIME only. Latent = one vector per ~17ms (T_lat frames/slice).
+# Fixes the legacy grid layout where 0.74s collapsed to 4-8 time positions
+# and freq was interleaved into the sequence — which made the decoder emit a
+# time-averaged spectrum (noise wash) regardless of latent precision.
+# ===========================================================================
+
+
+class TemporalEncoder(nn.Module):
+    def __init__(
+        self,
+        token_dim: int = 512,
+        hidden: int = 512,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        win_length: int = 1024,
+        num_res_blocks: int = 2,
+        num_res_conv: int = 3,
+        kernel_size: int = 5,
+        dilation_factor: int = 2,
+        time_downsample: int = 2,
+    ) -> None:
+        super().__init__()
+        self._n_fft = n_fft
+        self._hop_length = hop_length
+        self._win_length = win_length
+        in_dim = (n_fft // 2 + 1) * 2  # real+imag stacked as channels
+        self._proj_in = nn.Conv1d(in_dim, hidden, kernel_size=7, padding=3)
+        self._res1 = nn.Sequential(
+            *[
+                Res1DBlock(hidden, num_res_conv, dilation_factor, kernel_size)
+                for _ in range(num_res_blocks)
+            ]
+        )
+        self._down = nn.Conv1d(
+            hidden,
+            hidden,
+            kernel_size=2 * time_downsample,
+            stride=time_downsample,
+            padding=time_downsample // 2,
+        )
+        self._res2 = nn.Sequential(
+            *[
+                Res1DBlock(hidden, num_res_conv, dilation_factor, kernel_size)
+                for _ in range(num_res_blocks)
+            ]
+        )
+        self._proj_out = nn.Conv1d(hidden, token_dim, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 1, L) waveform
+        window = torch.hann_window(self._win_length).to(x.device)
+        spec = torch.stft(
+            x.flatten(start_dim=1),
+            n_fft=self._n_fft,
+            hop_length=self._hop_length,
+            win_length=self._win_length,
+            window=window,
+            return_complex=True,
+        )  # (B, n_fft/2+1, T+1)
+        n_frames = x.shape[-1] // self._hop_length
+        feats = torch.cat([spec.real, spec.imag], dim=1)[..., :n_frames]
+        h = self._proj_in(feats)
+        h = self._res1(h)
+        h = self._down(h)
+        h = self._res2(h)
+        return self._proj_out(h)  # (B, token_dim, n_frames / time_downsample)
+
+
+class TemporalDecoder(DecoderBase):
+    def __init__(
+        self,
+        token_dim: int = 512,
+        hidden: int = 512,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        win_length: int = 1024,
+        num_res_blocks: int = 2,
+        num_res_conv: int = 3,
+        kernel_size: int = 5,
+        dilation_factor: int = 2,
+        time_upsample: int = 2,
+        output_conv_hidden_dim: int = 32,
+    ) -> None:
+        super().__init__()
+        out_dim = (n_fft // 2 + 1) * 2
+        self._spec_bins = n_fft // 2 + 1
+        self._proj_in = nn.Conv1d(token_dim, hidden, kernel_size=3, padding=1)
+        self._res1 = nn.Sequential(
+            *[
+                Res1DBlock(hidden, num_res_conv, dilation_factor, kernel_size)
+                for _ in range(num_res_blocks)
+            ]
+        )
+        self._up = nn.ConvTranspose1d(
+            hidden,
+            hidden,
+            kernel_size=2 * time_upsample,
+            stride=time_upsample,
+            padding=time_upsample // 2,
+        )
+        self._res2 = nn.Sequential(
+            *[
+                Res1DBlock(hidden, num_res_conv, dilation_factor, kernel_size)
+                for _ in range(num_res_blocks)
+            ]
+        )
+        self._proj_spec = nn.Conv1d(hidden, out_dim, kernel_size=7, padding=3)
+        self._istft = ISTFT(n_fft, hop_length, win_length, padding="same")
+        self._end_conv = nn.Sequential(
+            nn.Conv1d(1, output_conv_hidden_dim, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(
+                output_conv_hidden_dim, output_conv_hidden_dim, kernel_size=3, padding=1
+            ),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(output_conv_hidden_dim, 1, kernel_size=3, padding=1),
+        )
+
+    @property
+    def last_layer(self) -> nn.Module:
+        return self._end_conv[-1]
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # z: (B, token_dim, T_lat)
+        h = self._proj_in(z)
+        h = self._res1(h)
+        h = self._up(h)
+        h = self._res2(h)
+        spec = self._proj_spec(h)  # (B, 2*(n_fft/2+1), T)
+        complex_spec = torch.complex(
+            spec[:, : self._spec_bins], spec[:, self._spec_bins :]
+        )
+        y = self._istft(complex_spec)  # (B, L)
+        return self._end_conv(y.unsqueeze(1))  # (B, 1, L)
+
+
+# ===========================================================================
 # Main VQ-VAE model
 # ===========================================================================
 
@@ -2241,11 +2379,19 @@ def build_generator(
     token_dim: int = 512,
     latent_grid: int = 4,
     bypass_vq: bool = False,
+    arch: str = "legacy",
 ) -> MultiLvlVQVariationalAutoEncoder:
+    if arch == "temporal":
+        # 32768-sample slice, hop 256 -> 128 STFT frames -> T_lat=64 (~86 fps latent)
+        encoder: nn.Module = TemporalEncoder(token_dim=token_dim)
+        decoder: DecoderBase = TemporalDecoder(token_dim=token_dim)
+    else:
+        encoder = build_encoder(token_dim, latent_grid)
+        decoder = build_decoder(token_dim, latent_grid)
     return MultiLvlVQVariationalAutoEncoder(
         input_channels=1,
-        encoder=build_encoder(token_dim, latent_grid),
-        decoder=build_decoder(token_dim, latent_grid),
+        encoder=encoder,
+        decoder=decoder,
         vq_module=build_vq_module(token_dim),
         loss_aggregator=loss_aggregator,
         bypass_vq=bypass_vq,
@@ -2333,12 +2479,14 @@ def build_module(
     token_dim: int = 512,
     latent_grid: int = 4,
     bypass_vq: bool = False,
+    arch: str = "legacy",
 ) -> VqganMusicLightningModule:
     generator = build_generator(
         loss_aggregator,
         token_dim=token_dim,
         latent_grid=latent_grid,
         bypass_vq=bypass_vq,
+        arch=arch,
     )
     discriminator = build_discriminator()
 
@@ -2401,6 +2549,15 @@ def parse_args() -> argparse.Namespace:
         default=512,
         help="VQ latent/token dimension (widens encoder output + decoder input to "
         "match). Larger = richer per-token, same token count (NTP-friendly). Default: 512.",
+    )
+    parser.add_argument(
+        "--arch",
+        type=str,
+        default="legacy",
+        choices=["legacy", "temporal"],
+        help="Model architecture. legacy = 2D grid latent (see --latent-grid). "
+        "temporal = EnCodec-style: STFT freq->channels, stride time only, "
+        "latent 64 frames/slice (~86 fps). Default: legacy.",
     )
     parser.add_argument(
         "--no-vq",
@@ -2489,6 +2646,7 @@ def main() -> None:
         token_dim=args.token_dim,
         latent_grid=args.latent_grid,
         bypass_vq=args.no_vq,
+        arch=args.arch,
     )
 
     if args.checkpoint is not None:
