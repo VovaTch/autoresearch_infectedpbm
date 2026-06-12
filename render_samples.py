@@ -29,17 +29,13 @@ OUT = os.path.join(os.path.dirname(__file__), "renders")
 
 CKPTS = {
     # tag: cfg matching the run's arch (token_dim/latent_grid/bypass_vq/arch).
-    "temporal_vq": dict(
-        path="saved_cookie_temporal_vq/last.ckpt", token_dim=512, latent_grid=4,
-        bypass_vq=False, arch="temporal",
+    "trq3": dict(
+        path="saved_cookie_trq3/last.ckpt", token_dim=512, latent_grid=4,
+        bypass_vq=False, arch="temporal", num_rq=3,
     ),
-    "temporal_novq": dict(
-        path="saved_cookie_temporal_novq/last.ckpt", token_dim=512, latent_grid=4,
-        bypass_vq=True, arch="temporal",
-    ),
-    "cw10_g8_ema": dict(
-        path="saved_cookie_cw10_g8_ema/last.ckpt", token_dim=512, latent_grid=8,
-        bypass_vq=False, arch="legacy",
+    "trq8": dict(
+        path="saved_cookie_trq8/last.ckpt", token_dim=512, latent_grid=4,
+        bypass_vq=False, arch="temporal", num_rq=8,
     ),
 }
 TRACK_SUBSTR = "Cookie_From_Space"  # restrict clips to this song (slice filenames use underscores)
@@ -149,6 +145,7 @@ def main():
                 path, lp, oc, sc, la,
                 token_dim=cfg["token_dim"], latent_grid=cfg["latent_grid"],
                 bypass_vq=cfg["bypass_vq"], arch=cfg["arch"],
+                num_rq=cfg.get("num_rq", 3),
             )
         else:
             print(f"SKIP {tag}: {path} missing")

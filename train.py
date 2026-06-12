@@ -1343,12 +1343,16 @@ class TemporalEncoder(nn.Module):
                 for _ in range(num_res_blocks)
             ]
         )
-        self._down = nn.Conv1d(
-            hidden,
-            hidden,
-            kernel_size=2 * time_downsample,
-            stride=time_downsample,
-            padding=time_downsample // 2,
+        self._down: nn.Module = (
+            nn.Identity()
+            if time_downsample == 1
+            else nn.Conv1d(
+                hidden,
+                hidden,
+                kernel_size=2 * time_downsample,
+                stride=time_downsample,
+                padding=time_downsample // 2,
+            )
         )
         self._res2 = nn.Sequential(
             *[
@@ -1392,10 +1396,15 @@ class TemporalDecoder(DecoderBase):
         dilation_factor: int = 2,
         time_upsample: int = 2,
         output_conv_hidden_dim: int = 32,
+        head: str = "complex",
     ) -> None:
         super().__init__()
-        out_dim = (n_fft // 2 + 1) * 2
+        self._head = head
         self._spec_bins = n_fft // 2 + 1
+        # complex head: raw (real, imag). magphase head (Vocos-style): predicts
+        # log-magnitude + phase direction (x, y) -> exp(m) * (x, y)/|..| — decouples
+        # energy from phase, typically yields cleaner harmonics than raw real/imag.
+        out_dim = self._spec_bins * (3 if head == "magphase" else 2)
         self._proj_in = nn.Conv1d(token_dim, hidden, kernel_size=3, padding=1)
         self._res1 = nn.Sequential(
             *[
@@ -1403,12 +1412,16 @@ class TemporalDecoder(DecoderBase):
                 for _ in range(num_res_blocks)
             ]
         )
-        self._up = nn.ConvTranspose1d(
-            hidden,
-            hidden,
-            kernel_size=2 * time_upsample,
-            stride=time_upsample,
-            padding=time_upsample // 2,
+        self._up: nn.Module = (
+            nn.Identity()
+            if time_upsample == 1
+            else nn.ConvTranspose1d(
+                hidden,
+                hidden,
+                kernel_size=2 * time_upsample,
+                stride=time_upsample,
+                padding=time_upsample // 2,
+            )
         )
         self._res2 = nn.Sequential(
             *[
@@ -1438,10 +1451,15 @@ class TemporalDecoder(DecoderBase):
         h = self._res1(h)
         h = self._up(h)
         h = self._res2(h)
-        spec = self._proj_spec(h)  # (B, 2*(n_fft/2+1), T)
-        complex_spec = torch.complex(
-            spec[:, : self._spec_bins], spec[:, self._spec_bins :]
-        )
+        spec = self._proj_spec(h)
+        b = self._spec_bins
+        if self._head == "magphase":
+            m, x_, y_ = spec[:, :b], spec[:, b : 2 * b], spec[:, 2 * b :]
+            mag = torch.exp(m.clamp(max=8.0))
+            denom = torch.sqrt(x_ * x_ + y_ * y_ + 1e-8)
+            complex_spec = torch.complex(mag * x_ / denom, mag * y_ / denom)
+        else:
+            complex_spec = torch.complex(spec[:, :b], spec[:, b:])
         y = self._istft(complex_spec)  # (B, L)
         return self._end_conv(y.unsqueeze(1))  # (B, 1, L)
 
@@ -2381,11 +2399,17 @@ def build_generator(
     bypass_vq: bool = False,
     arch: str = "legacy",
     num_rq_steps: int = 3,
+    time_downsample: int = 2,
+    dec_head: str = "complex",
 ) -> MultiLvlVQVariationalAutoEncoder:
     if arch == "temporal":
-        # 32768-sample slice, hop 256 -> 128 STFT frames -> T_lat=64 (~86 fps latent)
-        encoder: nn.Module = TemporalEncoder(token_dim=token_dim)
-        decoder: DecoderBase = TemporalDecoder(token_dim=token_dim)
+        # 32768-sample slice, hop 256 -> 128 STFT frames -> T_lat=128/time_downsample
+        encoder: nn.Module = TemporalEncoder(
+            token_dim=token_dim, time_downsample=time_downsample
+        )
+        decoder: DecoderBase = TemporalDecoder(
+            token_dim=token_dim, time_upsample=time_downsample, head=dec_head
+        )
     else:
         encoder = build_encoder(token_dim, latent_grid)
         decoder = build_decoder(token_dim, latent_grid)
@@ -2482,6 +2506,8 @@ def build_module(
     bypass_vq: bool = False,
     arch: str = "legacy",
     num_rq_steps: int = 3,
+    time_downsample: int = 2,
+    dec_head: str = "complex",
 ) -> VqganMusicLightningModule:
     generator = build_generator(
         loss_aggregator,
@@ -2490,6 +2516,8 @@ def build_module(
         bypass_vq=bypass_vq,
         arch=arch,
         num_rq_steps=num_rq_steps,
+        time_downsample=time_downsample,
+        dec_head=dec_head,
     )
     discriminator = build_discriminator()
 
@@ -2561,6 +2589,22 @@ def parse_args() -> argparse.Namespace:
         help="Model architecture. legacy = 2D grid latent (see --latent-grid). "
         "temporal = EnCodec-style: STFT freq->channels, stride time only, "
         "latent 64 frames/slice (~86 fps). Default: legacy.",
+    )
+    parser.add_argument(
+        "--time-downsample",
+        type=int,
+        default=2,
+        choices=[1, 2, 4],
+        help="Temporal arch: latent time downsample factor. 1 -> 128 frames/slice "
+        "(172 fps), 2 -> 64 (86 fps). Default: 2.",
+    )
+    parser.add_argument(
+        "--dec-head",
+        type=str,
+        default="complex",
+        choices=["complex", "magphase"],
+        help="Temporal decoder spectral head: raw real/imag or Vocos-style "
+        "log-magnitude + phase direction. Default: complex.",
     )
     parser.add_argument(
         "--num-rq",
@@ -2658,6 +2702,8 @@ def main() -> None:
         bypass_vq=args.no_vq,
         arch=args.arch,
         num_rq_steps=args.num_rq,
+        time_downsample=args.time_downsample,
+        dec_head=args.dec_head,
     )
 
     if args.checkpoint is not None:
