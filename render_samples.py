@@ -33,9 +33,13 @@ CKPTS = {
         path="saved_cookie_trq3/last.ckpt", token_dim=512, latent_grid=4,
         bypass_vq=False, arch="temporal", num_rq=3,
     ),
-    "trq8": dict(
-        path="saved_cookie_trq8/last.ckpt", token_dim=512, latent_grid=4,
-        bypass_vq=False, arch="temporal", num_rq=8,
+    "ts1": dict(
+        path="saved_cookie_ts1/last.ckpt", token_dim=512, latent_grid=4,
+        bypass_vq=False, arch="temporal", num_rq=3, time_downsample=1,
+    ),
+    "magphase": dict(
+        path="saved_cookie_magphase/last.ckpt", token_dim=512, latent_grid=4,
+        bypass_vq=False, arch="temporal", num_rq=3, dec_head="magphase",
     ),
 }
 TRACK_SUBSTR = "Cookie_From_Space"  # restrict clips to this song (slice filenames use underscores)
@@ -69,11 +73,11 @@ def _apply_ema(module, ckpt) -> bool:
     return False
 
 
-def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512, latent_grid: int = 4, bypass_vq: bool = False, arch: str = "legacy", num_rq: int = 3):
+def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512, latent_grid: int = 4, bypass_vq: bool = False, arch: str = "legacy", num_rq: int = 3, time_downsample: int = 2, dec_head: str = "complex"):
     module = build_module(
         lp, la, oc, sc,
         token_dim=token_dim, latent_grid=latent_grid, bypass_vq=bypass_vq, arch=arch,
-        num_rq_steps=num_rq,
+        num_rq_steps=num_rq, time_downsample=time_downsample, dec_head=dec_head,
     )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
@@ -146,6 +150,8 @@ def main():
                 token_dim=cfg["token_dim"], latent_grid=cfg["latent_grid"],
                 bypass_vq=cfg["bypass_vq"], arch=cfg["arch"],
                 num_rq=cfg.get("num_rq", 3),
+                time_downsample=cfg.get("time_downsample", 2),
+                dec_head=cfg.get("dec_head", "complex"),
             )
         else:
             print(f"SKIP {tag}: {path} missing")
