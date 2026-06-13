@@ -29,10 +29,6 @@ OUT = os.path.join(os.path.dirname(__file__), "renders")
 
 CKPTS = {
     # tag: cfg matching the run's arch (token_dim/latent_grid/bypass_vq/arch).
-    "trq3": dict(
-        path="saved_cookie_trq3/last.ckpt", token_dim=512, latent_grid=4,
-        bypass_vq=False, arch="temporal", num_rq=3,
-    ),
     "ts1": dict(
         path="saved_cookie_ts1/last.ckpt", token_dim=512, latent_grid=4,
         bypass_vq=False, arch="temporal", num_rq=3, time_downsample=1,
