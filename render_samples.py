@@ -37,9 +37,9 @@ CKPTS = {
         path="saved_cookie_ts1/last.ckpt", token_dim=512, latent_grid=4,
         bypass_vq=False, arch="temporal", num_rq=3, time_downsample=1,
     ),
-    "magphase": dict(
-        path="saved_cookie_magphase/last.ckpt", token_dim=512, latent_grid=4,
-        bypass_vq=False, arch="temporal", num_rq=3, dec_head="magphase",
+    "ts1_14h": dict(
+        path="saved_cookie_ts1_14h/last.ckpt", token_dim=512, latent_grid=4,
+        bypass_vq=False, arch="temporal", num_rq=3, time_downsample=1,
     ),
 }
 TRACK_SUBSTR = "Cookie_From_Space"  # restrict clips to this song (slice filenames use underscores)
