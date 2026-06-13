@@ -73,11 +73,12 @@ def _apply_ema(module, ckpt) -> bool:
     return False
 
 
-def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512, latent_grid: int = 4, bypass_vq: bool = False, arch: str = "legacy", num_rq: int = 3, time_downsample: int = 2, dec_head: str = "complex"):
+def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512, latent_grid: int = 4, bypass_vq: bool = False, arch: str = "legacy", num_rq: int = 3, time_downsample: int = 2, dec_head: str = "complex", disc_width: int = 1):
     module = build_module(
         lp, la, oc, sc,
         token_dim=token_dim, latent_grid=latent_grid, bypass_vq=bypass_vq, arch=arch,
         num_rq_steps=num_rq, time_downsample=time_downsample, dec_head=dec_head,
+        disc_width=disc_width,
     )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
@@ -152,6 +153,7 @@ def main():
                 num_rq=cfg.get("num_rq", 3),
                 time_downsample=cfg.get("time_downsample", 2),
                 dec_head=cfg.get("dec_head", "complex"),
+                disc_width=cfg.get("disc_width", 1),
             )
         else:
             print(f"SKIP {tag}: {path} missing")

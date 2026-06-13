@@ -2440,7 +2440,9 @@ def _spectralize_disc(module: nn.Module) -> nn.Module:
     return module
 
 
-def build_discriminator() -> EnsembleDiscriminator:
+def build_discriminator(disc_width: int = 1) -> EnsembleDiscriminator:
+    w = disc_width
+
     def make_mel_conv(n_fft, hop_length, n_mels, power) -> SimpleMelSpecConverter:
         return SimpleMelSpecConverter(
             MelSpecParameters(
@@ -2457,7 +2459,7 @@ def build_discriminator() -> EnsembleDiscriminator:
         )
 
     disc1 = MelSpecDiscriminator(
-        channel_list=[4, 8, 16, 32, 64],
+        channel_list=[4 * w, 8 * w, 16 * w, 32 * w, 64 * w],
         stride=2,
         kernel_size=3,
         activation_fn=nn.GELU(),
@@ -2465,7 +2467,7 @@ def build_discriminator() -> EnsembleDiscriminator:
         mel_spec_converter=make_mel_conv(1024, 256, 128, 1.0),
     )
     disc2 = MelSpecDiscriminator(
-        channel_list=[4, 8, 16, 32, 64],
+        channel_list=[4 * w, 8 * w, 16 * w, 32 * w, 64 * w],
         stride=2,
         kernel_size=3,
         activation_fn=nn.GELU(),
@@ -2473,7 +2475,7 @@ def build_discriminator() -> EnsembleDiscriminator:
         mel_spec_converter=make_mel_conv(2048, 512, 256, 1.0),
     )
     disc3 = MelSpecDiscriminator(
-        channel_list=[4, 8, 16, 32, 64],
+        channel_list=[4 * w, 8 * w, 16 * w, 32 * w, 64 * w],
         stride=2,
         kernel_size=3,
         activation_fn=nn.GELU(),
@@ -2481,7 +2483,7 @@ def build_discriminator() -> EnsembleDiscriminator:
         mel_spec_converter=make_mel_conv(4096, 1024, 512, 1.0),
     )
     disc4 = WaveformDiscriminator(
-        channel_list=[4, 8, 16, 32, 64, 128],
+        channel_list=[4 * w, 8 * w, 16 * w, 32 * w, 64 * w, 128 * w],
         dim_change_list=[4, 4, 4, 4, 4],
         kernel_size=3,
         num_res_block_conv=5,
@@ -2508,6 +2510,7 @@ def build_module(
     num_rq_steps: int = 3,
     time_downsample: int = 2,
     dec_head: str = "complex",
+    disc_width: int = 1,
 ) -> VqganMusicLightningModule:
     generator = build_generator(
         loss_aggregator,
@@ -2519,7 +2522,7 @@ def build_module(
         time_downsample=time_downsample,
         dec_head=dec_head,
     )
-    discriminator = build_discriminator()
+    discriminator = build_discriminator(disc_width=disc_width)
 
     discriminator_loss = DiscriminatorHingeLoss(
         name="discriminator_loss",
@@ -2589,6 +2592,13 @@ def parse_args() -> argparse.Namespace:
         help="Model architecture. legacy = 2D grid latent (see --latent-grid). "
         "temporal = EnCodec-style: STFT freq->channels, stride time only, "
         "latent 64 frames/slice (~86 fps). Default: legacy.",
+    )
+    parser.add_argument(
+        "--disc-width",
+        type=int,
+        default=1,
+        help="Discriminator channel multiplier (1 = legacy ~0.19M; 4 = ~16x params). "
+        "Stronger disc pushes the generator toward realistic texture (less distortion).",
     )
     parser.add_argument(
         "--time-downsample",
@@ -2704,13 +2714,24 @@ def main() -> None:
         num_rq_steps=args.num_rq,
         time_downsample=args.time_downsample,
         dec_head=args.dec_head,
+        disc_width=args.disc_width,
     )
 
     if args.checkpoint is not None:
         print(f"Loading model weights from {args.checkpoint}...")
         ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
-        module.load_state_dict(state_dict, strict=True)
+        # strict=False so a checkpoint can resume the generator into a different
+        # discriminator size (fresh disc keeps its init). Report what didn't match.
+        result = module.load_state_dict(state_dict, strict=False)
+        miss = [k for k in result.missing_keys if not k.startswith("discriminator")]
+        unexp = [k for k in result.unexpected_keys if not k.startswith("discriminator")]
+        print(
+            f"  loaded; discriminator left at init. "
+            f"non-disc missing={len(miss)} unexpected={len(unexp)}"
+        )
+        if miss or unexp:
+            print(f"  WARN non-disc mismatch: missing={miss[:5]} unexpected={unexp[:5]}")
 
     print("Starting training...")
     trainer.fit(module, data_module)
