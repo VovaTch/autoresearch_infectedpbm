@@ -1902,6 +1902,7 @@ class VqganMusicLightningModule(MusicLightningModule):
         generator_loss,
         generator_start_step: int = 10000,
         disc_warmup: int = 0,
+        d_weight_cap: float = 1e4,
         transforms: nn.Sequential | None = None,
         loss_aggregator=None,
         optimizer_cfg: dict[str, Any] | None = None,
@@ -1920,6 +1921,12 @@ class VqganMusicLightningModule(MusicLightningModule):
         # Disc trains alone for `disc_warmup` steps before generator gets the adversarial
         # gradient — gives the cold discriminator a head start vs the converged generator.
         self._disc_warmup = disc_warmup
+        # Upper clamp on the adaptive adversarial weight. The raw ratio
+        # ‖∇rec‖/‖∇gen‖ runs away to a huge ceiling once gen grads shrink, which
+        # dumps an overwhelming adversarial gradient that wrecks reconstruction
+        # (observed: dw4_long regressed all metrics). Cap low (~1) to keep the
+        # GAN as a texture nudge rather than the dominant objective.
+        self._d_weight_cap = d_weight_cap
         self._adv_start = generator_start_step + disc_warmup
         self.optimizer_d = self._build_optimizer_gan(
             optimizer_cfg, ModelPart.DISCRIMINATOR
@@ -1997,7 +2004,7 @@ class VqganMusicLightningModule(MusicLightningModule):
             generator_loss, last_layer.weight, retain_graph=True
         )[0]
         d_weight = torch.norm(rec_grads) / (torch.norm(generator_grads) + 1e-4)
-        d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+        d_weight = torch.clamp(d_weight, 0.0, self._d_weight_cap).detach()
         return d_weight
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
@@ -2185,15 +2192,59 @@ def build_optimizer_cfg() -> dict[str, Any]:
     }
 
 
-def build_scheduler_cfg() -> dict[str, Any]:
+class TimeCosineLR(torch.optim.lr_scheduler.LRScheduler):
+    """Cosine LR decay from base_lr -> min_lr driven by wall-clock training time.
+
+    Training here is time-capped (Timer(minutes=...)), not step-capped, and it/s
+    varies, so the number of steps to completion is unknown. A normal
+    step-indexed cosine would need that count. Instead this drives the schedule by
+    elapsed wall time vs `total_minutes`:
+
+        factor = 0.5 * (1 + cos(pi * t/T))   t = elapsed seconds, T = total
+
+    so lr starts at base_lr (t=0) and reaches min_lr at t=T (clamped past T).
+    The clock starts on the first get_lr() call (i.e. start of training); on a
+    resume the clock restarts, so set --minutes to the resume duration.
+    """
+
+    def __init__(self, optimizer, total_minutes: float, min_lr: float = 0.0, last_epoch: int = -1):
+        self.total_seconds = max(float(total_minutes) * 60.0, 1e-8)
+        self.min_lr = float(min_lr)
+        self._start: float | None = None
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        import math
+        import time
+
+        if self._start is None:
+            self._start = time.monotonic()
+        frac = min((time.monotonic() - self._start) / self.total_seconds, 1.0)
+        cos = 0.5 * (1.0 + math.cos(math.pi * frac))
+        return [self.min_lr + (base - self.min_lr) * cos for base in self.base_lrs]
+
+
+def build_scheduler_cfg(
+    cosine: bool = False, total_minutes: float = 540.0, min_lr: float = 0.0
+) -> dict[str, Any]:
+    module_params = {
+        "loss_monitor": "training/total loss",
+        "interval": "step",
+        "frequency": 1,
+        "trigger_loss": 1e-8,
+    }
+    if cosine:
+        return {
+            # resolve from the running module (__main__ when run as a script,
+            # else "train") so we don't re-import train.py as a second module.
+            "target": f"{__name__}.TimeCosineLR",
+            "total_minutes": total_minutes,
+            "min_lr": min_lr,
+            "module_params": module_params,
+        }
     return {
         "target": "none",
-        "module_params": {
-            "loss_monitor": "training/total loss",
-            "interval": "step",
-            "frequency": 1,
-            "trigger_loss": 1e-8,
-        },
+        "module_params": module_params,
     }
 
 
@@ -2511,6 +2562,7 @@ def build_module(
     time_downsample: int = 2,
     dec_head: str = "complex",
     disc_width: int = 1,
+    d_weight_cap: float = 1e4,
 ) -> VqganMusicLightningModule:
     generator = build_generator(
         loss_aggregator,
@@ -2544,6 +2596,7 @@ def build_module(
         generator_loss=generator_loss,
         generator_start_step=gss,
         disc_warmup=disc_warmup,
+        d_weight_cap=d_weight_cap,
         loss_aggregator=loss_aggregator,
         optimizer_cfg=optimizer_cfg,
         scheduler_cfg=scheduler_cfg,
@@ -2652,6 +2705,34 @@ def parse_args() -> argparse.Namespace:
         "gets the adversarial gradient. Default: 0.",
     )
     parser.add_argument(
+        "--d-weight-cap",
+        type=float,
+        default=1e4,
+        help="Upper clamp on the adaptive adversarial weight (||grad_rec||/||grad_gen||). "
+        "Default 1e4 (legacy). Set low (~1.0) to stop the weight running away and "
+        "overwhelming reconstruction with adversarial gradient.",
+    )
+    parser.add_argument(
+        "--lr-cosine",
+        action="store_true",
+        help="Use a wall-clock cosine LR schedule: lr decays base -> --lr-min over "
+        "--minutes (cos half-period). Off = constant lr.",
+    )
+    parser.add_argument(
+        "--lr-min",
+        type=float,
+        default=0.0,
+        help="Floor LR for --lr-cosine (value at end of training). Default: 0.0.",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Override base learning rate (both generator + discriminator AdamW). "
+        "With --lr-cosine this is the peak. Default: build_learning_params (1e-4). "
+        "Scale ~sqrt(k) or k with effective batch when using k GPUs (DDP).",
+    )
+    parser.add_argument(
         "--save-path",
         type=str,
         default=None,
@@ -2677,8 +2758,18 @@ def main() -> None:
     learning_params = build_learning_params()
     if args.save_path is not None:
         learning_params.save_path = args.save_path
+    if args.lr is not None:
+        learning_params.learning_rate = args.lr
     optimizer_cfg = build_optimizer_cfg()
-    scheduler_cfg = build_scheduler_cfg()
+    if args.lr is not None:
+        # the GAN optimizers are built from optimizer_cfg (target != "none"), so its
+        # "lr" is the one that actually takes effect -- override it too, else the
+        # learning_params value above is ignored. This is also the cosine peak.
+        optimizer_cfg["lr"] = args.lr
+        print(f"learning rate override: {args.lr:.4e}")
+    scheduler_cfg = build_scheduler_cfg(
+        cosine=args.lr_cosine, total_minutes=args.minutes, min_lr=args.lr_min
+    )
     loss_aggregator = build_loss_aggregator(commit_weight=args.commit_weight)
 
     print("Initializing data...")
@@ -2715,6 +2806,7 @@ def main() -> None:
         time_downsample=args.time_downsample,
         dec_head=args.dec_head,
         disc_width=args.disc_width,
+        d_weight_cap=args.d_weight_cap,
     )
 
     if args.checkpoint is not None:

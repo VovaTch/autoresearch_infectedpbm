@@ -29,13 +29,20 @@ OUT = os.path.join(os.path.dirname(__file__), "renders")
 
 CKPTS = {
     # tag: cfg matching the run's arch (token_dim/latent_grid/bypass_vq/arch).
-    "ts1": dict(
-        path="saved_cookie_ts1/last.ckpt", token_dim=512, latent_grid=4,
+    "cos": dict(
+        path="saved_cookie_cos/last.ckpt", token_dim=512, latent_grid=4,
         bypass_vq=False, arch="temporal", num_rq=3, time_downsample=1,
+        disc_width=1,
     ),
-    "ts1_14h": dict(
-        path="saved_cookie_ts1_14h/last.ckpt", token_dim=512, latent_grid=4,
+    "full2g_long": dict(
+        path="saved_cookie_full2g_long/last.ckpt", token_dim=512, latent_grid=4,
         bypass_vq=False, arch="temporal", num_rq=3, time_downsample=1,
+        disc_width=1,
+    ),
+    "full2g_long2": dict(
+        path="saved_cookie_full2g_long2/last.ckpt", token_dim=512, latent_grid=4,
+        bypass_vq=False, arch="temporal", num_rq=3, time_downsample=1,
+        disc_width=1,
     ),
 }
 TRACK_SUBSTR = "Cookie_From_Space"  # restrict clips to this song (slice filenames use underscores)
