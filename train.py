@@ -1398,6 +1398,11 @@ class TemporalEncoder(nn.Module):
         elif self._ze_norm == "rms":
             # unit-RMS per token (keeps norm ~sqrt(token_dim), gentler than l2)
             z_e = z_e * z_e.pow(2).mean(dim=1, keepdim=True).add(1e-5).rsqrt()
+        elif self._ze_norm == "grms":
+            # global-RMS pin: divide by batch-global RMS -> scale-invariant (can't
+            # run away) but KEEPS per-token relative magnitude (unlike l2/rms),
+            # preserving codebook capacity. Pins overall z_e energy to ~1.0.
+            z_e = z_e * z_e.pow(2).mean().add(1e-5).rsqrt()
         return z_e
 
 
@@ -2898,7 +2903,7 @@ def parse_args() -> argparse.Namespace:
         "--ze-norm",
         type=str,
         default="none",
-        choices=["none", "l2", "rms"],
+        choices=["none", "l2", "rms", "grms"],
         help="Normalize encoder output z_e to pin its scale (temporal arch). "
         "none = legacy unconstrained (z_e inflates under high LR -> alignment/"
         "commitment grow unbounded). l2 = unit-norm per token. rms = unit-RMS "
