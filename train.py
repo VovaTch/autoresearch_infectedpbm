@@ -340,7 +340,7 @@ class EMA(L.Callback):
 
 
 def get_trainer(
-    learning_parameters: LearningParameters, minutes: float = 9 * 60
+    learning_parameters: LearningParameters, minutes: int = 9 * 60
 ) -> L.Trainer:
     if not torch.cuda.is_available():
         warnings.warn("CUDA is not available, using CPU")
@@ -360,14 +360,19 @@ def get_trainer(
     )
     loggers: list[Logger] = [tensorboard_logger]
 
-    model_checkpoint_callback = ModelCheckpoint(
+    best_checkpoint_callback = ModelCheckpoint(
         dirpath=save_folder,
-        filename=learning_parameters.model_name,
-        # weights-only discards optimizer_states, which is where EMAOptimizer keeps
-        # the EMA params — i.e. the model that val/test actually evaluates. Keep them.
+        filename=learning_parameters.model_name + "_best",
         save_weights_only=False,
         save_top_k=1,
         monitor=learning_parameters.loss_monitor,
+        enable_version_counter=False,
+    )
+    last_checkpoint_callback = ModelCheckpoint(
+        dirpath=save_folder,
+        filename=learning_parameters.model_name + "_last",
+        save_weights_only=False,
+        save_top_k=1,
         save_last=True,
         enable_version_counter=False,
     )
@@ -386,7 +391,8 @@ def get_trainer(
         logger=loggers,
         callbacks=[
             early_stopping,
-            model_checkpoint_callback,
+            best_checkpoint_callback,
+            last_checkpoint_callback,
             model_summary,
             learning_rate_monitor,
             ema,
@@ -1330,8 +1336,10 @@ class TemporalEncoder(nn.Module):
         kernel_size: int = 5,
         dilation_factor: int = 2,
         time_downsample: int = 2,
+        ze_norm: str = "none",
     ) -> None:
         super().__init__()
+        self._ze_norm = ze_norm
         self._n_fft = n_fft
         self._hop_length = hop_length
         self._win_length = win_length
@@ -1379,7 +1387,18 @@ class TemporalEncoder(nn.Module):
         h = self._res1(h)
         h = self._down(h)
         h = self._res2(h)
-        return self._proj_out(h)  # (B, token_dim, n_frames / time_downsample)
+        z_e = self._proj_out(h)  # (B, token_dim, n_frames / time_downsample)
+        # Pin z_e scale so it can't run away: unconstrained conv output inflates
+        # under high LR -> alignment/commitment MSE (both vs z_e) grow unbounded.
+        # Normalize ONCE here (not inside the RQ select loop, which would force
+        # every residual step to unit-norm and kill refinement).
+        if self._ze_norm == "l2":
+            # unit-norm per token; matches codebook init scale (norm ~1)
+            z_e = F.normalize(z_e, dim=1)
+        elif self._ze_norm == "rms":
+            # unit-RMS per token (keeps norm ~sqrt(token_dim), gentler than l2)
+            z_e = z_e * z_e.pow(2).mean(dim=1, keepdim=True).add(1e-5).rsqrt()
+        return z_e
 
 
 class TemporalDecoder(DecoderBase):
@@ -2101,6 +2120,15 @@ class VqganMusicLightningModule(MusicLightningModule):
             self.untoggle_optimizer(optimizer_g)
             return None
 
+        if phase == "training":
+            # diagnostic: z_e scale drift drives align/commit MSE growth
+            self.log(
+                "training/z_e rms",
+                restructured_outputs["z_e"].detach().pow(2).mean().sqrt(),
+                sync_dist=True,
+                batch_size=self.learning_params.batch_size,
+            )
+
         loss = self.loss_aggregator(restructured_outputs, targets)
         generator_loss = (
             self._generator_loss(restructured_outputs, {}) if gan_active else 0
@@ -2207,7 +2235,9 @@ class TimeCosineLR(torch.optim.lr_scheduler.LRScheduler):
     resume the clock restarts, so set --minutes to the resume duration.
     """
 
-    def __init__(self, optimizer, total_minutes: float, min_lr: float = 0.0, last_epoch: int = -1):
+    def __init__(
+        self, optimizer, total_minutes: float, min_lr: float = 0.0, last_epoch: int = -1
+    ):
         self.total_seconds = max(float(total_minutes) * 60.0, 1e-8)
         self.min_lr = float(min_lr)
         self._start: float | None = None
@@ -2224,8 +2254,68 @@ class TimeCosineLR(torch.optim.lr_scheduler.LRScheduler):
         return [self.min_lr + (base - self.min_lr) * cos for base in self.base_lrs]
 
 
+class TimeOneCycleLR(torch.optim.lr_scheduler.LRScheduler):
+    """Wall-clock one-cycle LR, the time-capped analogue of torch's OneCycleLR.
+
+    OneCycleLR is step-indexed and raises once stepped past `total_steps`; training
+    here is time-capped (Timer(minutes=...)) with unknown step count, so we drive
+    the cycle by elapsed wall time vs `total_minutes` exactly like TimeCosineLR.
+
+    Shape (anneal_strategy='cos', matching torch defaults):
+        warmup  (frac < pct_start): initial_lr -> max_lr   over the first pct_start
+        anneal  (frac >= pct_start): max_lr     -> min_lr   over the remainder
+    Default pct_start=0.1 (rise over first 10% of training time, then anneal).
+    with initial_lr = max_lr/div_factor and min_lr = initial_lr/final_div_factor.
+    Clock starts on the first get_lr() (start of training); on resume it restarts,
+    so set --minutes to the resume duration (same caveat as TimeCosineLR).
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        total_minutes: float,
+        max_lr: float,
+        pct_start: float = 0.1,
+        div_factor: float = 25.0,
+        final_div_factor: float = 1e4,
+        last_epoch: int = -1,
+    ):
+        self.total_seconds = max(float(total_minutes) * 60.0, 1e-8)
+        self.max_lr = float(max_lr)
+        self.pct_start = float(pct_start)
+        self.initial_lr = self.max_lr / float(div_factor)
+        self.min_lr = self.initial_lr / float(final_div_factor)
+        self._start: float | None = None
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        import math
+        import time
+
+        if self._start is None:
+            self._start = time.monotonic()
+        frac = min((time.monotonic() - self._start) / self.total_seconds, 1.0)
+        if frac < self.pct_start:
+            # warmup: initial_lr -> max_lr, cosine ease-in
+            p = frac / self.pct_start
+            lr = self.initial_lr + (self.max_lr - self.initial_lr) * (
+                1.0 - math.cos(math.pi * p)
+            ) / 2.0
+        else:
+            # anneal: max_lr -> min_lr, cosine ease-out
+            p = (frac - self.pct_start) / max(1.0 - self.pct_start, 1e-8)
+            lr = self.min_lr + (self.max_lr - self.min_lr) * (
+                1.0 + math.cos(math.pi * p)
+            ) / 2.0
+        return [lr for _ in self.base_lrs]
+
+
 def build_scheduler_cfg(
-    cosine: bool = False, total_minutes: float = 540.0, min_lr: float = 0.0
+    cosine: bool = False,
+    total_minutes: float = 540.0,
+    min_lr: float = 0.0,
+    onecycle: bool = False,
+    max_lr: float = 1e-4,
 ) -> dict[str, Any]:
     module_params = {
         "loss_monitor": "training/total loss",
@@ -2233,6 +2323,15 @@ def build_scheduler_cfg(
         "frequency": 1,
         "trigger_loss": 1e-8,
     }
+    if onecycle:
+        return {
+            # resolve from the running module (__main__ when run as a script,
+            # else "train") so we don't re-import train.py as a second module.
+            "target": f"{__name__}.TimeOneCycleLR",
+            "total_minutes": total_minutes,
+            "max_lr": max_lr,
+            "module_params": module_params,
+        }
     if cosine:
         return {
             # resolve from the running module (__main__ when run as a script,
@@ -2285,7 +2384,9 @@ def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
         AlignLoss(name="alignment_loss", weight=0.75, base_loss=nn.MSELoss()),
         # commit_weight anchors unnormalized z_e to the codebook; 0.75 was too weak
         # (z_e magnitude outran codes -> alignment drifted unbounded over 3h runs)
-        CommitLoss(name="commitment_loss", weight=commit_weight, base_loss=nn.MSELoss()),
+        CommitLoss(
+            name="commitment_loss", weight=commit_weight, base_loss=nn.MSELoss()
+        ),
         MelSpecLoss(
             name="melspec_loss_1",
             weight=1.0,
@@ -2452,14 +2553,22 @@ def build_generator(
     num_rq_steps: int = 3,
     time_downsample: int = 2,
     dec_head: str = "complex",
+    hidden: int = 512,
+    ze_norm: str = "none",
 ) -> MultiLvlVQVariationalAutoEncoder:
     if arch == "temporal":
         # 32768-sample slice, hop 256 -> 128 STFT frames -> T_lat=128/time_downsample
         encoder: nn.Module = TemporalEncoder(
-            token_dim=token_dim, time_downsample=time_downsample
+            token_dim=token_dim,
+            hidden=hidden,
+            time_downsample=time_downsample,
+            ze_norm=ze_norm,
         )
         decoder: DecoderBase = TemporalDecoder(
-            token_dim=token_dim, time_upsample=time_downsample, head=dec_head
+            token_dim=token_dim,
+            hidden=hidden,
+            time_upsample=time_downsample,
+            head=dec_head,
         )
     else:
         encoder = build_encoder(token_dim, latent_grid)
@@ -2547,6 +2656,39 @@ def build_discriminator(disc_width: int = 1) -> EnsembleDiscriminator:
     )
 
 
+def partial_load_state_dict(module: nn.Module, src: dict[str, torch.Tensor]) -> None:
+    """Option-1 weight surgery: warm-start a (possibly wider) model from a narrower
+    checkpoint. For each destination param present in src:
+      - identical shape  -> copy whole (codebook, projections on unchanged axes, ...)
+      - differing shape  -> copy the overlapping min-size sub-block on every axis
+                            (widened convs: src [512,512,k] into dst [1024,1024,k][:512,:512])
+    Anything not in src, or with no overlap, is left at its fresh init. Not
+    function-preserving (new channels are random), but transfers learned filters +
+    the trained codebook. Reports coverage."""
+    dst = module.state_dict()
+    full, partial, skipped = 0, 0, 0
+    with torch.no_grad():
+        for k, dparam in dst.items():
+            s = src.get(k)
+            if s is None:
+                skipped += 1
+                continue
+            if s.shape == dparam.shape:
+                dparam.copy_(s)
+                full += 1
+            elif s.dim() == dparam.dim():
+                sl = tuple(slice(0, min(a, b)) for a, b in zip(dparam.shape, s.shape))
+                dparam[sl].copy_(s[sl])
+                partial += 1
+            else:
+                skipped += 1
+    module.load_state_dict(dst)
+    print(
+        f"  partial load: {full} full-copied, {partial} slice-copied, "
+        f"{skipped} left-at-init (of {len(dst)} dst params; {len(src)} in src)"
+    )
+
+
 def build_module(
     learning_params: LearningParameters,
     loss_aggregator: WeightedSumAggregator,
@@ -2563,6 +2705,8 @@ def build_module(
     dec_head: str = "complex",
     disc_width: int = 1,
     d_weight_cap: float = 1e4,
+    hidden: int = 512,
+    ze_norm: str = "none",
 ) -> VqganMusicLightningModule:
     generator = build_generator(
         loss_aggregator,
@@ -2573,6 +2717,8 @@ def build_module(
         num_rq_steps=num_rq_steps,
         time_downsample=time_downsample,
         dec_head=dec_head,
+        hidden=hidden,
+        ze_norm=ze_norm,
     )
     discriminator = build_discriminator(disc_width=disc_width)
 
@@ -2725,12 +2871,47 @@ def parse_args() -> argparse.Namespace:
         help="Floor LR for --lr-cosine (value at end of training). Default: 0.0.",
     )
     parser.add_argument(
+        "--lr-onecycle",
+        action="store_true",
+        help="Use a wall-clock one-cycle LR schedule (time-capped analogue of "
+        "torch OneCycleLR): warmup max_lr/25 -> --lr (peak) over first 10%% of "
+        "--minutes, then anneal down to near-zero. --lr is the peak. Overrides "
+        "--lr-cosine.",
+    )
+    parser.add_argument(
         "--lr",
         type=float,
         default=None,
         help="Override base learning rate (both generator + discriminator AdamW). "
         "With --lr-cosine this is the peak. Default: build_learning_params (1e-4). "
         "Scale ~sqrt(k) or k with effective batch when using k GPUs (DDP).",
+    )
+    parser.add_argument(
+        "--hidden",
+        type=int,
+        default=512,
+        help="Temporal arch conv channel width (TemporalEncoder/Decoder Res1DBlocks). "
+        "512 = legacy (~41.5M gen). Wider = more capacity (~width^2 on conv layers). "
+        "token_dim/codebook unchanged. Default: 512.",
+    )
+    parser.add_argument(
+        "--ze-norm",
+        type=str,
+        default="none",
+        choices=["none", "l2", "rms"],
+        help="Normalize encoder output z_e to pin its scale (temporal arch). "
+        "none = legacy unconstrained (z_e inflates under high LR -> alignment/"
+        "commitment grow unbounded). l2 = unit-norm per token. rms = unit-RMS "
+        "per token. Default: none.",
+    )
+    parser.add_argument(
+        "--init-from",
+        type=str,
+        default=None,
+        help="Warm-start a (possibly wider) model from a checkpoint via partial weight "
+        "surgery: tensors copied where shapes match (codebook etc.), slice-copied into "
+        "the overlapping [:n] sub-block where they differ (widened convs), rest left at "
+        "init. Use to bootstrap a --hidden-widened model from a narrower one.",
     )
     parser.add_argument(
         "--save-path",
@@ -2768,7 +2949,11 @@ def main() -> None:
         optimizer_cfg["lr"] = args.lr
         print(f"learning rate override: {args.lr:.4e}")
     scheduler_cfg = build_scheduler_cfg(
-        cosine=args.lr_cosine, total_minutes=args.minutes, min_lr=args.lr_min
+        cosine=args.lr_cosine,
+        total_minutes=args.minutes,
+        min_lr=args.lr_min,
+        onecycle=args.lr_onecycle,
+        max_lr=(args.lr if args.lr is not None else 1e-4),
     )
     loss_aggregator = build_loss_aggregator(commit_weight=args.commit_weight)
 
@@ -2807,7 +2992,15 @@ def main() -> None:
         dec_head=args.dec_head,
         disc_width=args.disc_width,
         d_weight_cap=args.d_weight_cap,
+        hidden=args.hidden,
+        ze_norm=args.ze_norm,
     )
+
+    if args.init_from is not None:
+        print(f"Warm-starting (partial surgery) from {args.init_from}...")
+        ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        src = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+        partial_load_state_dict(module, src)
 
     if args.checkpoint is not None:
         print(f"Loading model weights from {args.checkpoint}...")
@@ -2823,7 +3016,9 @@ def main() -> None:
             f"non-disc missing={len(miss)} unexpected={len(unexp)}"
         )
         if miss or unexp:
-            print(f"  WARN non-disc mismatch: missing={miss[:5]} unexpected={unexp[:5]}")
+            print(
+                f"  WARN non-disc mismatch: missing={miss[:5]} unexpected={unexp[:5]}"
+            )
 
     print("Starting training...")
     trainer.fit(module, data_module)
