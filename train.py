@@ -2910,6 +2910,16 @@ def parse_args() -> argparse.Namespace:
         "per token. Default: none.",
     )
     parser.add_argument(
+        "--codebook-grow",
+        type=str,
+        default="random",
+        choices=["random", "concat"],
+        help="When --init-from a checkpoint with smaller --token-dim: how to init the "
+        "widened codebook's new dims. random = fresh init (default; partial-load "
+        "slice-copies the old block). concat = tile the trained codebook across the "
+        "new dims (each code starts as a repeat of itself).",
+    )
+    parser.add_argument(
         "--init-from",
         type=str,
         default=None,
@@ -3006,6 +3016,20 @@ def main() -> None:
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
         src = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
         partial_load_state_dict(module, src)
+        # token_dim grow: partial_load slice-copies the codebook's old [:, :old]
+        # block and leaves the new dims at fresh random init (= "random"). For
+        # "concat", tile the trained codebook across the new dims instead so each
+        # new code starts as a repeat of the old (every code [c, c, ...]).
+        if args.codebook_grow == "concat":
+            cb_key = "model.vq_module.vq_codebook.code_embedding"
+            s = src.get(cb_key)
+            cb = dict(module.named_parameters()).get(cb_key)
+            if s is not None and cb is not None and cb.shape[1] > s.shape[1]:
+                old, new = s.shape[1], cb.shape[1]
+                reps = (new + old - 1) // old
+                with torch.no_grad():
+                    cb.copy_(s.repeat(1, reps)[:, :new])
+                print(f"  codebook grow=concat: tiled token_dim {old} -> {new}")
 
     if args.checkpoint is not None:
         print(f"Loading model weights from {args.checkpoint}...")
