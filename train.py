@@ -2368,6 +2368,7 @@ def main() -> None:
     learning_params = build_learning_params()
     if tr.get("save_path") is not None:
         learning_params.save_path = tr["save_path"]
+    learning_params.devices = tr.get("devices", "auto")
     learning_params.learning_rate = tr["lr"]
     optimizer_cfg = build_optimizer_cfg()
     # the GAN optimizers build from optimizer_cfg, so its "lr" is the one that
