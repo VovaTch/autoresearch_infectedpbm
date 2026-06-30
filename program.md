@@ -23,7 +23,7 @@ Each experiment on the number of GPUs available to the system, might be 1, might
 
 **What you CAN do:**
 
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- Modify `train.py` and `config.yaml` — these are the two files you edit. `config.yaml` holds the run knobs (model width/token dim, RQ depth, GAN start step + adversarial weight cap, learning rate / one-cycle warmup, training minutes, single-song-vs-full-dataset toggle, checkpoint to resume). `train.py` holds the architecture, losses, optimizer, and training loop. Tune hyperparameters in `config.yaml`; change code/architecture in `train.py`. Everything is fair game.
 - Modify the losses in train.py. Eventually, I want you to have the most fateful reconstruction of music to the human ear, everything else is fair game.
 - If memory and speed permits, run multiple training runs concurrently, keep in mind that too many processes slows the GPUs even if we don't run out of memory.
 

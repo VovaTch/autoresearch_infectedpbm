@@ -23,26 +23,17 @@ from train import (
 
 SR = 44100
 SLICE = 32768
-SLICES_PER_CLIP = 4  # ~2.97s clips
+SLICES_PER_CLIP = 14  # ~10.4s clips (14 * 32768 / 44100); sequential slices stitched
 CACHE = os.path.expanduser("~/.cache/infected_pbm/slices")
 OUT = os.path.join(os.path.dirname(__file__), "renders")
 
 CKPTS = {
-    # tag: cfg matching the run's arch (token_dim/latent_grid/bypass_vq/arch).
-    "cos": dict(
-        path="saved_cookie_cos/last.ckpt", token_dim=512, latent_grid=4,
-        bypass_vq=False, arch="temporal", num_rq=3, time_downsample=1,
-        disc_width=1,
-    ),
-    "full2g_long": dict(
-        path="saved_cookie_full2g_long/last.ckpt", token_dim=512, latent_grid=4,
-        bypass_vq=False, arch="temporal", num_rq=3, time_downsample=1,
-        disc_width=1,
-    ),
-    "full2g_long2": dict(
-        path="saved_cookie_full2g_long2/last.ckpt", token_dim=512, latent_grid=4,
-        bypass_vq=False, arch="temporal", num_rq=3, time_downsample=1,
-        disc_width=1,
+    # tag -> checkpoint to render. cfg fields must match config.yaml's model block
+    # (token_dim/hidden/num_rq/num_tokens/time_downsample). Paths point at the
+    # best-on-monitor checkpoint (model_name + "_best.ckpt").
+    "model": dict(
+        path="saved/lvl1_vqgan_best.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
     ),
 }
 TRACK_SUBSTR = "Cookie_From_Space"  # restrict clips to this song (slice filenames use underscores)
@@ -76,12 +67,11 @@ def _apply_ema(module, ckpt) -> bool:
     return False
 
 
-def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 512, latent_grid: int = 4, bypass_vq: bool = False, arch: str = "legacy", num_rq: int = 3, time_downsample: int = 2, dec_head: str = "complex", disc_width: int = 1):
+def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 1024, num_rq: int = 3, num_tokens: int = 2048, time_downsample: int = 1, hidden: int = 1024):
     module = build_module(
         lp, la, oc, sc,
-        token_dim=token_dim, latent_grid=latent_grid, bypass_vq=bypass_vq, arch=arch,
-        num_rq_steps=num_rq, time_downsample=time_downsample, dec_head=dec_head,
-        disc_width=disc_width,
+        token_dim=token_dim, num_rq_steps=num_rq, num_tokens=num_tokens,
+        time_downsample=time_downsample, hidden=hidden,
     )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
@@ -151,12 +141,11 @@ def main():
             print(f"Loading {tag} <- {path} ({ {k: v for k, v in cfg.items() if k != 'path'} })")
             modules[tag] = load_module(
                 path, lp, oc, sc, la,
-                token_dim=cfg["token_dim"], latent_grid=cfg["latent_grid"],
-                bypass_vq=cfg["bypass_vq"], arch=cfg["arch"],
+                token_dim=cfg.get("token_dim", 1024),
                 num_rq=cfg.get("num_rq", 3),
-                time_downsample=cfg.get("time_downsample", 2),
-                dec_head=cfg.get("dec_head", "complex"),
-                disc_width=cfg.get("disc_width", 1),
+                num_tokens=cfg.get("num_tokens", 2048),
+                time_downsample=cfg.get("time_downsample", 1),
+                hidden=cfg.get("hidden", 1024),
             )
         else:
             print(f"SKIP {tag}: {path} missing")

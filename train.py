@@ -13,6 +13,8 @@ import importlib
 import os
 import threading
 import warnings
+
+import yaml
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -1011,152 +1013,9 @@ class Res1DBlockReverse(Res1DBlock):
                 )
 
 
-class Res2DBlock(nn.Module):
-    def __init__(
-        self,
-        num_channels: int,
-        num_res_conv: int,
-        kernel_size: tuple[int, int],
-        activation_fn: nn.Module = nn.GELU(),
-        dilation_factor: int = 1,
-    ) -> None:
-        super().__init__()
-        self._activation_fn = activation_fn
-        layers = []
-        for idx in range(num_res_conv - 1):
-            dilation = dilation_factor**idx
-            padding_x = (
-                kernel_size[0] + (kernel_size[0] - 1) * (dilation - 1) - 1
-            ) // 2
-            padding_y = (
-                kernel_size[1] + (kernel_size[1] - 1) * (dilation - 1) - 1
-            ) // 2
-            layers.append(
-                nn.Conv2d(
-                    num_channels,
-                    num_channels,
-                    kernel_size=kernel_size,
-                    dilation=dilation,
-                    padding=(padding_x, padding_y),
-                )
-            )
-            layers.append(activation_fn)
-            layers.append(nn.BatchNorm2d(num_channels))
-        padding_x = (
-            kernel_size[0]
-            + (kernel_size[0] - 1) * (dilation_factor ** (num_res_conv - 1) - 1)
-            - 1
-        ) // 2
-        padding_y = (
-            kernel_size[1]
-            + (kernel_size[1] - 1) * (dilation_factor ** (num_res_conv - 1) - 1)
-            - 1
-        ) // 2
-        layers.append(
-            nn.Conv2d(
-                num_channels,
-                num_channels,
-                kernel_size=kernel_size,
-                dilation=dilation_factor ** (num_res_conv - 1),
-                padding=(padding_x, padding_y),
-            )
-        )
-        layers.append(nn.BatchNorm2d(num_channels))
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_init = x.clone()
-        x = self.layers(x)
-        return x + x_init
-
-
 # ===========================================================================
 # Encoder
 # ===========================================================================
-
-
-class EncoderConv2D(nn.Module):
-    def __init__(
-        self,
-        channel_list: list[int],
-        dim_change_list: list[int],
-        kernel_size: int,
-        num_res_block_conv: int,
-        n_fft: int,
-        hop_length: int,
-        win_length: int,
-        lstm_hiddem_dim: int = 64,
-        dilation_factor: int = 1,
-        activation_fn: nn.Module = nn.GELU(),
-    ) -> None:
-        super().__init__()
-        if len(channel_list) != len(dim_change_list) + 1:
-            raise ValueError(
-                "The length of `channel_list` must be one greater than the length of `dim_change_list`."
-            )
-        self._n_fft = n_fft
-        self._hop_length = hop_length
-        self._win_length = win_length
-
-        layers = []
-        for idx in range(len(dim_change_list)):
-            layers.append(
-                Res2DBlock(
-                    channel_list[idx],
-                    num_res_block_conv,
-                    (kernel_size, 1),
-                    activation_fn,
-                    dilation_factor=dilation_factor,
-                )
-            )
-            layers.append(
-                nn.Conv2d(
-                    channel_list[idx],
-                    channel_list[idx + 1],
-                    kernel_size,
-                    stride=dim_change_list[idx],
-                    padding=kernel_size // dim_change_list[idx],
-                )
-            )
-        layers.append(
-            Res2DBlock(
-                channel_list[-1], num_res_block_conv, (kernel_size, 1), activation_fn
-            )
-        )
-        self.layers = nn.Sequential(*layers)
-
-        self._lstm = nn.LSTM(
-            input_size=channel_list[-1],
-            hidden_size=lstm_hiddem_dim,
-            num_layers=2,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.0,
-        )
-        self._post_lstm_proj = nn.Conv1d(
-            lstm_hiddem_dim * 2, channel_list[-1], kernel_size=3, padding=1
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        window = torch.hann_window(self._win_length).to(x.device)
-        x = torch.stft(
-            x.flatten(start_dim=1, end_dim=2),
-            n_fft=self._n_fft,
-            hop_length=self._hop_length,
-            win_length=self._win_length,
-            return_complex=True,
-            window=window,
-        )
-        x = torch.view_as_real(x)
-        x = x.permute((0, 3, 1, 2)).contiguous()
-        x = x[..., : x.shape[2] - 1, : x.shape[3] - 1]
-        x = self.layers(x)
-        x = x.transpose(2, 3).flatten(start_dim=2, end_dim=3)
-        lstm_in = x.transpose(1, 2).contiguous()
-        lstm_out, _ = self._lstm(lstm_in)
-        lstm_out = lstm_out.transpose(1, 2).contiguous()
-        output = self._post_lstm_proj(lstm_out)
-        return output
 
 
 # ===========================================================================
@@ -1222,98 +1081,6 @@ class DecoderBase(ABC, nn.Module):
     def last_layer(self) -> nn.Module: ...
 
 
-class StftDecoder2D(DecoderBase):
-    def __init__(
-        self,
-        channel_list: list[int],
-        dim_change_list: list[int],
-        kernel_size: int,
-        dim_add_kernel_add: int,
-        num_res_block_conv: int,
-        n_fft: int,
-        hop_length: int,
-        win_length: int,
-        activation_fn: nn.Module = nn.GELU(),
-        output_conv_hidden_dim: int = 32,
-        dropout: float = 0.1,
-        dilation_factor: int = 1,
-        padding: Literal["center", "same"] = "same",
-    ):
-        super().__init__()
-        if len(channel_list) != len(dim_change_list) + 1:
-            raise ValueError(
-                "The channel list length must be greater than the dimension change list by 1"
-            )
-        self._dropout = nn.Dropout(dropout)
-        self._activation = activation_fn
-        self._end_conv = nn.Sequential(
-            nn.Conv1d(1, output_conv_hidden_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv1d(
-                output_conv_hidden_dim, output_conv_hidden_dim, kernel_size=3, padding=1
-            ),
-            self._dropout,
-            nn.LeakyReLU(0.2),
-            nn.Conv1d(output_conv_hidden_dim, 1, kernel_size=3, padding=1),
-        )
-        self._istft = ISTFT(n_fft, hop_length, win_length, padding)
-        self._before_istft_dim = n_fft // 2 + 1
-        self._proj_before_istft = nn.Linear(
-            prod(dim_change_list) * channel_list[-1], self._before_istft_dim * 2
-        )
-        self.conv_list = nn.ModuleList(
-            [nn.Identity()]
-            + [
-                Res2DBlock(
-                    num_channels=channel_list[idx],
-                    num_res_conv=num_res_block_conv,
-                    kernel_size=(kernel_size, kernel_size),
-                    activation_fn=activation_fn,
-                    dilation_factor=dilation_factor,
-                )
-                for idx in range(1, len(dim_change_list))
-            ]
-        )
-        if dim_add_kernel_add % 2 != 0:
-            raise ValueError("dim_add_kernel_size must be an even number.")
-        self.dim_change_list = nn.ModuleList(
-            [
-                nn.ConvTranspose2d(
-                    channel_list[idx],
-                    channel_list[idx + 1],
-                    kernel_size=dim_change_list[idx] + dim_add_kernel_add,
-                    stride=dim_change_list[idx],
-                    padding=dim_add_kernel_add // 2,
-                )
-                for idx in range(len(dim_change_list))
-            ]
-        )
-        self.required_post_channel_size = channel_list[1]
-        self._pre_stft_layer_norm = nn.LayerNorm(prod(dim_change_list))
-
-    @property
-    def last_layer(self) -> nn.Module:
-        return self._end_conv[-1]
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        z = z.unsqueeze(-1)
-        for conv, dim_change in zip(self.conv_list, self.dim_change_list):
-            z = conv(z)
-            z = self._dropout(z)
-            z = dim_change(z)
-            z = self._activation(z)
-        z = self._pre_stft_layer_norm(z)
-        z = z.transpose(1, 2).contiguous().flatten(start_dim=2)
-        z = self._dropout(z)
-        before_split = self._proj_before_istft(z)
-        real_part = before_split[..., : self._before_istft_dim].clone()
-        imag_part = before_split[..., self._before_istft_dim :].clone()
-        complex_z = torch.complex(real_part, imag_part).to(z.device)
-        output_z = self._istft.forward(complex_z.transpose(1, 2).contiguous())
-        output_z = self._end_conv(output_z.unsqueeze(1))
-        return output_z
-
-
 # ===========================================================================
 # Temporal codec (EnCodec-style layout): STFT freq bins -> CHANNELS, conv
 # stride along TIME only. Latent = one vector per ~17ms (T_lat frames/slice).
@@ -1336,10 +1103,8 @@ class TemporalEncoder(nn.Module):
         kernel_size: int = 5,
         dilation_factor: int = 2,
         time_downsample: int = 2,
-        ze_norm: str = "none",
     ) -> None:
         super().__init__()
-        self._ze_norm = ze_norm
         self._n_fft = n_fft
         self._hop_length = hop_length
         self._win_length = win_length
@@ -1390,20 +1155,10 @@ class TemporalEncoder(nn.Module):
         z_e = self._proj_out(h)  # (B, token_dim, n_frames / time_downsample)
         # Pin z_e scale so it can't run away: unconstrained conv output inflates
         # under high LR -> alignment/commitment MSE (both vs z_e) grow unbounded.
-        # Normalize ONCE here (not inside the RQ select loop, which would force
-        # every residual step to unit-norm and kill refinement).
-        if self._ze_norm == "l2":
-            # unit-norm per token; matches codebook init scale (norm ~1)
-            z_e = F.normalize(z_e, dim=1)
-        elif self._ze_norm == "rms":
-            # unit-RMS per token (keeps norm ~sqrt(token_dim), gentler than l2)
-            z_e = z_e * z_e.pow(2).mean(dim=1, keepdim=True).add(1e-5).rsqrt()
-        elif self._ze_norm == "grms":
-            # global-RMS pin: divide by batch-global RMS -> scale-invariant (can't
-            # run away) but KEEPS per-token relative magnitude (unlike l2/rms),
-            # preserving codebook capacity. Pins overall z_e energy to ~1.0.
-            z_e = z_e * z_e.pow(2).mean().add(1e-5).rsqrt()
-        return z_e
+        # l2 normalize ONCE here (unit-norm per token, matches codebook init scale
+        # ~1) -- NOT inside the RQ select loop, which would force every residual
+        # step to unit-norm and kill refinement.
+        return F.normalize(z_e, dim=1)
 
 
 class TemporalDecoder(DecoderBase):
@@ -1420,15 +1175,11 @@ class TemporalDecoder(DecoderBase):
         dilation_factor: int = 2,
         time_upsample: int = 2,
         output_conv_hidden_dim: int = 32,
-        head: str = "complex",
     ) -> None:
         super().__init__()
-        self._head = head
         self._spec_bins = n_fft // 2 + 1
-        # complex head: raw (real, imag). magphase head (Vocos-style): predicts
-        # log-magnitude + phase direction (x, y) -> exp(m) * (x, y)/|..| — decouples
-        # energy from phase, typically yields cleaner harmonics than raw real/imag.
-        out_dim = self._spec_bins * (3 if head == "magphase" else 2)
+        # complex head: decoder predicts raw (real, imag) STFT -> ISTFT.
+        out_dim = self._spec_bins * 2
         self._proj_in = nn.Conv1d(token_dim, hidden, kernel_size=3, padding=1)
         self._res1 = nn.Sequential(
             *[
@@ -1477,13 +1228,7 @@ class TemporalDecoder(DecoderBase):
         h = self._res2(h)
         spec = self._proj_spec(h)
         b = self._spec_bins
-        if self._head == "magphase":
-            m, x_, y_ = spec[:, :b], spec[:, b : 2 * b], spec[:, 2 * b :]
-            mag = torch.exp(m.clamp(max=8.0))
-            denom = torch.sqrt(x_ * x_ + y_ * y_ + 1e-8)
-            complex_spec = torch.complex(mag * x_ / denom, mag * y_ / denom)
-        else:
-            complex_spec = torch.complex(spec[:, :b], spec[:, b:])
+        complex_spec = torch.complex(spec[:, :b], spec[:, b:])
         y = self._istft(complex_spec)  # (B, L)
         return self._end_conv(y.unsqueeze(1))  # (B, 1, L)
 
@@ -2225,54 +1970,20 @@ def build_optimizer_cfg() -> dict[str, Any]:
     }
 
 
-class TimeCosineLR(torch.optim.lr_scheduler.LRScheduler):
-    """Cosine LR decay from base_lr -> min_lr driven by wall-clock training time.
-
-    Training here is time-capped (Timer(minutes=...)), not step-capped, and it/s
-    varies, so the number of steps to completion is unknown. A normal
-    step-indexed cosine would need that count. Instead this drives the schedule by
-    elapsed wall time vs `total_minutes`:
-
-        factor = 0.5 * (1 + cos(pi * t/T))   t = elapsed seconds, T = total
-
-    so lr starts at base_lr (t=0) and reaches min_lr at t=T (clamped past T).
-    The clock starts on the first get_lr() call (i.e. start of training); on a
-    resume the clock restarts, so set --minutes to the resume duration.
-    """
-
-    def __init__(
-        self, optimizer, total_minutes: float, min_lr: float = 0.0, last_epoch: int = -1
-    ):
-        self.total_seconds = max(float(total_minutes) * 60.0, 1e-8)
-        self.min_lr = float(min_lr)
-        self._start: float | None = None
-        super().__init__(optimizer, last_epoch)
-
-    def get_lr(self):
-        import math
-        import time
-
-        if self._start is None:
-            self._start = time.monotonic()
-        frac = min((time.monotonic() - self._start) / self.total_seconds, 1.0)
-        cos = 0.5 * (1.0 + math.cos(math.pi * frac))
-        return [self.min_lr + (base - self.min_lr) * cos for base in self.base_lrs]
-
-
 class TimeOneCycleLR(torch.optim.lr_scheduler.LRScheduler):
     """Wall-clock one-cycle LR, the time-capped analogue of torch's OneCycleLR.
 
     OneCycleLR is step-indexed and raises once stepped past `total_steps`; training
     here is time-capped (Timer(minutes=...)) with unknown step count, so we drive
-    the cycle by elapsed wall time vs `total_minutes` exactly like TimeCosineLR.
+    the cycle by elapsed wall time vs `total_minutes`.
 
     Shape (anneal_strategy='cos', matching torch defaults):
         warmup  (frac < pct_start): initial_lr -> max_lr   over the first pct_start
         anneal  (frac >= pct_start): max_lr     -> min_lr   over the remainder
-    Default pct_start=0.1 (rise over first 10% of training time, then anneal).
+    Default pct_start=0.1 (rise over first 10% of training time, then anneal),
     with initial_lr = max_lr/div_factor and min_lr = initial_lr/final_div_factor.
     Clock starts on the first get_lr() (start of training); on resume it restarts,
-    so set --minutes to the resume duration (same caveat as TimeCosineLR).
+    so set minutes to the resume duration.
     """
 
     def __init__(
@@ -2316,11 +2027,9 @@ class TimeOneCycleLR(torch.optim.lr_scheduler.LRScheduler):
 
 
 def build_scheduler_cfg(
-    cosine: bool = False,
     total_minutes: float = 540.0,
-    min_lr: float = 0.0,
-    onecycle: bool = False,
     max_lr: float = 1e-4,
+    pct_start: float = 0.1,
 ) -> dict[str, Any]:
     module_params = {
         "loss_monitor": "training/total loss",
@@ -2328,26 +2037,13 @@ def build_scheduler_cfg(
         "frequency": 1,
         "trigger_loss": 1e-8,
     }
-    if onecycle:
-        return {
-            # resolve from the running module (__main__ when run as a script,
-            # else "train") so we don't re-import train.py as a second module.
-            "target": f"{__name__}.TimeOneCycleLR",
-            "total_minutes": total_minutes,
-            "max_lr": max_lr,
-            "module_params": module_params,
-        }
-    if cosine:
-        return {
-            # resolve from the running module (__main__ when run as a script,
-            # else "train") so we don't re-import train.py as a second module.
-            "target": f"{__name__}.TimeCosineLR",
-            "total_minutes": total_minutes,
-            "min_lr": min_lr,
-            "module_params": module_params,
-        }
     return {
-        "target": "none",
+        # resolve from the running module (__main__ when run as a script, else
+        # "train") so we don't re-import train.py as a second module.
+        "target": f"{__name__}.TimeOneCycleLR",
+        "total_minutes": total_minutes,
+        "max_lr": max_lr,
+        "pct_start": pct_start,
         "module_params": module_params,
     }
 
@@ -2486,105 +2182,35 @@ def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
     return WeightedSumAggregator(components)
 
 
-def build_encoder(token_dim: int = 512, latent_grid: int = 4) -> EncoderConv2D:
-    # latent_grid: spatial size of the latent (grid x grid positions per slice).
-    # 4 = legacy (6 stride-2 stages, 16 positions, LSTM hidden 64 -> 128-dim cap).
-    # 8 = capacity arch (5 stages, 64 positions, LSTM hidden 256 -> full-rank 512).
-    if latent_grid == 8:
-        channel_list = [2, 16, 32, 64, 128, token_dim]
-        dim_change_list = [2, 2, 2, 2, 2]
-        lstm_hidden = 256
-    else:
-        channel_list = [2, 16, 32, 64, 128, 256, token_dim]
-        dim_change_list = [2, 2, 2, 2, 2, 2]
-        lstm_hidden = 64
-    return EncoderConv2D(
-        # final channel == token_dim (encoder output is the pre-quantization latent z_e)
-        channel_list=channel_list,
-        dim_change_list=dim_change_list,
-        kernel_size=5,
-        num_res_block_conv=3,
-        dilation_factor=2,
-        n_fft=512,
-        hop_length=128,
-        win_length=512,
-        lstm_hiddem_dim=lstm_hidden,
-        activation_fn=nn.GELU(),
-    )
-
-
-def build_decoder(token_dim: int = 512, latent_grid: int = 4) -> StftDecoder2D:
-    if latent_grid == 8:
-        # 64 latent positions -> x4 -> 256 STFT frames, hop 128 -> 32768 samples
-        return StftDecoder2D(
-            channel_list=[token_dim, 512, 256],
-            dim_change_list=[2, 2],
-            kernel_size=5,
-            dim_add_kernel_add=0,
-            num_res_block_conv=1,
-            activation_fn=nn.GELU(),
-            dropout=0.0,
-            dilation_factor=2,
-            n_fft=512,
-            hop_length=128,
-            win_length=512,
-        )
-    return StftDecoder2D(
-        # first channel == token_dim (decoder input is the quantized latent z_q)
-        channel_list=[token_dim, 512, 384, 256],
-        dim_change_list=[2, 2, 2],
-        kernel_size=5,
-        dim_add_kernel_add=0,
-        num_res_block_conv=1,
-        activation_fn=nn.GELU(),
-        dropout=0.0,
-        dilation_factor=2,
-        n_fft=1024,
-        hop_length=256,
-        win_length=1024,
-    )
-
-
-def build_vq_module(token_dim: int = 512, num_rq_steps: int = 3) -> VQ1D:
-    return VQ1D(token_dim=token_dim, num_tokens=2048, num_rq_steps=num_rq_steps)
+def build_vq_module(
+    token_dim: int = 512, num_rq_steps: int = 3, num_tokens: int = 2048
+) -> VQ1D:
+    return VQ1D(token_dim=token_dim, num_tokens=num_tokens, num_rq_steps=num_rq_steps)
 
 
 def build_generator(
     loss_aggregator: WeightedSumAggregator,
-    token_dim: int = 512,
-    latent_grid: int = 4,
-    bypass_vq: bool = False,
-    arch: str = "legacy",
+    token_dim: int = 1024,
     num_rq_steps: int = 3,
-    time_downsample: int = 2,
-    dec_head: str = "complex",
-    hidden: int = 512,
-    ze_norm: str = "none",
+    num_tokens: int = 2048,
+    time_downsample: int = 1,
+    hidden: int = 1024,
 ) -> MultiLvlVQVariationalAutoEncoder:
-    if arch == "temporal":
-        # 32768-sample slice, hop 256 -> 128 STFT frames -> T_lat=128/time_downsample
-        encoder: nn.Module = TemporalEncoder(
-            token_dim=token_dim,
-            hidden=hidden,
-            time_downsample=time_downsample,
-            ze_norm=ze_norm,
-        )
-        decoder: DecoderBase = TemporalDecoder(
-            token_dim=token_dim,
-            hidden=hidden,
-            time_upsample=time_downsample,
-            head=dec_head,
-        )
-    else:
-        encoder = build_encoder(token_dim, latent_grid)
-        decoder = build_decoder(token_dim, latent_grid)
+    # temporal STFT arch: 32768-sample slice, hop 256 -> 128 STFT frames ->
+    # T_lat = 128 / time_downsample. Encoder l2-normalizes z_e; decoder is the
+    # complex (real/imag) STFT head.
+    encoder = TemporalEncoder(
+        token_dim=token_dim, hidden=hidden, time_downsample=time_downsample
+    )
+    decoder = TemporalDecoder(
+        token_dim=token_dim, hidden=hidden, time_upsample=time_downsample
+    )
     return MultiLvlVQVariationalAutoEncoder(
         input_channels=1,
         encoder=encoder,
         decoder=decoder,
-        vq_module=build_vq_module(token_dim, num_rq_steps=num_rq_steps),
+        vq_module=build_vq_module(token_dim, num_rq_steps, num_tokens),
         loss_aggregator=loss_aggregator,
-        bypass_vq=bypass_vq,
     )
 
 
@@ -2661,69 +2287,27 @@ def build_discriminator(disc_width: int = 1) -> EnsembleDiscriminator:
     )
 
 
-def partial_load_state_dict(module: nn.Module, src: dict[str, torch.Tensor]) -> None:
-    """Option-1 weight surgery: warm-start a (possibly wider) model from a narrower
-    checkpoint. For each destination param present in src:
-      - identical shape  -> copy whole (codebook, projections on unchanged axes, ...)
-      - differing shape  -> copy the overlapping min-size sub-block on every axis
-                            (widened convs: src [512,512,k] into dst [1024,1024,k][:512,:512])
-    Anything not in src, or with no overlap, is left at its fresh init. Not
-    function-preserving (new channels are random), but transfers learned filters +
-    the trained codebook. Reports coverage."""
-    dst = module.state_dict()
-    full, partial, skipped = 0, 0, 0
-    with torch.no_grad():
-        for k, dparam in dst.items():
-            s = src.get(k)
-            if s is None:
-                skipped += 1
-                continue
-            if s.shape == dparam.shape:
-                dparam.copy_(s)
-                full += 1
-            elif s.dim() == dparam.dim():
-                sl = tuple(slice(0, min(a, b)) for a, b in zip(dparam.shape, s.shape))
-                dparam[sl].copy_(s[sl])
-                partial += 1
-            else:
-                skipped += 1
-    module.load_state_dict(dst)
-    print(
-        f"  partial load: {full} full-copied, {partial} slice-copied, "
-        f"{skipped} left-at-init (of {len(dst)} dst params; {len(src)} in src)"
-    )
-
-
 def build_module(
     learning_params: LearningParameters,
     loss_aggregator: WeightedSumAggregator,
     optimizer_cfg: dict[str, Any],
     scheduler_cfg: dict[str, Any],
     gss: int = 20000,
-    disc_warmup: int = 0,
-    token_dim: int = 512,
-    latent_grid: int = 4,
-    bypass_vq: bool = False,
-    arch: str = "legacy",
+    token_dim: int = 1024,
     num_rq_steps: int = 3,
-    time_downsample: int = 2,
-    dec_head: str = "complex",
+    num_tokens: int = 2048,
+    time_downsample: int = 1,
     disc_width: int = 1,
-    d_weight_cap: float = 1e4,
-    hidden: int = 512,
-    ze_norm: str = "none",
+    d_weight_cap: float = 1.0,
+    hidden: int = 1024,
 ) -> VqganMusicLightningModule:
     generator = build_generator(
         loss_aggregator,
         token_dim=token_dim,
-        latent_grid=latent_grid,
-        bypass_vq=bypass_vq,
-        arch=arch,
         num_rq_steps=num_rq_steps,
+        num_tokens=num_tokens,
         time_downsample=time_downsample,
-        dec_head=dec_head,
         hidden=hidden,
-        ze_norm=ze_norm,
     )
     discriminator = build_discriminator(disc_width=disc_width)
 
@@ -2746,7 +2330,7 @@ def build_module(
         discriminator_loss=discriminator_loss,
         generator_loss=generator_loss,
         generator_start_step=gss,
-        disc_warmup=disc_warmup,
+        disc_warmup=0,
         d_weight_cap=d_weight_cap,
         loss_aggregator=loss_aggregator,
         optimizer_cfg=optimizer_cfg,
@@ -2763,232 +2347,55 @@ def build_module(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train lvl1_vqgan.")
     parser.add_argument(
-        "--checkpoint",
+        "--config",
         type=str,
-        default=None,
-        help="Path to checkpoint to resume from. Default: train from scratch.",
-    )
-    parser.add_argument(
-        "--minutes",
-        type=float,
-        default=15.0,
-        help="Maximum training duration in minutes. Default: 15.",
-    )
-    parser.add_argument(
-        "--gss",
-        type=int,
-        default=20000,
-        help="generator_start_step: step at which the GAN/discriminator engages. "
-        "Set above total steps to disable GAN. Default: 20000.",
-    )
-    parser.add_argument(
-        "--token-dim",
-        type=int,
-        default=512,
-        help="VQ latent/token dimension (widens encoder output + decoder input to "
-        "match). Larger = richer per-token, same token count (NTP-friendly). Default: 512.",
-    )
-    parser.add_argument(
-        "--arch",
-        type=str,
-        default="legacy",
-        choices=["legacy", "temporal"],
-        help="Model architecture. legacy = 2D grid latent (see --latent-grid). "
-        "temporal = EnCodec-style: STFT freq->channels, stride time only, "
-        "latent 64 frames/slice (~86 fps). Default: legacy.",
-    )
-    parser.add_argument(
-        "--disc-width",
-        type=int,
-        default=1,
-        help="Discriminator channel multiplier (1 = legacy ~0.19M; 4 = ~16x params). "
-        "Stronger disc pushes the generator toward realistic texture (less distortion).",
-    )
-    parser.add_argument(
-        "--time-downsample",
-        type=int,
-        default=2,
-        choices=[1, 2, 4],
-        help="Temporal arch: latent time downsample factor. 1 -> 128 frames/slice "
-        "(172 fps), 2 -> 64 (86 fps). Default: 2.",
-    )
-    parser.add_argument(
-        "--dec-head",
-        type=str,
-        default="complex",
-        choices=["complex", "magphase"],
-        help="Temporal decoder spectral head: raw real/imag or Vocos-style "
-        "log-magnitude + phase direction. Default: complex.",
-    )
-    parser.add_argument(
-        "--num-rq",
-        type=int,
-        default=3,
-        help="Residual quantization depth (codes per latent frame). More = more "
-        "bits/fidelity, longer NTP token sequence. Default: 3.",
-    )
-    parser.add_argument(
-        "--no-vq",
-        action="store_true",
-        help="Ablation: decoder consumes continuous z_e (VQ bypassed for synthesis; "
-        "codebook still trains on the side). Isolates the quantization bottleneck.",
-    )
-    parser.add_argument(
-        "--commit-weight",
-        type=float,
-        default=0.75,
-        help="Commitment loss weight (anchors z_e scale to the codebook; raise to "
-        "counter z_e magnitude drift). Default: 0.75.",
-    )
-    parser.add_argument(
-        "--latent-grid",
-        type=int,
-        default=4,
-        choices=[4, 8],
-        help="Latent spatial grid per slice. 4 = legacy (16 positions). "
-        "8 = capacity arch (64 positions, LSTM 256, decoder n_fft 512). Default: 4.",
-    )
-    parser.add_argument(
-        "--disc-warmup",
-        type=int,
-        default=0,
-        help="Steps the discriminator trains alone (after --gss) before the generator "
-        "gets the adversarial gradient. Default: 0.",
-    )
-    parser.add_argument(
-        "--d-weight-cap",
-        type=float,
-        default=1e4,
-        help="Upper clamp on the adaptive adversarial weight (||grad_rec||/||grad_gen||). "
-        "Default 1e4 (legacy). Set low (~1.0) to stop the weight running away and "
-        "overwhelming reconstruction with adversarial gradient.",
-    )
-    parser.add_argument(
-        "--lr-cosine",
-        action="store_true",
-        help="Use a wall-clock cosine LR schedule: lr decays base -> --lr-min over "
-        "--minutes (cos half-period). Off = constant lr.",
-    )
-    parser.add_argument(
-        "--lr-min",
-        type=float,
-        default=0.0,
-        help="Floor LR for --lr-cosine (value at end of training). Default: 0.0.",
-    )
-    parser.add_argument(
-        "--lr-onecycle",
-        action="store_true",
-        help="Use a wall-clock one-cycle LR schedule (time-capped analogue of "
-        "torch OneCycleLR): warmup max_lr/25 -> --lr (peak) over first 10%% of "
-        "--minutes, then anneal down to near-zero. --lr is the peak. Overrides "
-        "--lr-cosine.",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=None,
-        help="Override base learning rate (both generator + discriminator AdamW). "
-        "With --lr-cosine this is the peak. Default: build_learning_params (1e-4). "
-        "Scale ~sqrt(k) or k with effective batch when using k GPUs (DDP).",
-    )
-    parser.add_argument(
-        "--hidden",
-        type=int,
-        default=512,
-        help="Temporal arch conv channel width (TemporalEncoder/Decoder Res1DBlocks). "
-        "512 = legacy (~41.5M gen). Wider = more capacity (~width^2 on conv layers). "
-        "token_dim/codebook unchanged. Default: 512.",
-    )
-    parser.add_argument(
-        "--ze-norm",
-        type=str,
-        default="none",
-        choices=["none", "l2", "rms", "grms"],
-        help="Normalize encoder output z_e to pin its scale (temporal arch). "
-        "none = legacy unconstrained (z_e inflates under high LR -> alignment/"
-        "commitment grow unbounded). l2 = unit-norm per token. rms = unit-RMS "
-        "per token. Default: none.",
-    )
-    parser.add_argument(
-        "--codebook-grow",
-        type=str,
-        default="random",
-        choices=["random", "concat"],
-        help="When --init-from a checkpoint with smaller --token-dim: how to init the "
-        "widened codebook's new dims. random = fresh init (default; partial-load "
-        "slice-copies the old block). concat = tile the trained codebook across the "
-        "new dims (each code starts as a repeat of itself).",
-    )
-    parser.add_argument(
-        "--init-from",
-        type=str,
-        default=None,
-        help="Warm-start a (possibly wider) model from a checkpoint via partial weight "
-        "surgery: tensors copied where shapes match (codebook etc.), slice-copied into "
-        "the overlapping [:n] sub-block where they differ (widened convs), rest left at "
-        "init. Use to bootstrap a --hidden-widened model from a narrower one.",
-    )
-    parser.add_argument(
-        "--save-path",
-        type=str,
-        default=None,
-        help="Override checkpoint/log save folder. Default: from build_learning_params.",
-    )
-    parser.add_argument(
-        "--single-song",
-        type=str,
-        default=None,
-        help="If set, restrict the dataset to tracks whose path contains this substring "
-        "(single-song overfit experiments).",
+        default=os.path.join(os.path.dirname(__file__), "config.yaml"),
+        help="Path to the YAML config (default: config.yaml next to train.py).",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    with open(args.config) as fh:
+        cfg = yaml.safe_load(fh)
+    m, vq, gan, tr = cfg["model"], cfg["vq"], cfg["gan"], cfg["train"]
 
     torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
     torch.set_float32_matmul_precision("high")
     L.seed_everything(42, workers=True)
 
     learning_params = build_learning_params()
-    if args.save_path is not None:
-        learning_params.save_path = args.save_path
-    if args.lr is not None:
-        learning_params.learning_rate = args.lr
+    if tr.get("save_path") is not None:
+        learning_params.save_path = tr["save_path"]
+    learning_params.learning_rate = tr["lr"]
     optimizer_cfg = build_optimizer_cfg()
-    if args.lr is not None:
-        # the GAN optimizers are built from optimizer_cfg (target != "none"), so its
-        # "lr" is the one that actually takes effect -- override it too, else the
-        # learning_params value above is ignored. This is also the cosine peak.
-        optimizer_cfg["lr"] = args.lr
-        print(f"learning rate override: {args.lr:.4e}")
+    # the GAN optimizers build from optimizer_cfg, so its "lr" is the one that
+    # takes effect (and the one-cycle peak) -- set it from config.
+    optimizer_cfg["lr"] = tr["lr"]
     scheduler_cfg = build_scheduler_cfg(
-        cosine=args.lr_cosine,
-        total_minutes=args.minutes,
-        min_lr=args.lr_min,
-        onecycle=args.lr_onecycle,
-        max_lr=(args.lr if args.lr is not None else 1e-4),
+        total_minutes=tr["minutes"],
+        max_lr=tr["lr"],
+        pct_start=tr["lr_pct_start"],
     )
-    loss_aggregator = build_loss_aggregator(commit_weight=args.commit_weight)
+    loss_aggregator = build_loss_aggregator(commit_weight=vq["commit_weight"])
 
     print("Initializing data...")
     data_module = build_data_module(learning_params)
 
-    if args.single_song is not None:
+    single_song = tr.get("single_song")
+    if single_song is not None:
         dataset = data_module._dataset  # type: ignore[attr-defined]
         before = len(dataset.buffer)
-        dataset.buffer = [
-            dp for dp in dataset.buffer if args.single_song in dp.track_path
-        ]
+        dataset.buffer = [dp for dp in dataset.buffer if single_song in dp.track_path]
         print(
-            f"single-song filter '{args.single_song}': {before} -> {len(dataset.buffer)} slices"
+            f"single-song filter '{single_song}': {before} -> {len(dataset.buffer)} slices"
         )
         if len(dataset.buffer) == 0:
-            raise ValueError(f"No tracks matched --single-song '{args.single_song}'")
+            raise ValueError(f"No tracks matched single_song '{single_song}'")
 
     print("Initializing trainer...")
-    trainer = get_trainer(learning_params, minutes=args.minutes)
+    trainer = get_trainer(learning_params, minutes=tr["minutes"])
 
     print("Initializing module...")
     module = build_module(
@@ -2996,47 +2403,22 @@ def main() -> None:
         loss_aggregator,
         optimizer_cfg,
         scheduler_cfg,
-        gss=args.gss,
-        disc_warmup=args.disc_warmup,
-        token_dim=args.token_dim,
-        latent_grid=args.latent_grid,
-        bypass_vq=args.no_vq,
-        arch=args.arch,
-        num_rq_steps=args.num_rq,
-        time_downsample=args.time_downsample,
-        dec_head=args.dec_head,
-        disc_width=args.disc_width,
-        d_weight_cap=args.d_weight_cap,
-        hidden=args.hidden,
-        ze_norm=args.ze_norm,
+        gss=gan["gan_start_step"],
+        token_dim=m["token_dim"],
+        num_rq_steps=m["num_rq"],
+        num_tokens=m["num_tokens"],
+        time_downsample=m["time_downsample"],
+        disc_width=gan["disc_width"],
+        d_weight_cap=gan["d_weight_cap"],
+        hidden=m["hidden"],
     )
 
-    if args.init_from is not None:
-        print(f"Warm-starting (partial surgery) from {args.init_from}...")
-        ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
-        src = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
-        partial_load_state_dict(module, src)
-        # token_dim grow: partial_load slice-copies the codebook's old [:, :old]
-        # block and leaves the new dims at fresh random init (= "random"). For
-        # "concat", tile the trained codebook across the new dims instead so each
-        # new code starts as a repeat of the old (every code [c, c, ...]).
-        if args.codebook_grow == "concat":
-            cb_key = "model.vq_module.vq_codebook.code_embedding"
-            s = src.get(cb_key)
-            cb = dict(module.named_parameters()).get(cb_key)
-            if s is not None and cb is not None and cb.shape[1] > s.shape[1]:
-                old, new = s.shape[1], cb.shape[1]
-                reps = (new + old - 1) // old
-                with torch.no_grad():
-                    cb.copy_(s.repeat(1, reps)[:, :new])
-                print(f"  codebook grow=concat: tiled token_dim {old} -> {new}")
-
-    if args.checkpoint is not None:
-        print(f"Loading model weights from {args.checkpoint}...")
-        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    checkpoint = tr.get("checkpoint")
+    if checkpoint is not None:
+        print(f"Loading model weights from {checkpoint}...")
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
         state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
-        # strict=False so a checkpoint can resume the generator into a different
-        # discriminator size (fresh disc keeps its init). Report what didn't match.
+        # strict=False so the generator can resume into a fresh discriminator.
         result = module.load_state_dict(state_dict, strict=False)
         miss = [k for k in result.missing_keys if not k.startswith("discriminator")]
         unexp = [k for k in result.unexpected_keys if not k.startswith("discriminator")]

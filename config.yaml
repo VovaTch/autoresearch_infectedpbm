@@ -1,0 +1,29 @@
+# Training configuration for the lvl1_vqgan music tokenizer.
+#
+# This file is edited alongside train.py (see program.md). train.py reads it at
+# startup and builds the model + training run from these values. The architecture
+# is fixed (temporal STFT encoder/decoder, residual VQ, l2-normalized latent);
+# the knobs below are what you tune.
+
+model:
+  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  token_dim: 1024       # VQ latent / codebook token dimension
+  num_rq: 3             # residual quantization depth (codes per latent frame)
+  num_tokens: 2048      # codebook entries per RQ level
+  time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+
+vq:
+  commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
+
+gan:
+  gan_start_step: 20000 # step the discriminator engages (set huge -> GAN off)
+  d_weight_cap: 1.0     # upper clamp on the adaptive adversarial weight
+  disc_width: 1         # discriminator channel multiplier
+
+train:
+  minutes: 15           # wall-clock training budget (excludes startup/eval)
+  lr: 1.0e-4            # one-cycle peak learning rate
+  lr_pct_start: 0.1     # one-cycle warmup fraction (rise over first 10% of time)
+  single_song: null     # substring filter for single-song overfit; null = full dataset
+  save_path: null       # checkpoint/log dir override; null = default ("saved/")
+  checkpoint: null       # resume weights from this checkpoint; null = train from scratch
