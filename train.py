@@ -6,12 +6,15 @@ Run: python train.py
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import copy
 import importlib
 import os
 import threading
 import warnings
+
+import yaml
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -27,17 +30,24 @@ from lightning.pytorch.callbacks import (
     LearningRateMonitor,
     ModelCheckpoint,
     ModelSummary,
+    Timer,
 )
 from lightning.pytorch.loggers import Logger, TensorBoardLogger
-from lightning.pytorch.utilities.exceptions import MisconfigurationException
-from lightning.pytorch.utilities.rank_zero import rank_zero_info
+from lightning.fabric.utilities.exceptions import MisconfigurationException
+from lightning_utilities.core.rank_zero import rank_zero_info
 from lightning.pytorch.utilities.types import STEP_OUTPUT, OptimizerLRScheduler
 
 from prepare import (
     LearningParameters,
     MelSpecParameters,
     SimpleMelSpecConverter,
+    COMPOSITE_WEIGHTS,
     build_data_module,
+    cdpam_distance,
+    chroma_cosine_distance,
+    make_cdpam_evaluator,
+    multi_res_stft_distance,
+    phase_distance,
 )
 
 # ===========================================================================
@@ -331,7 +341,9 @@ class EMA(L.Callback):
 # ===========================================================================
 
 
-def get_trainer(learning_parameters: LearningParameters) -> L.Trainer:
+def get_trainer(
+    learning_parameters: LearningParameters, minutes: int = 9 * 60
+) -> L.Trainer:
     if not torch.cuda.is_available():
         warnings.warn("CUDA is not available, using CPU")
         devices = "auto"
@@ -350,12 +362,20 @@ def get_trainer(learning_parameters: LearningParameters) -> L.Trainer:
     )
     loggers: list[Logger] = [tensorboard_logger]
 
-    model_checkpoint_callback = ModelCheckpoint(
+    best_checkpoint_callback = ModelCheckpoint(
         dirpath=save_folder,
-        filename=learning_parameters.model_name,
-        save_weights_only=True,
+        filename=learning_parameters.model_name + "_best",
+        save_weights_only=False,
         save_top_k=1,
         monitor=learning_parameters.loss_monitor,
+        enable_version_counter=False,
+    )
+    last_checkpoint_callback = ModelCheckpoint(
+        dirpath=save_folder,
+        filename=learning_parameters.model_name + "_last",
+        save_weights_only=False,
+        save_top_k=1,
+        save_last=True,
         enable_version_counter=False,
     )
     early_stopping = EarlyStopping(
@@ -366,16 +386,19 @@ def get_trainer(learning_parameters: LearningParameters) -> L.Trainer:
 
     precision = 16 if learning_parameters.amp else 32
     model_summary = ModelSummary(max_depth=2)
+    timer = Timer(duration={"minutes": minutes})
 
     trainer = L.Trainer(
         gradient_clip_val=learning_parameters.gradient_clip,
         logger=loggers,
         callbacks=[
             early_stopping,
-            model_checkpoint_callback,
+            best_checkpoint_callback,
+            last_checkpoint_callback,
             model_summary,
             learning_rate_monitor,
             ema,
+            timer,
         ],
         strategy="ddp_find_unused_parameters_true",
         devices=devices,
@@ -549,6 +572,129 @@ class MelSpecLoss:
 
 
 @dataclass
+class CDPAMLoss:
+    """Directly optimize the CDPAM perceptual metric (the eval target).
+
+    CDPAM.forward() runs under torch.no_grad(), so we replicate its computation
+    (base_encoder embeddings -> L2 normalize -> dist_model) WITHOUT no_grad to
+    let gradients flow back to the generator. The pretrained CDPAM weights are
+    frozen. Inputs are resampled to 22050 Hz and scaled to int16 range, matching
+    prepare.cdpam_distance.
+    """
+
+    name: str
+    weight: float
+    pred_key: str
+    ref_key: str
+    src_sr: int = 44100
+    cdpam_sr: int = 22050
+    differentiable: bool = True
+    _evaluator: Any = None
+    _resampler: Any = None
+
+    def _ensure(self, device: torch.device) -> None:
+        if self._evaluator is None:
+            import cdpam
+            import torchaudio
+
+            self._evaluator = cdpam.CDPAM(dev=str(device))
+            for p in self._evaluator.model.parameters():
+                p.requires_grad_(False)
+            self._resampler = torchaudio.transforms.Resample(
+                self.src_sr, self.cdpam_sr
+            ).to(device)
+
+    def __call__(self, estimation, target):
+        pred = estimation[self.pred_key]
+        ref = target[self.ref_key]
+        self._ensure(pred.device)
+        # Replicate CDPAM.forward (which uses no_grad): base_encoder -> acoustics
+        # embedding (2nd of 3 returns) -> L2 normalize -> model_dist. Inputs are
+        # [N, L] at 22050 Hz scaled to int16 range; encoder does unsqueeze(1).
+        pred_w = (self._resampler(pred.float()) * 32768.0).reshape(pred.shape[0], -1)
+        ref_w = (self._resampler(ref.float()) * 32768.0).reshape(ref.shape[0], -1)
+        model = self._evaluator.model
+        # bf16 autocast for the frozen cdpam net: it is Conv1d/BN/relu (no complex
+        # ops), so half precision is safe and ~halves this loss's compute/memory.
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, a1, _ = model.base_encoder.forward(ref_w.unsqueeze(1))
+            _, a2, _ = model.base_encoder.forward(pred_w.unsqueeze(1))
+            a1 = F.normalize(a1, dim=1)
+            a2 = F.normalize(a2, dim=1)
+            dist = model.model_dist.forward(a1, a2).mean()
+        return dist.float()
+
+
+@dataclass
+class MultiResSTFTLoss:
+    """Multi-resolution STFT loss (spectral convergence + log-mag L1).
+
+    Overall harmonic + transient fidelity across FFT sizes; the standard
+    neural-vocoder reconstruction loss. Differentiable (torch.stft).
+    """
+
+    name: str
+    weight: float
+    pred_key: str = "slice"
+    ref_key: str = "slice"
+    ffts: tuple[int, ...] = (512, 1024, 2048)
+    differentiable: bool = True
+
+    def __call__(self, estimation, target):
+        return multi_res_stft_distance(
+            estimation[self.pred_key], target[self.ref_key], ffts=self.ffts
+        )
+
+
+@dataclass
+class ChromaLoss:
+    """Chroma (pitch-class) cosine distance — the MELODY/harmony term.
+
+    Maps STFT magnitude to 12 pitch classes via a fixed librosa filterbank and
+    penalizes per-frame cosine mismatch. Robust to timbre/octave; targets the
+    melodic content cdpam is blind to. Differentiable.
+    """
+
+    name: str
+    weight: float
+    pred_key: str = "slice"
+    ref_key: str = "slice"
+    sr: int = 44100
+    n_fft: int = 2048
+    differentiable: bool = True
+
+    def __call__(self, estimation, target):
+        return chroma_cosine_distance(
+            estimation[self.pred_key],
+            target[self.ref_key],
+            sr=self.sr,
+            n_fft=self.n_fft,
+        )
+
+
+@dataclass
+class PhaseLoss:
+    """Magnitude-weighted multi-resolution phase incoherence.
+
+    Penalizes phase mismatch (cos of phase diff, weighted by target energy)
+    across FFT sizes — the phase coherence that pitched/melodic content needs and
+    that the magnitude-only mrstft/chroma terms are blind to. Differentiable.
+    """
+
+    name: str
+    weight: float
+    pred_key: str = "slice"
+    ref_key: str = "slice"
+    ffts: tuple[int, ...] = (512, 1024, 2048)
+    differentiable: bool = True
+
+    def __call__(self, estimation, target):
+        return phase_distance(
+            estimation[self.pred_key], target[self.ref_key], ffts=self.ffts
+        )
+
+
+@dataclass
 class DiscriminatorHingeLoss:
     name: str
     weight: float
@@ -668,7 +814,10 @@ class VQCodeBook(CodeBook):
     ) -> None:
         super().__init__()
         self.num_tokens = num_tokens
-        self.code_embedding = nn.Parameter(torch.rand(num_tokens, token_dim))
+        # randn (full space, not positive orthant) scaled to ~unit-norm codes
+        self.code_embedding = nn.Parameter(
+            torch.randn(num_tokens, token_dim) / token_dim**0.5
+        )
         self.usage_threshold = usage_threshold
         self.register_buffer("usage", torch.ones(self.num_tokens), persistent=False)
 
@@ -676,6 +825,9 @@ class VQCodeBook(CodeBook):
         return self.code_embedding[indices]
 
     def apply_codebook(self, x_in: torch.Tensor, code_sg: bool = False):
+        # Euclidean VQ on raw vectors: codes keep their magnitude so residual
+        # quantization (RQ) actually refines — normalizing here forced every RQ
+        # step to emit a unit-norm code for an ever-smaller residual.
         embedding_weights = self.code_embedding.transpose(0, 1).contiguous()
         z_q, indices = vq_code_book_select(
             x_in, embedding_weights.detach() if code_sg else embedding_weights
@@ -692,9 +844,16 @@ class VQCodeBook(CodeBook):
 
     def random_restart(self) -> float:
         dead_codes = torch.nonzero(self.usage < self.usage_threshold).squeeze(1)  # type: ignore
-        rand_codes = torch.randperm(self.num_tokens)[0 : len(dead_codes)]
-        with torch.no_grad():
-            self.code_embedding[dead_codes] = self.code_embedding[rand_codes]
+        alive_codes = torch.nonzero(self.usage >= self.usage_threshold).squeeze(1)  # type: ignore
+        if len(dead_codes) > 0 and len(alive_codes) > 0:
+            # revive dead codes near ALIVE ones (splits live clusters); copying
+            # from arbitrary codes could just clone another dead code
+            src = alive_codes[torch.randint(len(alive_codes), (len(dead_codes),))]
+            with torch.no_grad():
+                jitter = 0.1 * self.code_embedding[src].std()
+                self.code_embedding[dead_codes] = self.code_embedding[
+                    src
+                ] + jitter * torch.randn_like(self.code_embedding[src])
         return dead_codes.shape[0]
 
 
@@ -854,152 +1013,9 @@ class Res1DBlockReverse(Res1DBlock):
                 )
 
 
-class Res2DBlock(nn.Module):
-    def __init__(
-        self,
-        num_channels: int,
-        num_res_conv: int,
-        kernel_size: tuple[int, int],
-        activation_fn: nn.Module = nn.GELU(),
-        dilation_factor: int = 1,
-    ) -> None:
-        super().__init__()
-        self._activation_fn = activation_fn
-        layers = []
-        for idx in range(num_res_conv - 1):
-            dilation = dilation_factor**idx
-            padding_x = (
-                kernel_size[0] + (kernel_size[0] - 1) * (dilation - 1) - 1
-            ) // 2
-            padding_y = (
-                kernel_size[1] + (kernel_size[1] - 1) * (dilation - 1) - 1
-            ) // 2
-            layers.append(
-                nn.Conv2d(
-                    num_channels,
-                    num_channels,
-                    kernel_size=kernel_size,
-                    dilation=dilation,
-                    padding=(padding_x, padding_y),
-                )
-            )
-            layers.append(activation_fn)
-            layers.append(nn.BatchNorm2d(num_channels))
-        padding_x = (
-            kernel_size[0]
-            + (kernel_size[0] - 1) * (dilation_factor ** (num_res_conv - 1) - 1)
-            - 1
-        ) // 2
-        padding_y = (
-            kernel_size[1]
-            + (kernel_size[1] - 1) * (dilation_factor ** (num_res_conv - 1) - 1)
-            - 1
-        ) // 2
-        layers.append(
-            nn.Conv2d(
-                num_channels,
-                num_channels,
-                kernel_size=kernel_size,
-                dilation=dilation_factor ** (num_res_conv - 1),
-                padding=(padding_x, padding_y),
-            )
-        )
-        layers.append(nn.BatchNorm2d(num_channels))
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_init = x.clone()
-        x = self.layers(x)
-        return x + x_init
-
-
 # ===========================================================================
 # Encoder
 # ===========================================================================
-
-
-class EncoderConv2D(nn.Module):
-    def __init__(
-        self,
-        channel_list: list[int],
-        dim_change_list: list[int],
-        kernel_size: int,
-        num_res_block_conv: int,
-        n_fft: int,
-        hop_length: int,
-        win_length: int,
-        lstm_hiddem_dim: int = 64,
-        dilation_factor: int = 1,
-        activation_fn: nn.Module = nn.GELU(),
-    ) -> None:
-        super().__init__()
-        if len(channel_list) != len(dim_change_list) + 1:
-            raise ValueError(
-                "The length of `channel_list` must be one greater than the length of `dim_change_list`."
-            )
-        self._n_fft = n_fft
-        self._hop_length = hop_length
-        self._win_length = win_length
-
-        layers = []
-        for idx in range(len(dim_change_list)):
-            layers.append(
-                Res2DBlock(
-                    channel_list[idx],
-                    num_res_block_conv,
-                    (kernel_size, 1),
-                    activation_fn,
-                    dilation_factor=dilation_factor,
-                )
-            )
-            layers.append(
-                nn.Conv2d(
-                    channel_list[idx],
-                    channel_list[idx + 1],
-                    kernel_size,
-                    stride=dim_change_list[idx],
-                    padding=kernel_size // dim_change_list[idx],
-                )
-            )
-        layers.append(
-            Res2DBlock(
-                channel_list[-1], num_res_block_conv, (kernel_size, 1), activation_fn
-            )
-        )
-        self.layers = nn.Sequential(*layers)
-
-        self._lstm = nn.LSTM(
-            input_size=channel_list[-1],
-            hidden_size=lstm_hiddem_dim,
-            num_layers=2,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.0,
-        )
-        self._post_lstm_proj = nn.Conv1d(
-            lstm_hiddem_dim * 2, channel_list[-1], kernel_size=3, padding=1
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        window = torch.hann_window(self._win_length).to(x.device)
-        x = torch.stft(
-            x.flatten(start_dim=1, end_dim=2),
-            n_fft=self._n_fft,
-            hop_length=self._hop_length,
-            win_length=self._win_length,
-            return_complex=True,
-            window=window,
-        )
-        x = torch.view_as_real(x)
-        x = x.permute((0, 3, 1, 2)).contiguous()
-        x = x[..., : x.shape[2] - 1, : x.shape[3] - 1]
-        x = self.layers(x)
-        x = x.transpose(2, 3).flatten(start_dim=2, end_dim=3)
-        lstm_in = x.transpose(1, 2).contiguous()
-        lstm_out, _ = self._lstm(lstm_in)
-        lstm_out = lstm_out.transpose(1, 2).contiguous()
-        output = self._post_lstm_proj(lstm_out)
-        return output
 
 
 # ===========================================================================
@@ -1065,96 +1081,156 @@ class DecoderBase(ABC, nn.Module):
     def last_layer(self) -> nn.Module: ...
 
 
-class StftDecoder2D(DecoderBase):
+# ===========================================================================
+# Temporal codec (EnCodec-style layout): STFT freq bins -> CHANNELS, conv
+# stride along TIME only. Latent = one vector per ~17ms (T_lat frames/slice).
+# Fixes the legacy grid layout where 0.74s collapsed to 4-8 time positions
+# and freq was interleaved into the sequence — which made the decoder emit a
+# time-averaged spectrum (noise wash) regardless of latent precision.
+# ===========================================================================
+
+
+class TemporalEncoder(nn.Module):
     def __init__(
         self,
-        channel_list: list[int],
-        dim_change_list: list[int],
-        kernel_size: int,
-        dim_add_kernel_add: int,
-        num_res_block_conv: int,
-        n_fft: int,
-        hop_length: int,
-        win_length: int,
-        activation_fn: nn.Module = nn.GELU(),
-        output_conv_hidden_dim: int = 32,
-        dropout: float = 0.1,
-        dilation_factor: int = 1,
-        padding: Literal["center", "same"] = "same",
-    ):
+        token_dim: int = 512,
+        hidden: int = 512,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        win_length: int = 1024,
+        num_res_blocks: int = 2,
+        num_res_conv: int = 3,
+        kernel_size: int = 5,
+        dilation_factor: int = 2,
+        time_downsample: int = 2,
+    ) -> None:
         super().__init__()
-        if len(channel_list) != len(dim_change_list) + 1:
-            raise ValueError(
-                "The channel list length must be greater than the dimension change list by 1"
+        self._n_fft = n_fft
+        self._hop_length = hop_length
+        self._win_length = win_length
+        in_dim = (n_fft // 2 + 1) * 2  # real+imag stacked as channels
+        self._proj_in = nn.Conv1d(in_dim, hidden, kernel_size=7, padding=3)
+        self._res1 = nn.Sequential(
+            *[
+                Res1DBlock(hidden, num_res_conv, dilation_factor, kernel_size)
+                for _ in range(num_res_blocks)
+            ]
+        )
+        self._down: nn.Module = (
+            nn.Identity()
+            if time_downsample == 1
+            else nn.Conv1d(
+                hidden,
+                hidden,
+                kernel_size=2 * time_downsample,
+                stride=time_downsample,
+                padding=time_downsample // 2,
             )
-        self._dropout = nn.Dropout(dropout)
-        self._activation = activation_fn
+        )
+        self._res2 = nn.Sequential(
+            *[
+                Res1DBlock(hidden, num_res_conv, dilation_factor, kernel_size)
+                for _ in range(num_res_blocks)
+            ]
+        )
+        self._proj_out = nn.Conv1d(hidden, token_dim, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 1, L) waveform
+        window = torch.hann_window(self._win_length).to(x.device)
+        spec = torch.stft(
+            x.flatten(start_dim=1),
+            n_fft=self._n_fft,
+            hop_length=self._hop_length,
+            win_length=self._win_length,
+            window=window,
+            return_complex=True,
+        )  # (B, n_fft/2+1, T+1)
+        n_frames = x.shape[-1] // self._hop_length
+        feats = torch.cat([spec.real, spec.imag], dim=1)[..., :n_frames]
+        h = self._proj_in(feats)
+        h = self._res1(h)
+        h = self._down(h)
+        h = self._res2(h)
+        z_e = self._proj_out(h)  # (B, token_dim, n_frames / time_downsample)
+        # Pin z_e scale so it can't run away: unconstrained conv output inflates
+        # under high LR -> alignment/commitment MSE (both vs z_e) grow unbounded.
+        # l2 normalize ONCE here (unit-norm per token, matches codebook init scale
+        # ~1) -- NOT inside the RQ select loop, which would force every residual
+        # step to unit-norm and kill refinement.
+        return F.normalize(z_e, dim=1)
+
+
+class TemporalDecoder(DecoderBase):
+    def __init__(
+        self,
+        token_dim: int = 512,
+        hidden: int = 512,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        win_length: int = 1024,
+        num_res_blocks: int = 2,
+        num_res_conv: int = 3,
+        kernel_size: int = 5,
+        dilation_factor: int = 2,
+        time_upsample: int = 2,
+        output_conv_hidden_dim: int = 32,
+    ) -> None:
+        super().__init__()
+        self._spec_bins = n_fft // 2 + 1
+        # complex head: decoder predicts raw (real, imag) STFT -> ISTFT.
+        out_dim = self._spec_bins * 2
+        self._proj_in = nn.Conv1d(token_dim, hidden, kernel_size=3, padding=1)
+        self._res1 = nn.Sequential(
+            *[
+                Res1DBlock(hidden, num_res_conv, dilation_factor, kernel_size)
+                for _ in range(num_res_blocks)
+            ]
+        )
+        self._up: nn.Module = (
+            nn.Identity()
+            if time_upsample == 1
+            else nn.ConvTranspose1d(
+                hidden,
+                hidden,
+                kernel_size=2 * time_upsample,
+                stride=time_upsample,
+                padding=time_upsample // 2,
+            )
+        )
+        self._res2 = nn.Sequential(
+            *[
+                Res1DBlock(hidden, num_res_conv, dilation_factor, kernel_size)
+                for _ in range(num_res_blocks)
+            ]
+        )
+        self._proj_spec = nn.Conv1d(hidden, out_dim, kernel_size=7, padding=3)
+        self._istft = ISTFT(n_fft, hop_length, win_length, padding="same")
         self._end_conv = nn.Sequential(
             nn.Conv1d(1, output_conv_hidden_dim, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2),
             nn.Conv1d(
                 output_conv_hidden_dim, output_conv_hidden_dim, kernel_size=3, padding=1
             ),
-            self._dropout,
             nn.LeakyReLU(0.2),
             nn.Conv1d(output_conv_hidden_dim, 1, kernel_size=3, padding=1),
         )
-        self._istft = ISTFT(n_fft, hop_length, win_length, padding)
-        self._before_istft_dim = n_fft // 2 + 1
-        self._proj_before_istft = nn.Linear(
-            prod(dim_change_list) * channel_list[-1], self._before_istft_dim * 2
-        )
-        self.conv_list = nn.ModuleList(
-            [nn.Identity()]
-            + [
-                Res2DBlock(
-                    num_channels=channel_list[idx],
-                    num_res_conv=num_res_block_conv,
-                    kernel_size=(kernel_size, kernel_size),
-                    activation_fn=activation_fn,
-                    dilation_factor=dilation_factor,
-                )
-                for idx in range(1, len(dim_change_list))
-            ]
-        )
-        if dim_add_kernel_add % 2 != 0:
-            raise ValueError("dim_add_kernel_size must be an even number.")
-        self.dim_change_list = nn.ModuleList(
-            [
-                nn.ConvTranspose2d(
-                    channel_list[idx],
-                    channel_list[idx + 1],
-                    kernel_size=dim_change_list[idx] + dim_add_kernel_add,
-                    stride=dim_change_list[idx],
-                    padding=dim_add_kernel_add // 2,
-                )
-                for idx in range(len(dim_change_list))
-            ]
-        )
-        self.required_post_channel_size = channel_list[1]
-        self._pre_stft_layer_norm = nn.LayerNorm(prod(dim_change_list))
 
     @property
     def last_layer(self) -> nn.Module:
         return self._end_conv[-1]
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        z = z.unsqueeze(-1)
-        for conv, dim_change in zip(self.conv_list, self.dim_change_list):
-            z = conv(z)
-            z = self._dropout(z)
-            z = dim_change(z)
-            z = self._activation(z)
-        z = self._pre_stft_layer_norm(z)
-        z = z.transpose(1, 2).contiguous().flatten(start_dim=2)
-        z = self._dropout(z)
-        before_split = self._proj_before_istft(z)
-        real_part = before_split[..., : self._before_istft_dim].clone()
-        imag_part = before_split[..., self._before_istft_dim :].clone()
-        complex_z = torch.complex(real_part, imag_part).to(z.device)
-        output_z = self._istft.forward(complex_z.transpose(1, 2).contiguous())
-        output_z = self._end_conv(output_z.unsqueeze(1))
-        return output_z
+        # z: (B, token_dim, T_lat)
+        h = self._proj_in(z)
+        h = self._res1(h)
+        h = self._up(h)
+        h = self._res2(h)
+        spec = self._proj_spec(h)
+        b = self._spec_bins
+        complex_spec = torch.complex(spec[:, :b], spec[:, b:])
+        y = self._istft(complex_spec)  # (B, L)
+        return self._end_conv(y.unsqueeze(1))  # (B, 1, L)
 
 
 # ===========================================================================
@@ -1188,6 +1264,7 @@ class MultiLvlVQVariationalAutoEncoder(Tokenizer):
         decoder: DecoderBase,
         vq_module: VQ1D,
         loss_aggregator=None,
+        bypass_vq: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -1196,6 +1273,9 @@ class MultiLvlVQVariationalAutoEncoder(Tokenizer):
         self.decoder = decoder
         self.vq_module = vq_module
         self.input_channels = input_channels
+        # ablation: decoder consumes continuous z_e; VQ still runs (and trains via
+        # alignment/commitment) but its output never reaches the decoder
+        self.bypass_vq = bypass_vq
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x_reshaped = (
@@ -1203,6 +1283,8 @@ class MultiLvlVQVariationalAutoEncoder(Tokenizer):
             .permute((0, 2, 1))
             .contiguous()
         )
+        # no normalize: unit-sphere latents erase frame energy and make the
+        # commitment target (sum of codes, norm != 1) unsatisfiable
         return self.encoder(x_reshaped.float())
 
     def tokenize(self, x: torch.Tensor) -> torch.Tensor:
@@ -1216,7 +1298,8 @@ class MultiLvlVQVariationalAutoEncoder(Tokenizer):
 
     def decode(self, z_e: torch.Tensor, origin_shape=None):
         vq_block_output = self.vq_module(z_e, extract_losses=True)
-        x_out = self.decoder(vq_block_output["v_q"][:, -1, ...])
+        dec_in = z_e if self.bypass_vq else vq_block_output["v_q"][:, -1, ...]
+        x_out = self.decoder(dec_in)
         if origin_shape is None:
             origin_shape = (int(z_e.shape[0]), self.input_channels, -1)
         x_out = x_out.permute((0, 2, 1)).contiguous().reshape(origin_shape)
@@ -1491,6 +1574,38 @@ class BaseLightningModule(L.LightningModule):
             sync_dist=True,
             batch_size=self.learning_params.batch_size,
         )
+        if not hasattr(self, "_cdpam_fn"):
+            self._cdpam_fn = make_cdpam_evaluator(str(self.device))
+        cdpam_score = cdpam_distance(
+            self._cdpam_fn, output["slice"].detach(), batch["slice"]
+        )
+        self.log(
+            "test/cdpam",
+            cdpam_score,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=self.learning_params.batch_size,
+        )
+        # Composite headline (lower=better): cdpam (timbre) + mrstft (spectral) +
+        # chroma (melody). mrstft/chroma already logged via loss.individual above.
+        w = COMPOSITE_WEIGHTS
+        composite = (
+            w["cdpam"] * cdpam_score
+            + w["mrstft"] * loss.individual["mrstft"]
+            + w["chroma"] * loss.individual["chroma"]
+            + w["phase"] * loss.individual["phase"]
+        )
+        self.log(
+            "test/composite",
+            composite,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=self.learning_params.batch_size,
+        )
 
     @abstractmethod
     def step(self, batch, phase) -> torch.Tensor | None: ...
@@ -1555,6 +1670,8 @@ class VqganMusicLightningModule(MusicLightningModule):
         discriminator_loss,
         generator_loss,
         generator_start_step: int = 10000,
+        disc_warmup: int = 0,
+        d_weight_cap: float = 1e4,
         transforms: nn.Sequential | None = None,
         loss_aggregator=None,
         optimizer_cfg: dict[str, Any] | None = None,
@@ -1570,6 +1687,16 @@ class VqganMusicLightningModule(MusicLightningModule):
         )
         self.discriminator = discriminator
         self._generator_start_step = generator_start_step
+        # Disc trains alone for `disc_warmup` steps before generator gets the adversarial
+        # gradient — gives the cold discriminator a head start vs the converged generator.
+        self._disc_warmup = disc_warmup
+        # Upper clamp on the adaptive adversarial weight. The raw ratio
+        # ‖∇rec‖/‖∇gen‖ runs away to a huge ceiling once gen grads shrink, which
+        # dumps an overwhelming adversarial gradient that wrecks reconstruction
+        # (observed: dw4_long regressed all metrics). Cap low (~1) to keep the
+        # GAN as a texture nudge rather than the dominant objective.
+        self._d_weight_cap = d_weight_cap
+        self._adv_start = generator_start_step + disc_warmup
         self.optimizer_d = self._build_optimizer_gan(
             optimizer_cfg, ModelPart.DISCRIMINATOR
         )
@@ -1646,7 +1773,7 @@ class VqganMusicLightningModule(MusicLightningModule):
             generator_loss, last_layer.weight, retain_graph=True
         )[0]
         d_weight = torch.norm(rec_grads) / (torch.norm(generator_grads) + 1e-4)
-        d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+        d_weight = torch.clamp(d_weight, 0.0, self._d_weight_cap).detach()
         return d_weight
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
@@ -1677,7 +1804,8 @@ class VqganMusicLightningModule(MusicLightningModule):
         if scheduler_list is not None and len(scheduler_list) > 0:  # type: ignore
             scheduler_d, scheduler_g = scheduler_list  # type: ignore
 
-        self._discriminator_step(batch, phase, optimizer_d, scheduler_d)
+        if self._current_step >= self._generator_start_step or phase != "training":
+            self._discriminator_step(batch, phase, optimizer_d, scheduler_d)
         return self._generator_step(batch, phase, optimizer_g, scheduler_g)
 
     def _close_generator_phase(
@@ -1707,6 +1835,9 @@ class VqganMusicLightningModule(MusicLightningModule):
         disc_loss = self._discriminator_loss(disc_outputs, {})
         if phase == "training" and self._current_step >= self._generator_start_step:
             self.manual_backward(disc_loss * self._discriminator_loss.weight)
+            self.clip_gradients(
+                optimizer_d, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+            )
             optimizer_d.step()
             optimizer_d.zero_grad()
         self.log(
@@ -1724,10 +1855,12 @@ class VqganMusicLightningModule(MusicLightningModule):
     ) -> torch.Tensor | None:
         self.toggle_optimizer(optimizer_g)
         restructured_outputs = self.forward(batch)
-        disc_outputs_fake = self.discriminator(restructured_outputs["slice"])
-        restructured_outputs["d_output"] = disc_outputs_fake["logits"]
-        disc_outputs_real = self.discriminator(batch["slice"])
-        restructured_outputs["d_input"] = disc_outputs_real["logits"]
+        gan_active = self._current_step >= self._adv_start or phase != "training"
+        if gan_active:
+            disc_outputs_fake = self.discriminator(restructured_outputs["slice"])
+            restructured_outputs["d_output"] = disc_outputs_fake["logits"]
+            disc_outputs_real = self.discriminator(batch["slice"])
+            restructured_outputs["d_input"] = disc_outputs_real["logits"]
         targets = {
             "z_e": restructured_outputs["z_e"],
             "slice": batch["slice"],
@@ -1737,8 +1870,19 @@ class VqganMusicLightningModule(MusicLightningModule):
             self.untoggle_optimizer(optimizer_g)
             return None
 
+        if phase == "training":
+            # diagnostic: z_e scale drift drives align/commit MSE growth
+            self.log(
+                "training/z_e rms",
+                restructured_outputs["z_e"].detach().pow(2).mean().sqrt(),
+                sync_dist=True,
+                batch_size=self.learning_params.batch_size,
+            )
+
         loss = self.loss_aggregator(restructured_outputs, targets)
-        generator_loss = self._generator_loss(restructured_outputs, {})
+        generator_loss = (
+            self._generator_loss(restructured_outputs, {}) if gan_active else 0
+        )
 
         if phase != "training":
             self._close_generator_phase(
@@ -1750,7 +1894,7 @@ class VqganMusicLightningModule(MusicLightningModule):
             )
             return loss.total.clone()
 
-        if self._current_step >= self._generator_start_step:
+        if self._current_step >= self._adv_start:
             d_weight = self.calculate_adaptive_weight(
                 loss.total, generator_loss, self.generator.last_layer  # type: ignore
             )
@@ -1770,6 +1914,9 @@ class VqganMusicLightningModule(MusicLightningModule):
             self.log("d_weight", 0, sync_dist=True)
             self.manual_backward(loss.total)
 
+        self.clip_gradients(
+            optimizer_g, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+        )
         optimizer_g.step()
         optimizer_g.zero_grad()
         if scheduler_g is not None and phase == "training":
@@ -1795,10 +1942,10 @@ def build_learning_params() -> LearningParameters:
         model_name="lvl1_vqgan",
         learning_rate=0.0001,
         weight_decay=0.0,
-        batch_size=16,
+        batch_size=12,
         grad_accumulation=1,
-        epochs=2,
-        beta_ema=0.99,
+        epochs=10000,
+        beta_ema=0.95,
         gradient_clip=None,
         save_path="saved/",
         amp=False,
@@ -1823,19 +1970,85 @@ def build_optimizer_cfg() -> dict[str, Any]:
     }
 
 
-def build_scheduler_cfg() -> dict[str, Any]:
+class TimeOneCycleLR(torch.optim.lr_scheduler.LRScheduler):
+    """Wall-clock one-cycle LR, the time-capped analogue of torch's OneCycleLR.
+
+    OneCycleLR is step-indexed and raises once stepped past `total_steps`; training
+    here is time-capped (Timer(minutes=...)) with unknown step count, so we drive
+    the cycle by elapsed wall time vs `total_minutes`.
+
+    Shape (anneal_strategy='cos', matching torch defaults):
+        warmup  (frac < pct_start): initial_lr -> max_lr   over the first pct_start
+        anneal  (frac >= pct_start): max_lr     -> min_lr   over the remainder
+    Default pct_start=0.1 (rise over first 10% of training time, then anneal),
+    with initial_lr = max_lr/div_factor and min_lr = initial_lr/final_div_factor.
+    Clock starts on the first get_lr() (start of training); on resume it restarts,
+    so set minutes to the resume duration.
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        total_minutes: float,
+        max_lr: float,
+        pct_start: float = 0.1,
+        div_factor: float = 25.0,
+        final_div_factor: float = 1e4,
+        last_epoch: int = -1,
+    ):
+        self.total_seconds = max(float(total_minutes) * 60.0, 1e-8)
+        self.max_lr = float(max_lr)
+        self.pct_start = float(pct_start)
+        self.initial_lr = self.max_lr / float(div_factor)
+        self.min_lr = self.initial_lr / float(final_div_factor)
+        self._start: float | None = None
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        import math
+        import time
+
+        if self._start is None:
+            self._start = time.monotonic()
+        frac = min((time.monotonic() - self._start) / self.total_seconds, 1.0)
+        if frac < self.pct_start:
+            # warmup: initial_lr -> max_lr, cosine ease-in
+            p = frac / self.pct_start
+            lr = self.initial_lr + (self.max_lr - self.initial_lr) * (
+                1.0 - math.cos(math.pi * p)
+            ) / 2.0
+        else:
+            # anneal: max_lr -> min_lr, cosine ease-out
+            p = (frac - self.pct_start) / max(1.0 - self.pct_start, 1e-8)
+            lr = self.min_lr + (self.max_lr - self.min_lr) * (
+                1.0 + math.cos(math.pi * p)
+            ) / 2.0
+        return [lr for _ in self.base_lrs]
+
+
+def build_scheduler_cfg(
+    total_minutes: float = 540.0,
+    max_lr: float = 1e-4,
+    pct_start: float = 0.1,
+) -> dict[str, Any]:
+    module_params = {
+        "loss_monitor": "training/total loss",
+        "interval": "step",
+        "frequency": 1,
+        "trigger_loss": 1e-8,
+    }
     return {
-        "target": "none",
-        "module_params": {
-            "loss_monitor": "training/total loss",
-            "interval": "step",
-            "frequency": 1,
-            "trigger_loss": 1e-8,
-        },
+        # resolve from the running module (__main__ when run as a script, else
+        # "train") so we don't re-import train.py as a second module.
+        "target": f"{__name__}.TimeOneCycleLR",
+        "total_minutes": total_minutes,
+        "max_lr": max_lr,
+        "pct_start": pct_start,
+        "module_params": module_params,
     }
 
 
-def build_loss_aggregator() -> WeightedSumAggregator:
+def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
     def make_mel_converter(
         n_fft, hop_length, n_mels, power, norm="slaney", mel_scale="htk"
     ) -> SimpleMelSpecConverter:
@@ -1869,8 +2082,12 @@ def build_loss_aggregator() -> WeightedSumAggregator:
             edge_power=3.0,
             base_loss=nn.MSELoss(),
         ),
-        AlignLoss(name="alignment_loss", weight=0.5, base_loss=nn.MSELoss()),
-        CommitLoss(name="commitment_loss", weight=0.5, base_loss=nn.MSELoss()),
+        AlignLoss(name="alignment_loss", weight=0.75, base_loss=nn.MSELoss()),
+        # commit_weight anchors unnormalized z_e to the codebook; 0.75 was too weak
+        # (z_e magnitude outran codes -> alignment drifted unbounded over 3h runs)
+        CommitLoss(
+            name="commitment_loss", weight=commit_weight, base_loss=nn.MSELoss()
+        ),
         MelSpecLoss(
             name="melspec_loss_1",
             weight=1.0,
@@ -1883,12 +2100,12 @@ def build_loss_aggregator() -> WeightedSumAggregator:
         ),
         MelSpecLoss(
             name="melspec_loss_2",
-            weight=1.0,
+            weight=2.0,
             pred_key="slice",
             ref_key="slice",
             base_loss=nn.L1Loss(),
-            lin_start=1.0,
-            lin_end=1.0,
+            lin_start=0.5,
+            lin_end=5.0,
             mel_spec_converter=make_mel_converter(1024, 256, 64, 2.0),
         ),
         MelSpecLoss(
@@ -1904,7 +2121,7 @@ def build_loss_aggregator() -> WeightedSumAggregator:
         ),
         MelSpecLoss(
             name="melspec_loss_4",
-            weight=5.0,
+            weight=10.0,
             pred_key="slice",
             ref_key="slice",
             base_loss=nn.L1Loss(),
@@ -1933,57 +2150,90 @@ def build_loss_aggregator() -> WeightedSumAggregator:
             transform_func=transparent,
             mel_spec_converter=make_mel_converter(4096, 1024, 256, 1.0),
         ),
+        CDPAMLoss(
+            name="cdpam",
+            weight=25.0,
+            pred_key="slice",
+            ref_key="slice",
+        ),
+        # Overall spectral fidelity (rhythm + harmonics). Starting weight; tune.
+        MultiResSTFTLoss(
+            name="mrstft",
+            weight=5.0,
+            pred_key="slice",
+            ref_key="slice",
+        ),
+        # MELODY term — weighted up since pitch is the current weak spot. Tune.
+        ChromaLoss(
+            name="chroma",
+            weight=10.0,
+            pred_key="slice",
+            ref_key="slice",
+        ),
+        # PHASE coherence — DIAGNOSTIC ONLY (weight 0). Absolute-phase cos-distance is
+        # ill-posed (time-shift variant), proven ineffective as a loss; GAN handles phase.
+        PhaseLoss(
+            name="phase",
+            weight=0.0,
+            pred_key="slice",
+            ref_key="slice",
+        ),
     ]
     return WeightedSumAggregator(components)
 
 
-def build_encoder() -> EncoderConv2D:
-    return EncoderConv2D(
-        channel_list=[2, 32, 64, 128, 256, 512, 768],
-        dim_change_list=[2, 2, 2, 2, 2, 2],
-        kernel_size=3,
-        num_res_block_conv=3,
-        dilation_factor=2,
-        n_fft=512,
-        hop_length=128,
-        win_length=512,
-        activation_fn=nn.GELU(),
-    )
-
-
-def build_decoder() -> StftDecoder2D:
-    return StftDecoder2D(
-        channel_list=[768, 768, 512, 256],
-        dim_change_list=[2, 2, 2],
-        kernel_size=3,
-        dim_add_kernel_add=0,
-        num_res_block_conv=2,
-        activation_fn=nn.GELU(),
-        dropout=0.0,
-        dilation_factor=2,
-        n_fft=1024,
-        hop_length=256,
-        win_length=1024,
-    )
-
-
-def build_vq_module() -> VQ1D:
-    return VQ1D(token_dim=768, num_tokens=2048, num_rq_steps=1)
+def build_vq_module(
+    token_dim: int = 512, num_rq_steps: int = 3, num_tokens: int = 2048
+) -> VQ1D:
+    return VQ1D(token_dim=token_dim, num_tokens=num_tokens, num_rq_steps=num_rq_steps)
 
 
 def build_generator(
     loss_aggregator: WeightedSumAggregator,
+    token_dim: int = 1024,
+    num_rq_steps: int = 3,
+    num_tokens: int = 2048,
+    time_downsample: int = 1,
+    hidden: int = 1024,
 ) -> MultiLvlVQVariationalAutoEncoder:
+    # temporal STFT arch: 32768-sample slice, hop 256 -> 128 STFT frames ->
+    # T_lat = 128 / time_downsample. Encoder l2-normalizes z_e; decoder is the
+    # complex (real/imag) STFT head.
+    encoder = TemporalEncoder(
+        token_dim=token_dim, hidden=hidden, time_downsample=time_downsample
+    )
+    decoder = TemporalDecoder(
+        token_dim=token_dim, hidden=hidden, time_upsample=time_downsample
+    )
     return MultiLvlVQVariationalAutoEncoder(
         input_channels=1,
-        encoder=build_encoder(),
-        decoder=build_decoder(),
-        vq_module=build_vq_module(),
+        encoder=encoder,
+        decoder=decoder,
+        vq_module=build_vq_module(token_dim, num_rq_steps, num_tokens),
         loss_aggregator=loss_aggregator,
     )
 
 
-def build_discriminator() -> EnsembleDiscriminator:
+def _spectralize_disc(module: nn.Module) -> nn.Module:
+    """Discriminator hygiene: spectral-norm every conv (1-Lipschitz control, the
+    principled stabilizer) and drop BatchNorm (an anti-pattern in GAN discriminators —
+    leaks batch statistics across real/fake and fights the adversarial signal).
+    Recurses, mutates in place. Applied only to discriminators, never the generator."""
+    from torch.nn.utils.parametrizations import spectral_norm
+
+    for name, child in list(module.named_children()):
+        if isinstance(child, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            setattr(module, name, nn.Identity())
+        elif isinstance(child, (nn.Conv1d, nn.Conv2d)):
+            setattr(module, name, spectral_norm(child))
+        else:
+            _spectralize_disc(child)
+    return module
+
+
+def build_discriminator(disc_width: int = 1) -> EnsembleDiscriminator:
+    w = disc_width
+
     def make_mel_conv(n_fft, hop_length, n_mels, power) -> SimpleMelSpecConverter:
         return SimpleMelSpecConverter(
             MelSpecParameters(
@@ -2000,7 +2250,7 @@ def build_discriminator() -> EnsembleDiscriminator:
         )
 
     disc1 = MelSpecDiscriminator(
-        channel_list=[2, 4, 8, 16, 32],
+        channel_list=[4 * w, 8 * w, 16 * w, 32 * w, 64 * w],
         stride=2,
         kernel_size=3,
         activation_fn=nn.GELU(),
@@ -2008,7 +2258,7 @@ def build_discriminator() -> EnsembleDiscriminator:
         mel_spec_converter=make_mel_conv(1024, 256, 128, 1.0),
     )
     disc2 = MelSpecDiscriminator(
-        channel_list=[2, 4, 8, 16, 32],
+        channel_list=[4 * w, 8 * w, 16 * w, 32 * w, 64 * w],
         stride=2,
         kernel_size=3,
         activation_fn=nn.GELU(),
@@ -2016,7 +2266,7 @@ def build_discriminator() -> EnsembleDiscriminator:
         mel_spec_converter=make_mel_conv(2048, 512, 256, 1.0),
     )
     disc3 = MelSpecDiscriminator(
-        channel_list=[2, 4, 8, 16, 32],
+        channel_list=[4 * w, 8 * w, 16 * w, 32 * w, 64 * w],
         stride=2,
         kernel_size=3,
         activation_fn=nn.GELU(),
@@ -2024,7 +2274,7 @@ def build_discriminator() -> EnsembleDiscriminator:
         mel_spec_converter=make_mel_conv(4096, 1024, 512, 1.0),
     )
     disc4 = WaveformDiscriminator(
-        channel_list=[4, 8, 16, 32, 64, 128],
+        channel_list=[4 * w, 8 * w, 16 * w, 32 * w, 64 * w, 128 * w],
         dim_change_list=[4, 4, 4, 4, 4],
         kernel_size=3,
         num_res_block_conv=5,
@@ -2032,7 +2282,9 @@ def build_discriminator() -> EnsembleDiscriminator:
         input_channels=1,
         activation_fn=nn.GELU(),
     )
-    return EnsembleDiscriminator([disc1, disc2, disc3, disc4])
+    return EnsembleDiscriminator(
+        [_spectralize_disc(d) for d in (disc1, disc2, disc3, disc4)]
+    )
 
 
 def build_module(
@@ -2040,9 +2292,24 @@ def build_module(
     loss_aggregator: WeightedSumAggregator,
     optimizer_cfg: dict[str, Any],
     scheduler_cfg: dict[str, Any],
+    gss: int = 20000,
+    token_dim: int = 1024,
+    num_rq_steps: int = 3,
+    num_tokens: int = 2048,
+    time_downsample: int = 1,
+    disc_width: int = 1,
+    d_weight_cap: float = 1.0,
+    hidden: int = 1024,
 ) -> VqganMusicLightningModule:
-    generator = build_generator(loss_aggregator)
-    discriminator = build_discriminator()
+    generator = build_generator(
+        loss_aggregator,
+        token_dim=token_dim,
+        num_rq_steps=num_rq_steps,
+        num_tokens=num_tokens,
+        time_downsample=time_downsample,
+        hidden=hidden,
+    )
+    discriminator = build_discriminator(disc_width=disc_width)
 
     discriminator_loss = DiscriminatorHingeLoss(
         name="discriminator_loss",
@@ -2062,7 +2329,9 @@ def build_module(
         learning_params=learning_params,
         discriminator_loss=discriminator_loss,
         generator_loss=generator_loss,
-        generator_start_step=2000,
+        generator_start_step=gss,
+        disc_warmup=0,
+        d_weight_cap=d_weight_cap,
         loss_aggregator=loss_aggregator,
         optimizer_cfg=optimizer_cfg,
         scheduler_cfg=scheduler_cfg,
@@ -2075,33 +2344,110 @@ def build_module(
 # ===========================================================================
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train lvl1_vqgan.")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=os.path.join(os.path.dirname(__file__), "config.yaml"),
+        help="Path to the YAML config (default: config.yaml next to train.py).",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    with open(args.config) as fh:
+        cfg = yaml.safe_load(fh)
+    m, vq, gan, tr = cfg["model"], cfg["vq"], cfg["gan"], cfg["train"]
+
     torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
     torch.set_float32_matmul_precision("high")
+    L.seed_everything(42, workers=True)
 
     learning_params = build_learning_params()
+    if tr.get("save_path") is not None:
+        learning_params.save_path = tr["save_path"]
+    learning_params.devices = tr.get("devices", "auto")
+    learning_params.learning_rate = tr["lr"]
     optimizer_cfg = build_optimizer_cfg()
-    scheduler_cfg = build_scheduler_cfg()
-    loss_aggregator = build_loss_aggregator()
+    # the GAN optimizers build from optimizer_cfg, so its "lr" is the one that
+    # takes effect (and the one-cycle peak) -- set it from config.
+    optimizer_cfg["lr"] = tr["lr"]
+    scheduler_cfg = build_scheduler_cfg(
+        total_minutes=tr["minutes"],
+        max_lr=tr["lr"],
+        pct_start=tr["lr_pct_start"],
+    )
+    loss_aggregator = build_loss_aggregator(commit_weight=vq["commit_weight"])
 
     print("Initializing data...")
     data_module = build_data_module(learning_params)
 
+    single_song = tr.get("single_song")
+    if single_song is not None:
+        dataset = data_module._dataset  # type: ignore[attr-defined]
+        before = len(dataset.buffer)
+        dataset.buffer = [dp for dp in dataset.buffer if single_song in dp.track_path]
+        print(
+            f"single-song filter '{single_song}': {before} -> {len(dataset.buffer)} slices"
+        )
+        if len(dataset.buffer) == 0:
+            raise ValueError(f"No tracks matched single_song '{single_song}'")
+
     print("Initializing trainer...")
-    trainer = get_trainer(learning_params)
+    trainer = get_trainer(learning_params, minutes=tr["minutes"])
 
     print("Initializing module...")
     module = build_module(
-        learning_params, loss_aggregator, optimizer_cfg, scheduler_cfg
+        learning_params,
+        loss_aggregator,
+        optimizer_cfg,
+        scheduler_cfg,
+        gss=gan["gan_start_step"],
+        token_dim=m["token_dim"],
+        num_rq_steps=m["num_rq"],
+        num_tokens=m["num_tokens"],
+        time_downsample=m["time_downsample"],
+        disc_width=gan["disc_width"],
+        d_weight_cap=gan["d_weight_cap"],
+        hidden=m["hidden"],
     )
+
+    checkpoint = tr.get("checkpoint")
+    if checkpoint is not None:
+        print(f"Loading model weights from {checkpoint}...")
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+        # strict=False so the generator can resume into a fresh discriminator.
+        result = module.load_state_dict(state_dict, strict=False)
+        miss = [k for k in result.missing_keys if not k.startswith("discriminator")]
+        unexp = [k for k in result.unexpected_keys if not k.startswith("discriminator")]
+        print(
+            f"  loaded; discriminator left at init. "
+            f"non-disc missing={len(miss)} unexpected={len(unexp)}"
+        )
+        if miss or unexp:
+            print(
+                f"  WARN non-disc mismatch: missing={miss[:5]} unexpected={unexp[:5]}"
+            )
 
     print("Starting training...")
     trainer.fit(module, data_module)
     print("Training complete.")
 
     print("\nRunning test evaluation...")
-    trainer.test(module, data_module)
+    results = trainer.test(module, data_module)
     print("Test complete. Results printed above.")
+
+    cdpam_val = results[0].get("test/cdpam", 0.0) if results else 0.0
+    peak_vram_mb = (
+        torch.cuda.max_memory_allocated() / (1024 * 1024)
+        if torch.cuda.is_available()
+        else 0.0
+    )
+    print(f"cdpam: {cdpam_val:.6f}")
+    print(f"peak_vram_mb: {peak_vram_mb:.0f}")
 
 
 if __name__ == "__main__":

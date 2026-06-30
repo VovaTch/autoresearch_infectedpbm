@@ -5,6 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "cdpam>=0.0.6",
+    "resampy>=0.4.3",
+    "scipy>=1.17.1",
+    "librosa>=0.11.0",
     "gdown>=6.0.0",
     "ipython>=9.13.0",
     "lightning>=2.6.1",
@@ -14,6 +18,7 @@ dependencies = [
     "torchaudio>=2.11.0",
     "torchcodec>=0.11.1",
     "tqdm>=4.67.3",
+    "ipykernel>=7.3.0",
 ]
 
 [dependency-groups]
