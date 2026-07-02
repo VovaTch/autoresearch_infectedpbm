@@ -23,7 +23,7 @@ gan:
 train:
   devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
   minutes: 15           # wall-clock training budget (excludes startup/eval)
-  lr: 1.4142e-4        # one-cycle peak learning rate (sqrt(2)-scaled for 2-GPU batch)
+  lr: 2.8284e-4        # one-cycle peak learning rate (2x hotter peak for 15-min budget)
   lr_pct_start: 0.1     # one-cycle warmup fraction (rise over first 10% of time)
   single_song: null     # substring filter for single-song overfit; null = full dataset
   save_path: null       # checkpoint/log dir override; null = default ("saved/")
