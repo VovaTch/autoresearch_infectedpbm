@@ -31,12 +31,13 @@ CKPTS = {
     # tag -> checkpoint to render. cfg fields must match config.yaml's model block
     # (token_dim/hidden/num_rq/num_tokens/time_downsample). Paths point at the
     # best-on-monitor checkpoint (model_name + "_best.ckpt").
-    "model": dict(
-        path="saved/lvl1_vqgan_best.ckpt",
+    "last": dict(
+        path="saved/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
     ),
 }
-TRACK_SUBSTR = "Cookie_From_Space"  # restrict clips to this song (slice filenames use underscores)
+# tracks to render (substrings of slice filenames); one set of clips per track
+TRACKS = ["deeply_disturbed", "Cookie_From_Space"]
 
 
 def multi_res_stft_dist(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -83,24 +84,27 @@ def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 1024, num_rq: i
 
 
 def pick_clips(n_clips: int = 3) -> list[tuple[str, torch.Tensor]]:
-    """Pick n clips from distinct positions (25/50/75%) of the TRACK_SUBSTR song."""
-    files = [
-        f
-        for f in sorted(glob.glob(os.path.join(CACHE, "*.pt")))
-        if TRACK_SUBSTR in os.path.basename(f)
-    ]
-    if not files:
-        raise ValueError(f"No slice file matched '{TRACK_SUBSTR}'")
-    slices = torch.load(files[0], map_location="cpu")  # [N,1,SLICE]
-    name = os.path.splitext(os.path.basename(files[0]))[0].replace("slices_", "")[:40]
-    n = slices.shape[0]
-    fracs = [(i + 1) / (n_clips + 1) for i in range(n_clips)]  # 0.25,0.5,0.75
+    """Pick n clips from distinct positions (25/50/75%) of each track in TRACKS."""
     clips = []
-    for fr in fracs:
-        start = min(int(fr * n), n - SLICES_PER_CLIP)
-        start -= start % SLICES_PER_CLIP
-        clip = slices[start : start + SLICES_PER_CLIP].reshape(1, -1)
-        clips.append((f"{name}_p{int(fr*100)}", clip))
+    for substr in TRACKS:
+        files = [
+            f
+            for f in sorted(glob.glob(os.path.join(CACHE, "*.pt")))
+            if substr in os.path.basename(f)
+        ]
+        if not files:
+            raise ValueError(f"No slice file matched '{substr}'")
+        slices = torch.load(files[0], map_location="cpu")  # [N,1,SLICE]
+        name = (
+            os.path.splitext(os.path.basename(files[0]))[0].replace("slices_", "")[:40]
+        )
+        n = slices.shape[0]
+        fracs = [(i + 1) / (n_clips + 1) for i in range(n_clips)]  # 0.25,0.5,0.75
+        for fr in fracs:
+            start = min(int(fr * n), n - SLICES_PER_CLIP)
+            start -= start % SLICES_PER_CLIP
+            clip = slices[start : start + SLICES_PER_CLIP].reshape(1, -1)
+            clips.append((f"{name}_p{int(fr*100)}", clip))
     return clips
 
 

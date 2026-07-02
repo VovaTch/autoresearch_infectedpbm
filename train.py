@@ -2014,15 +2014,17 @@ class TimeOneCycleLR(torch.optim.lr_scheduler.LRScheduler):
         if frac < self.pct_start:
             # warmup: initial_lr -> max_lr, cosine ease-in
             p = frac / self.pct_start
-            lr = self.initial_lr + (self.max_lr - self.initial_lr) * (
-                1.0 - math.cos(math.pi * p)
-            ) / 2.0
+            lr = (
+                self.initial_lr
+                + (self.max_lr - self.initial_lr) * (1.0 - math.cos(math.pi * p)) / 2.0
+            )
         else:
             # anneal: max_lr -> min_lr, cosine ease-out
             p = (frac - self.pct_start) / max(1.0 - self.pct_start, 1e-8)
-            lr = self.min_lr + (self.max_lr - self.min_lr) * (
-                1.0 + math.cos(math.pi * p)
-            ) / 2.0
+            lr = (
+                self.min_lr
+                + (self.max_lr - self.min_lr) * (1.0 + math.cos(math.pi * p)) / 2.0
+            )
         return [lr for _ in self.base_lrs]
 
 
