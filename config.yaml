@@ -6,7 +6,7 @@
 # the knobs below are what you tune.
 
 model:
-  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  hidden: 512           # temporal conv channel width (smaller model: ~2x steps in 15-min budget)
   token_dim: 1024       # VQ latent / codebook token dimension
   num_rq: 3             # residual quantization depth (codes per latent frame)
   num_tokens: 2048      # codebook entries per RQ level
