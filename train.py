@@ -2157,7 +2157,7 @@ def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
         ),
         CDPAMLoss(
             name="cdpam",
-            weight=25.0,
+            weight=50.0,
             pred_key="slice",
             ref_key="slice",
         ),
