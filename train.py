@@ -1090,6 +1090,29 @@ class DecoderBase(ABC, nn.Module):
 # ===========================================================================
 
 
+class AttnBlock1D(nn.Module):
+    """Pre-norm transformer block over the time axis of a (B, C, T) latent.
+    Convs are local; this adds global temporal context at the bottleneck."""
+
+    def __init__(self, dim: int, heads: int = 8, mlp_ratio: int = 4) -> None:
+        super().__init__()
+        self._norm1 = nn.LayerNorm(dim)
+        self._attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self._norm2 = nn.LayerNorm(dim)
+        self._mlp = nn.Sequential(
+            nn.Linear(dim, mlp_ratio * dim),
+            nn.GELU(),
+            nn.Linear(mlp_ratio * dim, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x.transpose(1, 2)  # (B, T, C)
+        n = self._norm1(h)
+        h = h + self._attn(n, n, n, need_weights=False)[0]
+        h = h + self._mlp(self._norm2(h))
+        return h.transpose(1, 2)
+
+
 class TemporalEncoder(nn.Module):
     def __init__(
         self,
@@ -1133,6 +1156,7 @@ class TemporalEncoder(nn.Module):
                 for _ in range(num_res_blocks)
             ]
         )
+        self._attn = AttnBlock1D(hidden)
         self._proj_out = nn.Conv1d(hidden, token_dim, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1152,6 +1176,7 @@ class TemporalEncoder(nn.Module):
         h = self._res1(h)
         h = self._down(h)
         h = self._res2(h)
+        h = self._attn(h)
         z_e = self._proj_out(h)  # (B, token_dim, n_frames / time_downsample)
         # Pin z_e scale so it can't run away: unconstrained conv output inflates
         # under high LR -> alignment/commitment MSE (both vs z_e) grow unbounded.
@@ -1181,6 +1206,7 @@ class TemporalDecoder(DecoderBase):
         # complex head: decoder predicts raw (real, imag) STFT -> ISTFT.
         out_dim = self._spec_bins * 2
         self._proj_in = nn.Conv1d(token_dim, hidden, kernel_size=3, padding=1)
+        self._attn = AttnBlock1D(hidden)
         self._res1 = nn.Sequential(
             *[
                 Res1DBlock(hidden, num_res_conv, dilation_factor, kernel_size)
@@ -1223,6 +1249,7 @@ class TemporalDecoder(DecoderBase):
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         # z: (B, token_dim, T_lat)
         h = self._proj_in(z)
+        h = self._attn(h)
         h = self._res1(h)
         h = self._up(h)
         h = self._res2(h)
