@@ -1227,6 +1227,8 @@ class TemporalDecoder(DecoderBase):
         h = self._up(h)
         h = self._res2(h)
         spec = self._proj_spec(h)
+        # torch.complex/ISTFT don't support bf16 -> fp32 for the spectral head
+        spec = spec.float()
         b = self._spec_bins
         complex_spec = torch.complex(spec[:, :b], spec[:, b:])
         y = self._istft(complex_spec)  # (B, L)
