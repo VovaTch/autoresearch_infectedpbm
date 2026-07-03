@@ -2022,7 +2022,7 @@ class TimeOneCycleLR(torch.optim.lr_scheduler.LRScheduler):
         total_minutes: float,
         max_lr: float,
         pct_start: float = 0.1,
-        div_factor: float = 25.0,
+        div_factor: float = 10.0,
         final_div_factor: float = 1e4,
         last_epoch: int = -1,
     ):
