@@ -1232,7 +1232,8 @@ class TemporalDecoder(DecoderBase):
         b = self._spec_bins
         complex_spec = torch.complex(spec[:, :b], spec[:, b:])
         y = self._istft(complex_spec)  # (B, L)
-        return self._end_conv(y.unsqueeze(1))  # (B, 1, L)
+        # fp32 output: downstream losses (cuFFT stft, melspec) reject bf16
+        return self._end_conv(y.unsqueeze(1)).float()  # (B, 1, L)
 
 
 # ===========================================================================
