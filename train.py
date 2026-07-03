@@ -384,7 +384,7 @@ def get_trainer(
         patience=int(learning_parameters.epochs),
     )
 
-    precision = 16 if learning_parameters.amp else 32
+    precision = "bf16-mixed" if learning_parameters.amp else 32
     model_summary = ModelSummary(max_depth=2)
     timer = Timer(duration={"minutes": minutes})
 
@@ -1948,7 +1948,7 @@ def build_learning_params() -> LearningParameters:
         beta_ema=0.95,
         gradient_clip=None,
         save_path="saved/",
-        amp=False,
+        amp=True,
         val_split=0.04,
         test_split=0.01,
         devices="auto",
