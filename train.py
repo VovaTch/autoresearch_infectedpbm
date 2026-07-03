@@ -2121,16 +2121,6 @@ def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
             name="commitment_loss", weight=commit_weight, base_loss=nn.MSELoss()
         ),
         MelSpecLoss(
-            name="melspec_loss_1",
-            weight=1.0,
-            pred_key="slice",
-            ref_key="slice",
-            base_loss=nn.L1Loss(),
-            lin_start=1.0,
-            lin_end=1.0,
-            mel_spec_converter=make_mel_converter(2048, 512, 128, 2.0),
-        ),
-        MelSpecLoss(
             name="melspec_loss_2",
             weight=2.0,
             pred_key="slice",
@@ -2160,16 +2150,6 @@ def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
             lin_start=0.5,
             lin_end=10.0,
             mel_spec_converter=make_mel_converter(4096, 1024, 256, 1.0),
-        ),
-        MelSpecLoss(
-            name="melspec_loss_5",
-            weight=5.0,
-            pred_key="slice",
-            ref_key="slice",
-            base_loss=nn.L1Loss(),
-            lin_start=0.1,
-            lin_end=20.0,
-            mel_spec_converter=make_mel_converter(512, 256, 64, 2.0),
         ),
         MelSpecLoss(
             name="melspec_loss_6",
