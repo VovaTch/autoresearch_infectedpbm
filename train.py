@@ -1983,7 +1983,7 @@ def build_learning_params() -> LearningParameters:
         model_name="lvl1_vqgan",
         learning_rate=0.0001,
         weight_decay=0.0,
-        batch_size=12,
+        batch_size=16,
         grad_accumulation=1,
         epochs=10000,
         beta_ema=0.95,
@@ -2007,7 +2007,7 @@ def build_optimizer_cfg() -> dict[str, Any]:
         "weight_decay": 0.0,
         "lr": 0.0001,
         "amsgrad": True,
-        "betas": (0.5, 0.9),
+        "betas": (0.5, 0.95),
     }
 
 

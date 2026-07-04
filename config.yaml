@@ -24,7 +24,7 @@ train:
   devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
   minutes: 15           # wall-clock training budget (excludes startup/eval)
   lr: 3.5355e-4        # one-cycle peak learning rate (2.5x: retune after attn added)
-  lr_pct_start: 0.1     # one-cycle warmup fraction (rise over first 10% of time)
+  lr_pct_start: 0.15    # one-cycle warmup fraction
   single_song: null     # substring filter for single-song overfit; null = full dataset
   save_path: null       # checkpoint/log dir override; null = default ("saved/")
   checkpoint: null       # resume weights from this checkpoint; null = train from scratch
