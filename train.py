@@ -2112,7 +2112,7 @@ def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
     components = [
         RecLoss(
             name="rec_l2",
-            weight=0.3,
+            weight=0.15,
             pred_key="slice",
             ref_key="slice",
             base_loss=nn.MSELoss(),
