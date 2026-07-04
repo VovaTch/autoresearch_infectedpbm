@@ -1107,6 +1107,23 @@ class AttnBlock1D(nn.Module):
         return h.transpose(1, 2)
 
 
+class GRUBlock1D(nn.Module):
+    """Pre-norm bidirectional GRU over the time axis of a (B, C, T) latent.
+    Recurrent alternative to attention for global temporal context."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self._norm = nn.LayerNorm(dim)
+        self._gru = nn.GRU(
+            dim, dim // 2, batch_first=True, bidirectional=True
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x.transpose(1, 2)  # (B, T, C)
+        h = h + self._gru(self._norm(h))[0]
+        return h.transpose(1, 2)
+
+
 class TemporalEncoder(nn.Module):
     def __init__(
         self,
@@ -1150,7 +1167,7 @@ class TemporalEncoder(nn.Module):
                 for _ in range(num_res_blocks)
             ]
         )
-        self._attn = AttnBlock1D(hidden)
+        self._attn = GRUBlock1D(hidden)
         self._proj_out = nn.Conv1d(hidden, token_dim, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1200,7 +1217,7 @@ class TemporalDecoder(DecoderBase):
         # complex head: decoder predicts raw (real, imag) STFT -> ISTFT.
         out_dim = self._spec_bins * 2
         self._proj_in = nn.Conv1d(token_dim, hidden, kernel_size=3, padding=1)
-        self._attn = AttnBlock1D(hidden)
+        self._attn = GRUBlock1D(hidden)
         self._res1 = nn.Sequential(
             *[
                 Res1DBlock(hidden, num_res_conv, dilation_factor, kernel_size)
