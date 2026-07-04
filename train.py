@@ -918,6 +918,24 @@ class VQ1D(nn.Module):
 # ===========================================================================
 
 
+def _sep_conv1d(
+    num_channels: int, kernel_size: int, dilation: int, padding: int
+) -> nn.Sequential:
+    """Depthwise-separable conv: depthwise k-conv + pointwise 1x1 (~5x cheaper
+    than a full conv at hidden=512, k=5 -> more optimizer steps per budget)."""
+    return nn.Sequential(
+        nn.Conv1d(
+            num_channels,
+            num_channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=padding,
+            groups=num_channels,
+        ),
+        nn.Conv1d(num_channels, num_channels, kernel_size=1),
+    )
+
+
 class Res1DBlock(nn.Module):
     def __init__(
         self,
@@ -936,13 +954,7 @@ class Res1DBlock(nn.Module):
             if idx != num_res_conv - 1:
                 self.res_block_modules.append(
                     nn.Sequential(
-                        nn.Conv1d(
-                            num_channels,
-                            num_channels,
-                            kernel_size=kernel_size,
-                            dilation=dilation,
-                            padding=padding,
-                        ),
+                        _sep_conv1d(num_channels, kernel_size, dilation, padding),
                         self.activation,
                         nn.BatchNorm1d(num_channels),
                     )
@@ -950,13 +962,7 @@ class Res1DBlock(nn.Module):
             else:
                 self.res_block_modules.append(
                     nn.Sequential(
-                        nn.Conv1d(
-                            num_channels,
-                            num_channels,
-                            kernel_size=kernel_size,
-                            dilation=dilation,
-                            padding=padding,
-                        ),
+                        _sep_conv1d(num_channels, kernel_size, dilation, padding),
                         self.activation,
                     )
                 )
@@ -987,13 +993,7 @@ class Res1DBlockReverse(Res1DBlock):
             if idx != num_res_conv - 1:
                 self.res_block_modules.append(
                     nn.Sequential(
-                        nn.Conv1d(
-                            num_channels,
-                            num_channels,
-                            kernel_size=kernel_size,
-                            dilation=dilation,
-                            padding=padding,
-                        ),
+                        _sep_conv1d(num_channels, kernel_size, dilation, padding),
                         self.activation,
                         nn.BatchNorm1d(num_channels),
                     )
@@ -1001,13 +1001,7 @@ class Res1DBlockReverse(Res1DBlock):
             else:
                 self.res_block_modules.append(
                     nn.Sequential(
-                        nn.Conv1d(
-                            num_channels,
-                            num_channels,
-                            kernel_size=kernel_size,
-                            dilation=dilation,
-                            padding=padding,
-                        ),
+                        _sep_conv1d(num_channels, kernel_size, dilation, padding),
                         self.activation,
                     )
                 )
