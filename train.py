@@ -1142,7 +1142,7 @@ class TemporalEncoder(nn.Module):
         self._n_fft = n_fft
         self._hop_length = hop_length
         self._win_length = win_length
-        in_dim = (n_fft // 2 + 1) * 2  # real+imag stacked as channels
+        in_dim = (n_fft // 2 + 1) * 3  # real+imag+magnitude stacked as channels
         self._proj_in = nn.Conv1d(in_dim, hidden, kernel_size=7, padding=3)
         self._res1 = nn.Sequential(
             *[
@@ -1182,7 +1182,7 @@ class TemporalEncoder(nn.Module):
             return_complex=True,
         )  # (B, n_fft/2+1, T+1)
         n_frames = x.shape[-1] // self._hop_length
-        feats = torch.cat([spec.real, spec.imag], dim=1)[..., :n_frames]
+        feats = torch.cat([spec.real, spec.imag, spec.abs()], dim=1)[..., :n_frames]
         h = self._proj_in(feats)
         h = self._res1(h)
         h = self._down(h)
