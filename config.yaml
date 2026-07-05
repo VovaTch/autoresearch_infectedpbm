@@ -3,7 +3,6 @@
 # PREPARED FOR LONG RUN (2026-07-05) — not yet launched.
 # Recipe = jul2-jul5 15-min loop best (commit dc336f0): sep-convs, BiGRU
 # bottleneck, mag input channel, decoder-heavy depth, RQ2, cdpam w100.
-# Open decisions before launch (see FINDINGS_jul2_15min_loop.md):
 # Launch decisions (user, 2026-07-05): hidden 1024, token_dim 1024, peak LR
 # 3.5355e-4, GAN ON (gan_start_step 20000 engages mid-run). Watch align/commit
 # early — this peak LR was tuned at 15 min.
