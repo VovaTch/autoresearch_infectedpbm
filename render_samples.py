@@ -33,7 +33,7 @@ CKPTS = {
     # best-on-monitor checkpoint (model_name + "_best.ckpt").
     "last": dict(
         path="saved/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        token_dim=1024, num_rq=2, num_tokens=2048, time_downsample=1, hidden=1024,
     ),
 }
 # tracks to render (substrings of slice filenames); one set of clips per track

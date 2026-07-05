@@ -4,16 +4,12 @@
 # Recipe = jul2-jul5 15-min loop best (commit dc336f0): sep-convs, BiGRU
 # bottleneck, mag input channel, decoder-heavy depth, RQ2, cdpam w100.
 # Open decisions before launch (see FINDINGS_jul2_15min_loop.md):
-#   - hidden 512 vs 1024: 512 won at 15 min, but capacity ceiling evidence says
-#     wider may win at this horizon.
-#   - peak LR 3.5355e-4 was tuned at 15 min; previous long runs used 1.4142e-4.
-#     TimeOneCycleLR stretches the schedule automatically, but the peak may be
-#     hot for 14h — watch align/commit early.
-#   - gan_start_step 20000 WILL be reached in a long run (GAN engages). Memory:
-#     GAN sounded better by ear despite worse cdpam. Raise to disable.
+# Launch decisions (user, 2026-07-05): hidden 1024, token_dim 1024, peak LR
+# 3.5355e-4, GAN ON (gan_start_step 20000 engages mid-run). Watch align/commit
+# early — this peak LR was tuned at 15 min.
 
 model:
-  hidden: 512           # temporal conv channel width (15-min winner; see note above)
+  hidden: 1024          # temporal conv channel width (user: wider for long horizon)
   token_dim: 1024       # VQ latent / codebook token dimension
   num_rq: 2             # residual quantization depth (RQ2 beat RQ3 at 15 min)
   num_tokens: 2048      # codebook entries per RQ level
