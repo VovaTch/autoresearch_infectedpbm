@@ -2226,7 +2226,10 @@ def build_generator(
         token_dim=token_dim, hidden=hidden, time_downsample=time_downsample
     )
     decoder = TemporalDecoder(
-        token_dim=token_dim, hidden=hidden, time_upsample=time_downsample
+        token_dim=token_dim,
+        hidden=hidden,
+        num_res_blocks=3,
+        time_upsample=time_downsample,
     )
     return MultiLvlVQVariationalAutoEncoder(
         input_channels=1,
