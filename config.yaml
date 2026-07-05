@@ -1,6 +1,6 @@
 # Training configuration for the lvl1_vqgan music tokenizer.
 #
-# PREPARED FOR LONG RUN (2026-07-05) — not yet launched.
+# LONG RUN LAUNCHED 2026-07-05 23:15 (target finish ~19:30 next day).
 # Recipe = jul2-jul5 15-min loop best (commit dc336f0): sep-convs, BiGRU
 # bottleneck, mag input channel, decoder-heavy depth, RQ2, cdpam w100.
 # Launch decisions (user, 2026-07-05): hidden 1024, token_dim 1024, peak LR
@@ -24,7 +24,7 @@ gan:
 
 train:
   devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
-  minutes: 870          # wall-clock training budget (14.5h, excludes startup/eval)
+  minutes: 1185         # wall-clock training budget (19.75h; launched 2026-07-05 23:15, target finish 19:30 with startup/eval buffer)
   lr: 3.5355e-4        # one-cycle peak learning rate (see LR note above)
   lr_pct_start: 0.15    # one-cycle warmup fraction
   single_song: null     # substring filter for single-song overfit; null = full dataset
