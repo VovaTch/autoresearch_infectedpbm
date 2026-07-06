@@ -384,7 +384,7 @@ def get_trainer(
         patience=int(learning_parameters.epochs),
     )
 
-    precision = "bf16-mixed" if learning_parameters.amp else 32
+    precision = 16 if learning_parameters.amp else 32
     model_summary = ModelSummary(max_depth=2)
     timer = Timer(duration={"minutes": minutes})
 
@@ -918,24 +918,6 @@ class VQ1D(nn.Module):
 # ===========================================================================
 
 
-def _sep_conv1d(
-    num_channels: int, kernel_size: int, dilation: int, padding: int
-) -> nn.Sequential:
-    """Depthwise-separable conv: depthwise k-conv + pointwise 1x1 (~5x cheaper
-    than a full conv at hidden=512, k=5 -> more optimizer steps per budget)."""
-    return nn.Sequential(
-        nn.Conv1d(
-            num_channels,
-            num_channels,
-            kernel_size=kernel_size,
-            dilation=dilation,
-            padding=padding,
-            groups=num_channels,
-        ),
-        nn.Conv1d(num_channels, num_channels, kernel_size=1),
-    )
-
-
 class Res1DBlock(nn.Module):
     def __init__(
         self,
@@ -954,7 +936,13 @@ class Res1DBlock(nn.Module):
             if idx != num_res_conv - 1:
                 self.res_block_modules.append(
                     nn.Sequential(
-                        _sep_conv1d(num_channels, kernel_size, dilation, padding),
+                        nn.Conv1d(
+                            num_channels,
+                            num_channels,
+                            kernel_size=kernel_size,
+                            dilation=dilation,
+                            padding=padding,
+                        ),
                         self.activation,
                         nn.BatchNorm1d(num_channels),
                     )
@@ -962,7 +950,13 @@ class Res1DBlock(nn.Module):
             else:
                 self.res_block_modules.append(
                     nn.Sequential(
-                        _sep_conv1d(num_channels, kernel_size, dilation, padding),
+                        nn.Conv1d(
+                            num_channels,
+                            num_channels,
+                            kernel_size=kernel_size,
+                            dilation=dilation,
+                            padding=padding,
+                        ),
                         self.activation,
                     )
                 )
@@ -993,7 +987,13 @@ class Res1DBlockReverse(Res1DBlock):
             if idx != num_res_conv - 1:
                 self.res_block_modules.append(
                     nn.Sequential(
-                        _sep_conv1d(num_channels, kernel_size, dilation, padding),
+                        nn.Conv1d(
+                            num_channels,
+                            num_channels,
+                            kernel_size=kernel_size,
+                            dilation=dilation,
+                            padding=padding,
+                        ),
                         self.activation,
                         nn.BatchNorm1d(num_channels),
                     )
@@ -1001,7 +1001,13 @@ class Res1DBlockReverse(Res1DBlock):
             else:
                 self.res_block_modules.append(
                     nn.Sequential(
-                        _sep_conv1d(num_channels, kernel_size, dilation, padding),
+                        nn.Conv1d(
+                            num_channels,
+                            num_channels,
+                            kernel_size=kernel_size,
+                            dilation=dilation,
+                            padding=padding,
+                        ),
                         self.activation,
                     )
                 )
@@ -1084,46 +1090,6 @@ class DecoderBase(ABC, nn.Module):
 # ===========================================================================
 
 
-class AttnBlock1D(nn.Module):
-    """Pre-norm transformer block over the time axis of a (B, C, T) latent.
-    Convs are local; this adds global temporal context at the bottleneck."""
-
-    def __init__(self, dim: int, heads: int = 8, mlp_ratio: int = 4) -> None:
-        super().__init__()
-        self._norm1 = nn.LayerNorm(dim)
-        self._attn = nn.MultiheadAttention(dim, heads, batch_first=True)
-        self._norm2 = nn.LayerNorm(dim)
-        self._mlp = nn.Sequential(
-            nn.Linear(dim, mlp_ratio * dim),
-            nn.GELU(),
-            nn.Linear(mlp_ratio * dim, dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = x.transpose(1, 2)  # (B, T, C)
-        n = self._norm1(h)
-        h = h + self._attn(n, n, n, need_weights=False)[0]
-        h = h + self._mlp(self._norm2(h))
-        return h.transpose(1, 2)
-
-
-class GRUBlock1D(nn.Module):
-    """Pre-norm bidirectional GRU over the time axis of a (B, C, T) latent.
-    Recurrent alternative to attention for global temporal context."""
-
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self._norm = nn.LayerNorm(dim)
-        self._gru = nn.GRU(
-            dim, dim // 2, batch_first=True, bidirectional=True
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = x.transpose(1, 2)  # (B, T, C)
-        h = h + self._gru(self._norm(h))[0]
-        return h.transpose(1, 2)
-
-
 class TemporalEncoder(nn.Module):
     def __init__(
         self,
@@ -1142,7 +1108,7 @@ class TemporalEncoder(nn.Module):
         self._n_fft = n_fft
         self._hop_length = hop_length
         self._win_length = win_length
-        in_dim = (n_fft // 2 + 1) * 3  # real+imag+magnitude stacked as channels
+        in_dim = (n_fft // 2 + 1) * 2  # real+imag stacked as channels
         self._proj_in = nn.Conv1d(in_dim, hidden, kernel_size=7, padding=3)
         self._res1 = nn.Sequential(
             *[
@@ -1167,7 +1133,6 @@ class TemporalEncoder(nn.Module):
                 for _ in range(num_res_blocks)
             ]
         )
-        self._attn = GRUBlock1D(hidden)
         self._proj_out = nn.Conv1d(hidden, token_dim, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1182,12 +1147,11 @@ class TemporalEncoder(nn.Module):
             return_complex=True,
         )  # (B, n_fft/2+1, T+1)
         n_frames = x.shape[-1] // self._hop_length
-        feats = torch.cat([spec.real, spec.imag, spec.abs()], dim=1)[..., :n_frames]
+        feats = torch.cat([spec.real, spec.imag], dim=1)[..., :n_frames]
         h = self._proj_in(feats)
         h = self._res1(h)
         h = self._down(h)
         h = self._res2(h)
-        h = self._attn(h)
         z_e = self._proj_out(h)  # (B, token_dim, n_frames / time_downsample)
         # Pin z_e scale so it can't run away: unconstrained conv output inflates
         # under high LR -> alignment/commitment MSE (both vs z_e) grow unbounded.
@@ -1217,7 +1181,6 @@ class TemporalDecoder(DecoderBase):
         # complex head: decoder predicts raw (real, imag) STFT -> ISTFT.
         out_dim = self._spec_bins * 2
         self._proj_in = nn.Conv1d(token_dim, hidden, kernel_size=3, padding=1)
-        self._attn = GRUBlock1D(hidden)
         self._res1 = nn.Sequential(
             *[
                 Res1DBlock(hidden, num_res_conv, dilation_factor, kernel_size)
@@ -1260,18 +1223,14 @@ class TemporalDecoder(DecoderBase):
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         # z: (B, token_dim, T_lat)
         h = self._proj_in(z)
-        h = self._attn(h)
         h = self._res1(h)
         h = self._up(h)
         h = self._res2(h)
         spec = self._proj_spec(h)
-        # torch.complex/ISTFT don't support bf16 -> fp32 for the spectral head
-        spec = spec.float()
         b = self._spec_bins
         complex_spec = torch.complex(spec[:, :b], spec[:, b:])
         y = self._istft(complex_spec)  # (B, L)
-        # fp32 output: downstream losses (cuFFT stft, melspec) reject bf16
-        return self._end_conv(y.unsqueeze(1)).float()  # (B, 1, L)
+        return self._end_conv(y.unsqueeze(1))  # (B, 1, L)
 
 
 # ===========================================================================
@@ -1983,13 +1942,13 @@ def build_learning_params() -> LearningParameters:
         model_name="lvl1_vqgan",
         learning_rate=0.0001,
         weight_decay=0.0,
-        batch_size=16,
+        batch_size=12,
         grad_accumulation=1,
         epochs=10000,
         beta_ema=0.95,
         gradient_clip=None,
         save_path="saved/",
-        amp=True,
+        amp=False,
         val_split=0.04,
         test_split=0.01,
         devices="auto",
@@ -2007,7 +1966,7 @@ def build_optimizer_cfg() -> dict[str, Any]:
         "weight_decay": 0.0,
         "lr": 0.0001,
         "amsgrad": True,
-        "betas": (0.5, 0.95),
+        "betas": (0.5, 0.9),
     }
 
 
@@ -2033,7 +1992,7 @@ class TimeOneCycleLR(torch.optim.lr_scheduler.LRScheduler):
         total_minutes: float,
         max_lr: float,
         pct_start: float = 0.1,
-        div_factor: float = 10.0,
+        div_factor: float = 25.0,
         final_div_factor: float = 1e4,
         last_epoch: int = -1,
     ):
@@ -2055,17 +2014,15 @@ class TimeOneCycleLR(torch.optim.lr_scheduler.LRScheduler):
         if frac < self.pct_start:
             # warmup: initial_lr -> max_lr, cosine ease-in
             p = frac / self.pct_start
-            lr = (
-                self.initial_lr
-                + (self.max_lr - self.initial_lr) * (1.0 - math.cos(math.pi * p)) / 2.0
-            )
+            lr = self.initial_lr + (self.max_lr - self.initial_lr) * (
+                1.0 - math.cos(math.pi * p)
+            ) / 2.0
         else:
             # anneal: max_lr -> min_lr, cosine ease-out
             p = (frac - self.pct_start) / max(1.0 - self.pct_start, 1e-8)
-            lr = (
-                self.min_lr
-                + (self.max_lr - self.min_lr) * (1.0 + math.cos(math.pi * p)) / 2.0
-            )
+            lr = self.min_lr + (self.max_lr - self.min_lr) * (
+                1.0 + math.cos(math.pi * p)
+            ) / 2.0
         return [lr for _ in self.base_lrs]
 
 
@@ -2112,7 +2069,7 @@ def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
     components = [
         RecLoss(
             name="rec_l2",
-            weight=0.15,
+            weight=0.3,
             pred_key="slice",
             ref_key="slice",
             base_loss=nn.MSELoss(),
@@ -2130,6 +2087,16 @@ def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
         # (z_e magnitude outran codes -> alignment drifted unbounded over 3h runs)
         CommitLoss(
             name="commitment_loss", weight=commit_weight, base_loss=nn.MSELoss()
+        ),
+        MelSpecLoss(
+            name="melspec_loss_1",
+            weight=1.0,
+            pred_key="slice",
+            ref_key="slice",
+            base_loss=nn.L1Loss(),
+            lin_start=1.0,
+            lin_end=1.0,
+            mel_spec_converter=make_mel_converter(2048, 512, 128, 2.0),
         ),
         MelSpecLoss(
             name="melspec_loss_2",
@@ -2161,6 +2128,16 @@ def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
             lin_start=0.5,
             lin_end=10.0,
             mel_spec_converter=make_mel_converter(4096, 1024, 256, 1.0),
+        ),
+        MelSpecLoss(
+            name="melspec_loss_5",
+            weight=5.0,
+            pred_key="slice",
+            ref_key="slice",
+            base_loss=nn.L1Loss(),
+            lin_start=0.1,
+            lin_end=20.0,
+            mel_spec_converter=make_mel_converter(512, 256, 64, 2.0),
         ),
         MelSpecLoss(
             name="melspec_loss_6",
@@ -2226,10 +2203,7 @@ def build_generator(
         token_dim=token_dim, hidden=hidden, time_downsample=time_downsample
     )
     decoder = TemporalDecoder(
-        token_dim=token_dim,
-        hidden=hidden,
-        num_res_blocks=3,
-        time_upsample=time_downsample,
+        token_dim=token_dim, hidden=hidden, time_upsample=time_downsample
     )
     return MultiLvlVQVariationalAutoEncoder(
         input_channels=1,
