@@ -31,9 +31,13 @@ CKPTS = {
     # tag -> checkpoint to render. cfg fields must match config.yaml's model block
     # (token_dim/hidden/num_rq/num_tokens/time_downsample). Paths point at the
     # best-on-monitor checkpoint (model_name + "_best.ckpt").
-    # PASS 2: 10h best-mrstft ckpt — requires baseline train.py (2ef38bc) checked out
+    # baseline arch (2ef38bc train.py): 10h fidelity ckpt + GAN-unconstrained fine-tune
     "10h_mrstft": dict(
         path="saved_10h_mrstft/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+    ),
+    "ft_gan": dict(
+        path="saved_ft_gan/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
     ),
 }
