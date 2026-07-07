@@ -31,9 +31,10 @@ CKPTS = {
     # tag -> checkpoint to render. cfg fields must match config.yaml's model block
     # (token_dim/hidden/num_rq/num_tokens/time_downsample). Paths point at the
     # best-on-monitor checkpoint (model_name + "_best.ckpt").
-    "last": dict(
-        path="saved/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=2, num_tokens=2048, time_downsample=1, hidden=1024,
+    # PASS 2: 10h best-mrstft ckpt — requires baseline train.py (2ef38bc) checked out
+    "10h_mrstft": dict(
+        path="saved_10h_mrstft/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
     ),
 }
 # tracks to render (substrings of slice filenames); one set of clips per track
