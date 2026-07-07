@@ -1,0 +1,32 @@
+# Training configuration for the lvl1_vqgan music tokenizer.
+#
+# GAN CAP PROBE 100 (2026-07-07): 4h fine-tune from the 10h best-mrstft ckpt.
+# best-mrstft checkpoint (2ef38bc, mrstft 1.6704 / cdpam 0.1539 — ear: hints of
+# melody, best of current ckpts). Experiment: remove the adaptive adversarial
+# weight clamp (d_weight_cap 1.0 -> 1e4, the code default = effectively
+# unconstrained grad-norm ratio). GAN on from step 0 (fresh trainer step
+# counter). Checkpoints go to saved_ft_gan/ so saved_10h_mrstft/ stays intact.
+
+model:
+  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  token_dim: 1024       # VQ latent / codebook token dimension
+  num_rq: 3             # residual quantization depth (codes per latent frame)
+  num_tokens: 2048      # codebook entries per RQ level
+  time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+
+vq:
+  commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
+
+gan:
+  gan_start_step: 0     # fine-tune: GAN on immediately (step counter resets on weight-load)
+  d_weight_cap: 100.0   # cap probe: ~30% of balanced GAN pressure (raw ratio ~360)
+  disc_width: 1         # discriminator channel multiplier
+
+train:
+  devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
+  minutes: 240          # 4h cap probe
+  lr: 1.0e-4            # one-cycle peak learning rate (fine-tune: below from-scratch peak)
+  lr_pct_start: 0.15    # one-cycle warmup fraction
+  single_song: null     # substring filter for single-song overfit; null = full dataset
+  save_path: saved_ft_cap100/
+  checkpoint: saved_10h_mrstft/lvl1_vqgan_last.ckpt  # weights from the 10h fidelity run
