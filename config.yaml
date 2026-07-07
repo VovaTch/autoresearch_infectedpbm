@@ -19,7 +19,7 @@ vq:
 
 gan:
   gan_start_step: 0     # fine-tune: GAN on immediately (step counter resets on weight-load)
-  d_weight_cap: 1.0e4   # UNCONSTRAINED adaptive adversarial weight (experiment)
+  d_weight_cap: 1.0e+4  # UNCONSTRAINED adaptive adversarial weight (experiment; sign required or PyYAML reads a string)
   disc_width: 1         # discriminator channel multiplier
 
 train:
