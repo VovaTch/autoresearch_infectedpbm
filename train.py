@@ -2414,6 +2414,16 @@ def main() -> None:
         hidden=m["hidden"],
     )
 
+    if tr.get("compile"):
+        # Compile the conv res stacks only: STFT/ISTFT (cuFFT) stay outside the
+        # compiled regions. Note: compiled submodules get an "_orig_mod." prefix
+        # in state_dict keys -> checkpoints need key-stripping to load uncompiled.
+        gen = module.model
+        for net in (gen.encoder, gen.decoder):
+            net._res1 = torch.compile(net._res1)
+            net._res2 = torch.compile(net._res2)
+        print("torch.compile enabled on encoder/decoder res stacks")
+
     checkpoint = tr.get("checkpoint")
     if checkpoint is not None:
         print(f"Loading model weights from {checkpoint}...")
