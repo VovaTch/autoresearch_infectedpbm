@@ -1,0 +1,31 @@
+# Training configuration for the lvl1_vqgan music tokenizer.
+#
+# 20H CONTINUATION (2026-07-08): resume the 10h best-mrstft ckpt (2ef38bc,
+# mrstft 1.6704 / cdpam 0.1539, best by ear). GAN fully OFF (start step huge):
+# every GAN fine-tune variant failed the ear check. Fresh one-cycle, peak 1e-4
+# (below from-scratch peak: warm model), 1200 min.
+
+
+model:
+  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  token_dim: 1024       # VQ latent / codebook token dimension
+  num_rq: 3             # residual quantization depth (codes per latent frame)
+  num_tokens: 2048      # codebook entries per RQ level
+  time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+
+vq:
+  commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
+
+gan:
+  gan_start_step: 100000000 # GAN OFF for the whole continuation
+  d_weight_cap: 1.0     # upper clamp on the adaptive adversarial weight
+  disc_width: 1         # discriminator channel multiplier
+
+train:
+  devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
+  minutes: 1200         # 20h continuation
+  lr: 1.0e-4            # one-cycle peak (continuation: below from-scratch peak)
+  lr_pct_start: 0.1     # one-cycle warmup fraction (rise over first 10% of time)
+  single_song: null     # substring filter for single-song overfit; null = full dataset
+  save_path: saved_20h_cont/
+  checkpoint: saved_10h_mrstft/lvl1_vqgan_last.ckpt
