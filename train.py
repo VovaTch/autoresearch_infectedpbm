@@ -2030,6 +2030,7 @@ def build_scheduler_cfg(
     total_minutes: float = 540.0,
     max_lr: float = 1e-4,
     pct_start: float = 0.1,
+    div_factor: float = 25.0,
 ) -> dict[str, Any]:
     module_params = {
         "loss_monitor": "training/total loss",
@@ -2044,6 +2045,7 @@ def build_scheduler_cfg(
         "total_minutes": total_minutes,
         "max_lr": max_lr,
         "pct_start": pct_start,
+        "div_factor": div_factor,
         "module_params": module_params,
     }
 
@@ -2378,6 +2380,7 @@ def main() -> None:
         total_minutes=tr["minutes"],
         max_lr=tr["lr"],
         pct_start=tr["lr_pct_start"],
+        div_factor=tr.get("lr_div_factor", 25.0),
     )
     loss_aggregator = build_loss_aggregator(commit_weight=vq["commit_weight"])
 
