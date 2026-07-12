@@ -773,17 +773,22 @@ class VQCodeBookFunc(torch.autograd.Function):
             grad_input = grad_outputs
         if ctx.needs_input_grad[1]:
             embedding_weights, indices = ctx.saved_tensors
-            grad_emb = torch.zeros_like(embedding_weights)
-            for batch_idx, batch in enumerate(indices.flatten(start_dim=1)):
-                running_idx = 0
-                for idx in batch:
-                    idx_value = idx.item()
-                    grad_emb[:, idx_value] = (
-                        grad_emb[:, idx_value]
-                        + grad_outputs[batch_idx, :, running_idx]
-                        / indices.flatten().shape[0]
-                    )  # type: ignore
-                    running_idx += 1
+            # scatter-add, matching nn.Embedding's backward: each position's grad
+            # accumulates onto its selected code with NO extra normalization (the
+            # loss's mean() already provides it). The old python loop divided by
+            # B*T on top of that, leaving the codebook ~3000x undertrained.
+            flat_idx = indices.reshape(-1)
+            flat_grad = grad_outputs.transpose(1, 2).reshape(
+                -1, grad_outputs.shape[1]
+            )
+            grad_emb_t = torch.zeros(
+                embedding_weights.shape[1],
+                embedding_weights.shape[0],
+                device=grad_outputs.device,
+                dtype=grad_outputs.dtype,
+            )
+            grad_emb_t.index_add_(0, flat_idx, flat_grad)
+            grad_emb = grad_emb_t.t()
         return grad_input, grad_emb, None, None
 
 
@@ -892,6 +897,14 @@ class RQCodeBook(VQCodeBook):
             emb = emb + self.code_embedding[indices[..., idx]]
         return emb
 
+    def embed_cumulative(self, indices: torch.Tensor) -> torch.Tensor:
+        # Differentiable lookup for the align/commit losses: (B, T, R) indices ->
+        # (B, R, C, T) cumulative RQ sums — the same values apply_codebook would
+        # reselect for the same input, without a second cdist pass. Gradient to
+        # code_embedding flows through the native gather backward.
+        codes = self.code_embedding[indices]  # (B, T, R, C)
+        return codes.cumsum(dim=2).permute(0, 2, 3, 1)
+
 
 class VQ1D(nn.Module):
     def __init__(
@@ -908,8 +921,9 @@ class VQ1D(nn.Module):
         z_q, indices = self.vq_codebook.apply_codebook(z_e, code_sg=True)
         output = {"indices": indices, "v_q": z_q}
         if extract_losses:
-            emb, _ = self.vq_codebook.apply_codebook(z_e.detach())
-            output.update({"emb": emb})
+            # reuse the selection above: a second apply_codebook on z_e.detach()
+            # picked identical indices while paying the full cdist again.
+            output.update({"emb": self.vq_codebook.embed_cumulative(indices)})
         return output
 
 
@@ -2372,6 +2386,8 @@ def main() -> None:
         learning_params.save_path = tr["save_path"]
     learning_params.devices = tr.get("devices", "auto")
     learning_params.learning_rate = tr["lr"]
+    if tr.get("batch_size") is not None:
+        learning_params.batch_size = tr["batch_size"]
     optimizer_cfg = build_optimizer_cfg()
     # the GAN optimizers build from optimizer_cfg, so its "lr" is the one that
     # takes effect (and the one-cycle peak) -- set it from config.
