@@ -1117,11 +1117,15 @@ class TemporalEncoder(nn.Module):
         kernel_size: int = 5,
         dilation_factor: int = 2,
         time_downsample: int = 2,
+        ze_norm: str = "l2",
     ) -> None:
         super().__init__()
         self._n_fft = n_fft
         self._hop_length = hop_length
         self._win_length = win_length
+        if ze_norm not in ("l2", "grms", "none"):
+            raise ValueError(f"Unknown ze_norm '{ze_norm}'")
+        self._ze_norm = ze_norm
         in_dim = (n_fft // 2 + 1) * 2  # real+imag stacked as channels
         self._proj_in = nn.Conv1d(in_dim, hidden, kernel_size=7, padding=3)
         self._res1 = nn.Sequential(
@@ -1169,10 +1173,19 @@ class TemporalEncoder(nn.Module):
         z_e = self._proj_out(h)  # (B, token_dim, n_frames / time_downsample)
         # Pin z_e scale so it can't run away: unconstrained conv output inflates
         # under high LR -> alignment/commitment MSE (both vs z_e) grow unbounded.
-        # l2 normalize ONCE here (unit-norm per token, matches codebook init scale
-        # ~1) -- NOT inside the RQ select loop, which would force every residual
-        # step to unit-norm and kill refinement.
-        return F.normalize(z_e, dim=1)
+        # Applied ONCE here -- NOT inside the RQ select loop, which would force
+        # every residual step to unit-norm and kill refinement.
+        # NOTE: the historical runaway (none) / stagnation (grms) verdicts were
+        # collected with the ~frozen codebook (pre grad fix); knob re-exposed to
+        # retest both against a mobile codebook.
+        if self._ze_norm == "l2":
+            # unit-norm per token, matches codebook init scale ~1
+            return F.normalize(z_e, dim=1)
+        if self._ze_norm == "grms":
+            # global-RMS pin: scale-invariant but KEEPS per-token relative
+            # magnitude (unlike l2), preserving codebook capacity.
+            return z_e * z_e.pow(2).mean().add(1e-5).rsqrt()
+        return z_e  # none: unconstrained
 
 
 class TemporalDecoder(DecoderBase):
@@ -2211,12 +2224,16 @@ def build_generator(
     num_tokens: int = 2048,
     time_downsample: int = 1,
     hidden: int = 1024,
+    ze_norm: str = "l2",
 ) -> MultiLvlVQVariationalAutoEncoder:
     # temporal STFT arch: 32768-sample slice, hop 256 -> 128 STFT frames ->
-    # T_lat = 128 / time_downsample. Encoder l2-normalizes z_e; decoder is the
-    # complex (real/imag) STFT head.
+    # T_lat = 128 / time_downsample. Encoder pins z_e scale (ze_norm); decoder
+    # is the complex (real/imag) STFT head.
     encoder = TemporalEncoder(
-        token_dim=token_dim, hidden=hidden, time_downsample=time_downsample
+        token_dim=token_dim,
+        hidden=hidden,
+        time_downsample=time_downsample,
+        ze_norm=ze_norm,
     )
     decoder = TemporalDecoder(
         token_dim=token_dim, hidden=hidden, time_upsample=time_downsample
@@ -2316,6 +2333,7 @@ def build_module(
     disc_width: int = 1,
     d_weight_cap: float = 1.0,
     hidden: int = 1024,
+    ze_norm: str = "l2",
 ) -> VqganMusicLightningModule:
     generator = build_generator(
         loss_aggregator,
@@ -2324,6 +2342,7 @@ def build_module(
         num_tokens=num_tokens,
         time_downsample=time_downsample,
         hidden=hidden,
+        ze_norm=ze_norm,
     )
     discriminator = build_discriminator(disc_width=disc_width)
 
@@ -2431,6 +2450,7 @@ def main() -> None:
         disc_width=gan["disc_width"],
         d_weight_cap=gan["d_weight_cap"],
         hidden=m["hidden"],
+        ze_norm=m.get("ze_norm", "l2"),
     )
 
     if tr.get("compile"):

@@ -1,0 +1,37 @@
+# Training configuration for the lvl1_vqgan music tokenizer.
+#
+# NO-NORM x CODEBOOK-FIX PROBE (2026-07-13): retest ze_norm none now that the
+# codebook gradient is fixed. Hypothesis: the historical z_e runaway
+# (align/commit unbounded) happened because the ~frozen codebook could not
+# chase z_e -- a mobile codebook may keep it bounded without any encoder pin.
+# Warm-start from the 48h ckpt (l2-trained; z_e distribution will shift --
+# transient expected). Watch: training/z_e rms (now a live diagnostic again),
+# alignment loss, dead codes. 2h, same schedule as the codebook probe.
+
+
+model:
+  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  token_dim: 1024       # VQ latent / codebook token dimension
+  num_rq: 3             # residual quantization depth (codes per latent frame)
+  num_tokens: 2048      # codebook entries per RQ level
+  time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+  ze_norm: none         # UNCONSTRAINED z_e (retest vs mobile codebook)
+
+vq:
+  commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
+
+gan:
+  gan_start_step: 100000000 # GAN OFF
+  d_weight_cap: 1.0     # upper clamp on the adaptive adversarial weight
+  disc_width: 1         # discriminator channel multiplier
+
+train:
+  devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
+  minutes: 120          # 2h probe
+  lr: 3.0e-5            # gentle peak -- codebook just became mobile
+  lr_pct_start: 0.1     # longer warmup than usual, ease the codes in
+  lr_div_factor: 50     # initial lr = peak / div_factor = 6e-7
+  batch_size: 24        # keep the 48h run's batch
+  single_song: null     # substring filter for single-song overfit; null = full dataset
+  save_path: saved_probe_nonorm/
+  checkpoint: saved_48h_cont/lvl1_vqgan_last.ckpt

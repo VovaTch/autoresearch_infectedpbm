@@ -29,32 +29,26 @@ OUT = os.path.join(os.path.dirname(__file__), "renders")
 
 CKPTS = {
     # tag -> checkpoint to render. cfg fields must match config.yaml's model block
-    # (token_dim/hidden/num_rq/num_tokens/time_downsample). Paths point at the
-    # best-on-monitor checkpoint (model_name + "_best.ckpt").
-    # baseline arch (2ef38bc train.py): 10h fidelity ckpt + GAN-unconstrained fine-tune
-    "10h_mrstft": dict(
-        path="saved_10h_mrstft/lvl1_vqgan_last.ckpt",
+    # (token_dim/hidden/num_rq/num_tokens/time_downsample/ze_norm). Paths point
+    # at the best-on-monitor checkpoint (model_name + "_best.ckpt").
+    # jul13 codebook-fix probe set: 48h base + 3x 2h ze_norm probes from it.
+    "cont48h": dict(
+        path="saved_48h_cont/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
     ),
-    "ft_gan": dict(
-        path="saved_ft_gan/lvl1_vqgan_last.ckpt",
+    "probe_l2": dict(
+        path="saved_probe_codebook/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
     ),
-    "ft_cap30": dict(
-        path="saved_ft_cap30/lvl1_vqgan_last.ckpt",
+    "probe_nonorm": dict(
+        path="saved_probe_nonorm/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        ze_norm="none",
     ),
-    "ft_cap100": dict(
-        path="saved_ft_cap100/lvl1_vqgan_last.ckpt",
+    "probe_grms": dict(
+        path="saved_probe_grms/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-    ),
-    "cont20h": dict(
-        path="saved_20h_cont/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-    ),
-    "cont32h": dict(
-        path="saved_32h_cont/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        ze_norm="grms",
     ),
 }
 # tracks to render (substrings of slice filenames); one set of clips per track
@@ -89,11 +83,11 @@ def _apply_ema(module, ckpt) -> bool:
     return False
 
 
-def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 1024, num_rq: int = 3, num_tokens: int = 2048, time_downsample: int = 1, hidden: int = 1024):
+def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 1024, num_rq: int = 3, num_tokens: int = 2048, time_downsample: int = 1, hidden: int = 1024, ze_norm: str = "l2"):
     module = build_module(
         lp, la, oc, sc,
         token_dim=token_dim, num_rq_steps=num_rq, num_tokens=num_tokens,
-        time_downsample=time_downsample, hidden=hidden,
+        time_downsample=time_downsample, hidden=hidden, ze_norm=ze_norm,
     )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
@@ -171,6 +165,7 @@ def main():
                 num_tokens=cfg.get("num_tokens", 2048),
                 time_downsample=cfg.get("time_downsample", 1),
                 hidden=cfg.get("hidden", 1024),
+                ze_norm=cfg.get("ze_norm", "l2"),
             )
         else:
             print(f"SKIP {tag}: {path} missing")
