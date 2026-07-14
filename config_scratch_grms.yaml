@@ -1,0 +1,34 @@
+# Training configuration for the lvl1_vqgan music tokenizer.
+#
+# FROM-SCRATCH NORM RACE: grms (2026-07-14). 3h from scratch with the fixed
+# codebook gradient, one config per ze_norm, identical everything else (seed 42
+# shared -> same data order). Kills the warm-start home-field advantage the l2
+# ckpt had in the 2h probe rematch. From-scratch recipe LR (peak 1.4142e-4).
+
+
+model:
+  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  token_dim: 1024       # VQ latent / codebook token dimension
+  num_rq: 3             # residual quantization depth (codes per latent frame)
+  num_tokens: 2048      # codebook entries per RQ level
+  time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+  ze_norm: grms
+
+vq:
+  commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
+
+gan:
+  gan_start_step: 100000000 # GAN OFF
+  d_weight_cap: 1.0     # upper clamp on the adaptive adversarial weight
+  disc_width: 1         # discriminator channel multiplier
+
+train:
+  devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
+  minutes: 180          # 3h from scratch
+  lr: 1.4142e-4         # one-cycle peak (from-scratch recipe)
+  lr_pct_start: 0.1     # one-cycle warmup fraction
+  lr_div_factor: 25     # initial lr = peak / 25
+  batch_size: 24        # match the probe runs
+  single_song: null     # substring filter for single-song overfit; null = full dataset
+  save_path: saved_scratch_grms/
+  checkpoint: null      # FROM SCRATCH

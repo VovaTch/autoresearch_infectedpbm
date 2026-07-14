@@ -31,22 +31,23 @@ CKPTS = {
     # tag -> checkpoint to render. cfg fields must match config.yaml's model block
     # (token_dim/hidden/num_rq/num_tokens/time_downsample/ze_norm). Paths point
     # at the best-on-monitor checkpoint (model_name + "_best.ckpt").
-    # jul13 codebook-fix probe set: 48h base + 3x 2h ze_norm probes from it.
-    "cont48h": dict(
-        path="saved_48h_cont/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-    ),
+    # jul14 from-scratch norm race: 3x 3h runs (fixed codebook, seed-paired) +
+    # probe_l2 (current best, 48h+2h fix continuation) as the quality anchor.
     "probe_l2": dict(
         path="saved_probe_codebook/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
     ),
-    "probe_nonorm": dict(
-        path="saved_probe_nonorm/lvl1_vqgan_last.ckpt",
+    "scratch_l2": dict(
+        path="saved_scratch_l2/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+    ),
+    "scratch_nonorm": dict(
+        path="saved_scratch_nonorm/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
         ze_norm="none",
     ),
-    "probe_grms": dict(
-        path="saved_probe_grms/lvl1_vqgan_last.ckpt",
+    "scratch_grms": dict(
+        path="saved_scratch_grms/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
         ze_norm="grms",
     ),
