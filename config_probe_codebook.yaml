@@ -25,7 +25,7 @@ gan:
 
 train:
   devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
-  minutes: 240          # 4h probe
+  minutes: 120          # 2h probe
   lr: 3.0e-5            # gentle peak -- codebook just became mobile
   lr_pct_start: 0.1     # longer warmup than usual, ease the codes in
   lr_div_factor: 50     # initial lr = peak / div_factor = 6e-7
