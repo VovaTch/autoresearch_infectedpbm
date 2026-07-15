@@ -1117,7 +1117,7 @@ class TemporalEncoder(nn.Module):
         kernel_size: int = 5,
         dilation_factor: int = 2,
         time_downsample: int = 2,
-        ze_norm: str = "l2",
+        ze_norm: str = "none",
     ) -> None:
         super().__init__()
         self._n_fft = n_fft
@@ -2224,7 +2224,7 @@ def build_generator(
     num_tokens: int = 2048,
     time_downsample: int = 1,
     hidden: int = 1024,
-    ze_norm: str = "l2",
+    ze_norm: str = "none",
 ) -> MultiLvlVQVariationalAutoEncoder:
     # temporal STFT arch: 32768-sample slice, hop 256 -> 128 STFT frames ->
     # T_lat = 128 / time_downsample. Encoder pins z_e scale (ze_norm); decoder
@@ -2333,7 +2333,7 @@ def build_module(
     disc_width: int = 1,
     d_weight_cap: float = 1.0,
     hidden: int = 1024,
-    ze_norm: str = "l2",
+    ze_norm: str = "none",
 ) -> VqganMusicLightningModule:
     generator = build_generator(
         loss_aggregator,
@@ -2450,7 +2450,9 @@ def main() -> None:
         disc_width=gan["disc_width"],
         d_weight_cap=gan["d_weight_cap"],
         hidden=m["hidden"],
-        ze_norm=m.get("ze_norm", "l2"),
+        # DEFAULT none since 2026-07-15: from-scratch race (fixed codebook,
+        # seed-paired 3h) ranked none > grms > l2 on every metric + ear check.
+        ze_norm=m.get("ze_norm", "none"),
     )
 
     if tr.get("compile"):

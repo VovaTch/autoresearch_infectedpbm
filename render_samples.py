@@ -36,10 +36,12 @@ CKPTS = {
     "probe_l2": dict(
         path="saved_probe_codebook/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        ze_norm="l2",
     ),
     "scratch_l2": dict(
         path="saved_scratch_l2/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        ze_norm="l2",
     ),
     "scratch_nonorm": dict(
         path="saved_scratch_nonorm/lvl1_vqgan_last.ckpt",
@@ -84,7 +86,7 @@ def _apply_ema(module, ckpt) -> bool:
     return False
 
 
-def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 1024, num_rq: int = 3, num_tokens: int = 2048, time_downsample: int = 1, hidden: int = 1024, ze_norm: str = "l2"):
+def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 1024, num_rq: int = 3, num_tokens: int = 2048, time_downsample: int = 1, hidden: int = 1024, ze_norm: str = "none"):
     module = build_module(
         lp, la, oc, sc,
         token_dim=token_dim, num_rq_steps=num_rq, num_tokens=num_tokens,
@@ -166,7 +168,7 @@ def main():
                 num_tokens=cfg.get("num_tokens", 2048),
                 time_downsample=cfg.get("time_downsample", 1),
                 hidden=cfg.get("hidden", 1024),
-                ze_norm=cfg.get("ze_norm", "l2"),
+                ze_norm=cfg.get("ze_norm", "none"),
             )
         else:
             print(f"SKIP {tag}: {path} missing")
