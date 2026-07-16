@@ -1,11 +1,13 @@
 # Training configuration for the lvl1_vqgan music tokenizer.
 #
-# FINE-TUNE GAN-UNCONSTRAINED (2026-07-07): 60-min fine-tune from the 10h
-# best-mrstft checkpoint (2ef38bc, mrstft 1.6704 / cdpam 0.1539 — ear: hints of
-# melody, best of current ckpts). Experiment: remove the adaptive adversarial
-# weight clamp (d_weight_cap 1.0 -> 1e4, the code default = effectively
-# unconstrained grad-norm ratio). GAN on from step 0 (fresh trainer step
-# counter). Checkpoints go to saved_ft_gan/ so saved_10h_mrstft/ stays intact.
+# BASELINE (2026-07-16): nonorm-lineage reset. Current best model =
+# saved_12h_nonorm/ (composite 2.022 / cdpam 0.1007 / mrstft 1.234 / chroma
+# 0.0163, 15h lineage, ear-confirmed). Produced by: 3h from scratch with the
+# fixed codebook gradient (84e7cb5) + ze_norm none, then 12h continuation
+# (config_cont12h_nonorm.yaml). This file = the from-scratch recipe of that
+# lineage; continuations should warm-start saved_12h_nonorm and follow the
+# one-cycle continuation convention (peak ~1e-4, div 50, pct 0.05).
+
 
 model:
   hidden: 1024          # temporal conv channel width (Res1DBlocks)
@@ -13,20 +15,23 @@ model:
   num_rq: 3             # residual quantization depth (codes per latent frame)
   num_tokens: 2048      # codebook entries per RQ level
   time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+  ze_norm: none         # unconstrained z_e (default; l2/grms lost the norm race)
 
 vq:
   commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
 
 gan:
-  gan_start_step: 0     # fine-tune: GAN on immediately (step counter resets on weight-load)
-  d_weight_cap: 1.0e+4  # UNCONSTRAINED adaptive adversarial weight (experiment; sign required or PyYAML reads a string)
+  gan_start_step: 100000000 # GAN OFF
+  d_weight_cap: 1.0     # upper clamp on the adaptive adversarial weight
   disc_width: 1         # discriminator channel multiplier
 
 train:
   devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
-  minutes: 60           # wall-clock training budget (fine-tune step)
-  lr: 1.0e-4            # one-cycle peak learning rate (fine-tune: below from-scratch peak)
-  lr_pct_start: 0.15    # one-cycle warmup fraction
+  minutes: 180          # from-scratch leg of the baseline lineage
+  lr: 1.4142e-4         # one-cycle peak (from-scratch recipe)
+  lr_pct_start: 0.1     # one-cycle warmup fraction
+  lr_div_factor: 25     # initial lr = peak / 25
+  batch_size: 24        # 2x the legacy default; fits in 24GB with headroom
   single_song: null     # substring filter for single-song overfit; null = full dataset
-  save_path: saved_ft_gan/  # keep saved_10h_mrstft/ untouched
-  checkpoint: saved_10h_mrstft/lvl1_vqgan_last.ckpt  # weights from the 10h fidelity run
+  save_path: saved/
+  checkpoint: null      # FROM SCRATCH
