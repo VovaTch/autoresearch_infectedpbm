@@ -53,6 +53,10 @@ CKPTS = {
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
         ze_norm="grms",
     ),
+    "nonorm12h": dict(
+        path="saved_12h_nonorm/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+    ),
 }
 # tracks to render (substrings of slice filenames); one set of clips per track
 TRACKS = ["deeply_disturbed", "Cookie_From_Space"]
