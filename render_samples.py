@@ -38,6 +38,12 @@ CKPTS = {
         path="saved_12h_nonorm/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
     ),
+    # 2026-07-17: +12h continuation of nonorm12h (config_cont24h_nonorm.yaml).
+    # All-time best every metric: 1.9146/0.0967/1.1437/0.0139.
+    "nonorm24h": dict(
+        path="saved_24h_nonorm/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+    ),
 }
 # tracks to render (substrings of slice filenames); one set of clips per track
 TRACKS = ["deeply_disturbed", "Cookie_From_Space"]
