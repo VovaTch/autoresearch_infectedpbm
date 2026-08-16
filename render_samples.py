@@ -44,6 +44,27 @@ CKPTS = {
         path="saved_24h_nonorm/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
     ),
+    # 2026-08-07: +48h continuation of nonorm24h (config_cont48h_resume.yaml,
+    # relaunched after the 2026-08-05 power loss). Composite 1.8227 / mrstft
+    # 1.0678 / chroma 0.0115 all beat nonorm24h; cdpam 0.0998 slightly worse.
+    "nonorm48h": dict(
+        path="saved_48h_nonorm_resume/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+    ),
+    # 2026-08-10: +48h continuation of nonorm48h at 1/5 the peak LR (2e-5,
+    # config_cont48h_lowlr.yaml). Test metrics essentially flat vs nonorm48h:
+    # 1.8210/0.1015/1.0653/0.0115.
+    "lowlr48h": dict(
+        path="saved_48h_lowlr/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+    ),
+    # 2026-08-14: +48h GAN leg from lowlr48h (config_cont48h_gan.yaml, cap 30).
+    # cdpam IMPROVED 0.1015 -> 0.0993 while composite/mrstft/chroma regressed
+    # (1.9268/1.1719/0.0143) -- the ear decides this one, not the metrics.
+    "gan48h": dict(
+        path="saved_48h_gan/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+    ),
 }
 # tracks to render (substrings of slice filenames); one set of clips per track
 TRACKS = ["deeply_disturbed", "Cookie_From_Space"]
@@ -144,7 +165,7 @@ def main():
         b = rs(rec.float()) * 32768.0
         return float(evaluator.forward(a, b).mean().item())
 
-    clips = pick_clips(3)
+    clips = pick_clips(int(os.environ.get("N_CLIPS", "3")))
     print(f"Picked {len(clips)} clips.\n")
 
     modules = {}

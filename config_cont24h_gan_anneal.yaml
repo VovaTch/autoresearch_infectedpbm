@@ -1,0 +1,81 @@
+# Training configuration for the lvl1_vqgan music tokenizer.
+#
+# 24H GAN ANNEAL (2026-08-15): repair pass on the GAN leg. Parent is
+# saved_48h_gan/lvl1_vqgan_last.ckpt (composite 1.9268 / cdpam 0.0993 /
+# mrstft 1.1719 / chroma 0.0143).
+#
+# WHAT THE GAN LEG ACTUALLY DID (measured over 12 peak-normalized render
+# clips, render_gan48h.log + spectral analysis):
+#   model       RMS     crest dB   <500Hz   0.5-5k   >5kHz   centroid
+#   ORIG        0.2673    11.88    0.7549   0.2312   0.01391    0.6
+#   lowlr48h    0.2052    14.16    0.7869   0.2016   0.01146    0.5
+#   gan48h      0.1748    15.45    0.7559   0.2308   0.01333    0.6
+# WIN (keep): the GAN fixed a spectral tilt that 134h of recon-loss training
+# never touched -- mid and HF energy and centroid all snap back to the
+# original. Neither mrstft nor cdpam can see this, which is why both regressed.
+# DAMAGE (repair): crest factor expanded 14.16 -> 15.45 dB. Sparse loud
+# transient artifacts hit full scale; peak-normalization then drags the body
+# down, costing ~1.5 dB RMS vs lowlr48h. User's ear: "filtered a lot of the
+# noise, but added a few distortions and the volume seems a bit lower" -- the
+# distortions and the loudness drop are the same phenomenon.
+#
+# THE FIX, in order of leverage:
+# 1. d_weight_cap 30 -> 10. d_weight ended the GAN leg at ~18.6, i.e. BELOW the
+#    cap of 30, so the cap had stopped binding and adversarial pressure ran
+#    unchecked as the raw ||grad_rec||/||grad_gan|| ratio collapsed 375 -> 18.6
+#    over the run. Cap 10 binds from step 0 and limits the pressure that made
+#    the transients.
+# 2. lr peak 1e-4 -> 2e-5. At low LR the heavily weighted recon terms (cdpam
+#    25, mrstft 5, chroma 10) dominate each update and sand the peaks down
+#    while the disc holds the spectral texture. NOTE this is not a repeat of
+#    the flat 2e-5 leg (config_cont48h_lowlr.yaml): that ran on a saturated
+#    recon-only objective. With a live adversarial term the objective is not
+#    saturated and annealing is the goal, not exploration.
+# 3. gan_start_step 0 / disc_warmup 0. The disc is already trained and DOES
+#    carry over -- the loader is load_state_dict(strict=False) and this
+#    checkpoint holds 200 trained discriminator.* keys (mean weight norm 1.278
+#    vs 1.205 at init). The "discriminator left at init" line printed at
+#    startup is a hardcoded string (train.py:2480), not a report; it was only
+#    accurate for earlier legs whose parents had never trained a disc. Adam
+#    moments for the disc do not carry, which is minor.
+#
+# 24h not 48h: this is a repair pass, and the previous leg bought its damage in
+# the first third. Faster read.
+#
+# SUCCESS CRITERIA (measurable without the ear, rerun the spectral analysis on
+# fresh renders): crest dB back toward ~14 WHILE >5kHz stays near 0.0133 and
+# centroid stays 0.6. FAILURE MODE TO WATCH: if crest drops and HF also
+# collapses back to ~0.0114, the recon terms have simply undone the GAN and the
+# cap is too low -- the next move then is a transient/crest penalty term, not
+# more LR tuning.
+#
+# Lineage after this run: ~206h.
+
+
+model:
+  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  token_dim: 1024       # VQ latent / codebook token dimension
+  num_rq: 3             # residual quantization depth (codes per latent frame)
+  num_tokens: 2048      # codebook entries per RQ level
+  time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+  ze_norm: none         # unconstrained z_e (baseline default)
+
+vq:
+  commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
+
+gan:
+  gan_start_step: 0     # disc is already trained; no lead-in needed
+  disc_warmup: 0        # adversarial pressure live from step 0
+  d_weight_cap: 10.0    # binds from step 0 (GAN leg ended unclamped at 18.6)
+  disc_width: 1         # discriminator channel multiplier
+
+train:
+  devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
+  minutes: 1440         # 24h repair pass (true wall clock)
+  lr: 2.0e-5            # one-cycle peak; anneal, not exploration
+  lr_pct_start: 0.05    # short warmup, weights already trained
+  lr_div_factor: 50     # initial lr = peak / 50 = 4e-7
+  batch_size: 24        # keep baseline batch
+  single_song: null     # substring filter for single-song overfit; null = full dataset
+  save_path: saved_24h_gan_anneal/
+  checkpoint: saved_48h_gan/lvl1_vqgan_last.ckpt

@@ -2332,6 +2332,7 @@ def build_module(
     time_downsample: int = 1,
     disc_width: int = 1,
     d_weight_cap: float = 1.0,
+    disc_warmup: int = 0,
     hidden: int = 1024,
     ze_norm: str = "none",
 ) -> VqganMusicLightningModule:
@@ -2365,7 +2366,7 @@ def build_module(
         discriminator_loss=discriminator_loss,
         generator_loss=generator_loss,
         generator_start_step=gss,
-        disc_warmup=0,
+        disc_warmup=disc_warmup,
         d_weight_cap=d_weight_cap,
         loss_aggregator=loss_aggregator,
         optimizer_cfg=optimizer_cfg,
@@ -2449,6 +2450,7 @@ def main() -> None:
         time_downsample=m["time_downsample"],
         disc_width=gan["disc_width"],
         d_weight_cap=gan["d_weight_cap"],
+        disc_warmup=gan.get("disc_warmup", 0),
         hidden=m["hidden"],
         # DEFAULT none since 2026-07-15: from-scratch race (fixed codebook,
         # seed-paired 3h) ranked none > grms > l2 on every metric + ear check.
