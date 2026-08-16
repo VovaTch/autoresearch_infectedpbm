@@ -65,6 +65,14 @@ CKPTS = {
         path="saved_48h_gan/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
     ),
+    # 2026-08-16: 24h GAN anneal from gan48h (config_cont24h_gan_anneal.yaml,
+    # cap 30->10, peak 2e-5). Repair pass for the transient artifacts; the
+    # verdict is crest factor + HF retention, not the aggregate metrics
+    # (1.9054/0.1023/1.1494/0.0137).
+    "ganAnneal": dict(
+        path="saved_24h_gan_anneal/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+    ),
 }
 # tracks to render (substrings of slice filenames); one set of clips per track
 TRACKS = ["deeply_disturbed", "Cookie_From_Space"]
