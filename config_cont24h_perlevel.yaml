@@ -1,0 +1,74 @@
+# Training configuration for the lvl1_vqgan music tokenizer.
+#
+# 24H PER-LEVEL CODEBOOKS (2026-08-18): first run of the new quantizer layout.
+# Parent is saved_48h_gan_anneal2/lvl1_vqgan_last.ckpt (1.8800 / 0.1034 /
+# 1.1236 / 0.0140).
+#
+# WHAT CHANGES: until now RQCodeBook shared ONE (2048, 1024) table across all
+# three residual levels -- every RQ step called the same VQCodeBook. Standard
+# RVQ (SoundStream/EnCodec/DAC) gives each level its own codebook, because RQ
+# residual magnitude shrinks sharply level to level: level 0 quantizes z_e
+# (rms ~1.6), level 1 what level 0 missed, level 2 what remains. One fixed set
+# of 2048 vectors has to span all three regimes, so it self-partitions by
+# magnitude and no level gets the full 2048. Nominal rate is
+# 3 x log2(2048) = 33 bits/frame at 172.3 Hz = 5.68 kbps, but that only holds
+# if each level uses its table near-uniformly.
+#
+# per_level_codebooks: true makes code_embedding (num_rq, num_tokens,
+# token_dim) with per-level usage tracking and per-level random_restart.
+# Codebook size is UNCHANGED (2048 per level) and so is the bitrate -- this
+# buys nothing in rate, it only makes the existing 33 bits/frame real.
+# Parameter cost is ~25 MB against a 145M model.
+#
+# WARM START: the loader replicates the trained shared (2048, 1024) table onto
+# all three levels, so the ~254h lineage carries forward rather than
+# restarting. The three levels start identical but diverge immediately since
+# each sees a different residual. Verified before launch: expansion loads with
+# 0 missing / 0 unexpected keys and every level matches the source table.
+#
+# GAN OFF and peak LR back to 1e-4: this run is about the quantizer, so the
+# adversarial term is out of the way and the LR is the standard continuation
+# value rather than the anneal's 2e-5. That makes the comparison against the
+# GAN-off legs (lowlr48h 1.8210/0.1015/1.0653/0.0115) the meaningful one, not
+# against the anneal lineage it warm-starts from.
+#
+# WATCH: "number of dead codes" now sums over 3 x 2048 = 6144 entries instead
+# of 2048, so its scale changes -- do not compare the raw count against
+# earlier runs. Each codebook also gets ~1/3 the gradient traffic it used to,
+# so expect slower codebook convergence and more dead codes in the first
+# hours; random_restart runs per level and should absorb it. If dead codes
+# keep climbing past a few hundred per level after ~6h, the per-level tables
+# are starving and the fallback is per-level residual normalization against a
+# shared table instead.
+#
+# Lineage after this run: ~278h.
+
+
+model:
+  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  token_dim: 1024       # VQ latent / codebook token dimension
+  num_rq: 3             # residual quantization depth (codes per latent frame)
+  num_tokens: 2048      # codebook entries PER LEVEL (unchanged size)
+  time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+  ze_norm: none         # unconstrained z_e (baseline default)
+  per_level_codebooks: true  # each RQ level owns its own codebook
+
+vq:
+  commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
+
+gan:
+  gan_start_step: 100000000 # GAN OFF
+  disc_warmup: 0        # unused with the GAN off
+  d_weight_cap: 1.0     # unused with the GAN off
+  disc_width: 1         # discriminator channel multiplier
+
+train:
+  devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
+  minutes: 1440         # 24h leg (true wall clock)
+  lr: 1.0e-4            # one-cycle peak (continuation convention)
+  lr_pct_start: 0.05    # short warmup, weights already trained
+  lr_div_factor: 50     # initial lr = peak / 50 = 2e-6
+  batch_size: 24        # keep baseline batch
+  single_song: null     # substring filter for single-song overfit; null = full dataset
+  save_path: saved_24h_perlevel/
+  checkpoint: saved_48h_gan_anneal2/lvl1_vqgan_last.ckpt

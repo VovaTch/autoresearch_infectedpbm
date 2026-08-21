@@ -73,6 +73,20 @@ CKPTS = {
         path="saved_24h_gan_anneal/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
     ),
+    # 2026-08-18: 48h second anneal from ganAnneal (config_cont48h_gan_anneal2.yaml,
+    # cap 10->5). 1.8800/0.1034/1.1236/0.0140.
+    "ganAnneal2": dict(
+        path="saved_48h_gan_anneal2/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+    ),
+    # 2026-08-19: 24h per-level codebooks from ganAnneal2
+    # (config_cont24h_perlevel.yaml). Each RQ level owns a 2048-entry table;
+    # same bitrate, GAN off, peak 1e-4.
+    "perlevel24h": dict(
+        path="saved_24h_perlevel/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        per_level_codebooks=True,
+    ),
 }
 # tracks to render (substrings of slice filenames); one set of clips per track
 TRACKS = ["deeply_disturbed", "Cookie_From_Space"]
@@ -106,11 +120,12 @@ def _apply_ema(module, ckpt) -> bool:
     return False
 
 
-def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 1024, num_rq: int = 3, num_tokens: int = 2048, time_downsample: int = 1, hidden: int = 1024, ze_norm: str = "none"):
+def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 1024, num_rq: int = 3, num_tokens: int = 2048, time_downsample: int = 1, hidden: int = 1024, ze_norm: str = "none", per_level_codebooks: bool = False):
     module = build_module(
         lp, la, oc, sc,
         token_dim=token_dim, num_rq_steps=num_rq, num_tokens=num_tokens,
         time_downsample=time_downsample, hidden=hidden, ze_norm=ze_norm,
+        per_level_codebooks=per_level_codebooks,
     )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
@@ -189,6 +204,7 @@ def main():
                 time_downsample=cfg.get("time_downsample", 1),
                 hidden=cfg.get("hidden", 1024),
                 ze_norm=cfg.get("ze_norm", "none"),
+                per_level_codebooks=cfg.get("per_level_codebooks", False),
             )
         else:
             print(f"SKIP {tag}: {path} missing")

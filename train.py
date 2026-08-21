@@ -863,22 +863,80 @@ class VQCodeBook(CodeBook):
 
 
 class RQCodeBook(VQCodeBook):
+    """Residual quantizer over a shared or per-level codebook.
+
+    With per_level=False every RQ step selects from one (num_tokens, token_dim)
+    table. With per_level=True the parameter becomes
+    (num_rq_steps, num_tokens, token_dim) so each residual level owns codes at
+    its own magnitude scale, as in standard RVQ (SoundStream/EnCodec/DAC).
+
+    Args:
+      token_dim (int): code dimension.
+      num_rq_steps (int): residual quantization depth.
+      num_tokens (int): codebook entries per level.
+      usage_threshold (float): usage below which a code counts as dead.
+      per_level (bool): give each RQ level its own codebook.
+    """
+
     def __init__(
         self,
         token_dim: int,
         num_rq_steps: int,
         num_tokens: int = 512,
         usage_threshold: float = 1e-9,
+        per_level: bool = False,
     ) -> None:
         super().__init__(token_dim, num_tokens, usage_threshold)
         self._num_rq_steps = num_rq_steps
+        self._per_level = per_level
+        if per_level:
+            self.code_embedding = nn.Parameter(
+                torch.randn(num_rq_steps, num_tokens, token_dim) / token_dim**0.5
+            )
+            self.usage = torch.ones(num_rq_steps, num_tokens)
+
+    def level_embedding(self, level: int) -> torch.Tensor:
+        """Codebook serving one RQ level.
+
+        Args:
+          level (int): RQ level index.
+
+        Returns:
+          torch.Tensor: (num_tokens, token_dim) codes.
+        """
+        return self.code_embedding[level] if self._per_level else self.code_embedding
+
+    def _usage_row(self, level: int) -> torch.Tensor:
+        return self.usage[level] if self._per_level else self.usage  # type: ignore
+
+    def _quantize_level(
+        self, x_in: torch.Tensor, level: int, code_sg: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select codes for one RQ level and age that level's usage counts.
+
+        Args:
+          x_in (torch.Tensor): (B, C, T) residual to quantize.
+          level (int): RQ level index.
+          code_sg (bool): detach the codebook (straight-through selection).
+
+        Returns:
+          tuple: (B, 1, C, T) selected codes and (B, T, 1) indices.
+        """
+        weights = self.level_embedding(level).transpose(0, 1).contiguous()
+        z_q, indices = vq_code_book_select(
+            x_in, weights.detach() if code_sg else weights
+        )  # type: ignore
+        row = self._usage_row(level)
+        row[indices.flatten()] = row[indices.flatten()] + 1
+        row /= 2
+        return z_q.unsqueeze(1), indices
 
     def apply_codebook(self, x_in: torch.Tensor, code_sg: bool = False):
         x_res = x_in.clone()
         z_q_aggregated = []
         indices = []
-        for _ in range(self._num_rq_steps):
-            z_q_ind, indices_ind = super().apply_codebook(x_res, code_sg)
+        for level in range(self._num_rq_steps):
+            z_q_ind, indices_ind = self._quantize_level(x_res, level, code_sg)
             x_res = x_res - z_q_ind.squeeze(1)
             z_q_aggregated.append(
                 z_q_ind if len(z_q_aggregated) == 0 else z_q_aggregated[-1] + z_q_ind
@@ -890,11 +948,11 @@ class RQCodeBook(VQCodeBook):
         emb = torch.zeros(
             indices.size(0),
             indices.size(1),
-            self.code_embedding.size(1),
+            self.code_embedding.size(-1),
             device=indices.device,
         )
-        for idx in range(self._num_rq_steps):
-            emb = emb + self.code_embedding[indices[..., idx]]
+        for level in range(self._num_rq_steps):
+            emb = emb + self.level_embedding(level)[indices[..., level]]
         return emb
 
     def embed_cumulative(self, indices: torch.Tensor) -> torch.Tensor:
@@ -902,17 +960,52 @@ class RQCodeBook(VQCodeBook):
         # (B, R, C, T) cumulative RQ sums — the same values apply_codebook would
         # reselect for the same input, without a second cdist pass. Gradient to
         # code_embedding flows through the native gather backward.
-        codes = self.code_embedding[indices]  # (B, T, R, C)
+        if self._per_level:
+            codes = torch.stack(
+                [
+                    self.level_embedding(level)[indices[..., level]]
+                    for level in range(self._num_rq_steps)
+                ],
+                dim=2,
+            )  # (B, T, R, C)
+        else:
+            codes = self.code_embedding[indices]  # (B, T, R, C)
         return codes.cumsum(dim=2).permute(0, 2, 3, 1)
+
+    def random_restart(self) -> float:
+        if not self._per_level:
+            return super().random_restart()
+        total = 0.0
+        for level in range(self._num_rq_steps):
+            usage = self._usage_row(level)
+            dead_codes = torch.nonzero(usage < self.usage_threshold).squeeze(1)
+            alive_codes = torch.nonzero(usage >= self.usage_threshold).squeeze(1)
+            if len(dead_codes) > 0 and len(alive_codes) > 0:
+                src = alive_codes[torch.randint(len(alive_codes), (len(dead_codes),))]
+                with torch.no_grad():
+                    codes = self.code_embedding.data[level]
+                    jitter = 0.1 * codes[src].std()
+                    codes[dead_codes] = codes[src] + jitter * torch.randn_like(
+                        codes[src]
+                    )
+            total += dead_codes.shape[0]
+        return total
 
 
 class VQ1D(nn.Module):
     def __init__(
-        self, token_dim: int, num_tokens: int = 8192, num_rq_steps: int = 1
+        self,
+        token_dim: int,
+        num_tokens: int = 8192,
+        num_rq_steps: int = 1,
+        per_level_codebooks: bool = False,
     ) -> None:
         super().__init__()
         self.vq_codebook = RQCodeBook(
-            token_dim, num_rq_steps=num_rq_steps, num_tokens=num_tokens
+            token_dim,
+            num_rq_steps=num_rq_steps,
+            num_tokens=num_tokens,
+            per_level=per_level_codebooks,
         )
 
     def forward(
@@ -2212,9 +2305,17 @@ def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
 
 
 def build_vq_module(
-    token_dim: int = 512, num_rq_steps: int = 3, num_tokens: int = 2048
+    token_dim: int = 512,
+    num_rq_steps: int = 3,
+    num_tokens: int = 2048,
+    per_level_codebooks: bool = False,
 ) -> VQ1D:
-    return VQ1D(token_dim=token_dim, num_tokens=num_tokens, num_rq_steps=num_rq_steps)
+    return VQ1D(
+        token_dim=token_dim,
+        num_tokens=num_tokens,
+        num_rq_steps=num_rq_steps,
+        per_level_codebooks=per_level_codebooks,
+    )
 
 
 def build_generator(
@@ -2225,6 +2326,7 @@ def build_generator(
     time_downsample: int = 1,
     hidden: int = 1024,
     ze_norm: str = "none",
+    per_level_codebooks: bool = False,
 ) -> MultiLvlVQVariationalAutoEncoder:
     # temporal STFT arch: 32768-sample slice, hop 256 -> 128 STFT frames ->
     # T_lat = 128 / time_downsample. Encoder pins z_e scale (ze_norm); decoder
@@ -2242,7 +2344,9 @@ def build_generator(
         input_channels=1,
         encoder=encoder,
         decoder=decoder,
-        vq_module=build_vq_module(token_dim, num_rq_steps, num_tokens),
+        vq_module=build_vq_module(
+            token_dim, num_rq_steps, num_tokens, per_level_codebooks
+        ),
         loss_aggregator=loss_aggregator,
     )
 
@@ -2335,6 +2439,7 @@ def build_module(
     disc_warmup: int = 0,
     hidden: int = 1024,
     ze_norm: str = "none",
+    per_level_codebooks: bool = False,
 ) -> VqganMusicLightningModule:
     generator = build_generator(
         loss_aggregator,
@@ -2344,6 +2449,7 @@ def build_module(
         time_downsample=time_downsample,
         hidden=hidden,
         ze_norm=ze_norm,
+        per_level_codebooks=per_level_codebooks,
     )
     discriminator = build_discriminator(disc_width=disc_width)
 
@@ -2452,6 +2558,7 @@ def main() -> None:
         d_weight_cap=gan["d_weight_cap"],
         disc_warmup=gan.get("disc_warmup", 0),
         hidden=m["hidden"],
+        per_level_codebooks=m.get("per_level_codebooks", False),
         # DEFAULT none since 2026-07-15: from-scratch race (fixed codebook,
         # seed-paired 3h) ranked none > grms > l2 on every metric + ear check.
         ze_norm=m.get("ze_norm", "none"),
@@ -2472,6 +2579,24 @@ def main() -> None:
         print(f"Loading model weights from {checkpoint}...")
         ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
         state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+        # per-level codebooks warm-start from a shared-codebook checkpoint by
+        # replicating the (num_tokens, token_dim) table onto every RQ level.
+        cb_key = "model.vq_module.vq_codebook.code_embedding"
+        target = module.state_dict().get(cb_key)
+        if (
+            cb_key in state_dict
+            and target is not None
+            and state_dict[cb_key].dim() == 2
+            and target.dim() == 3
+        ):
+            state_dict = dict(state_dict)
+            state_dict[cb_key] = (
+                state_dict[cb_key].unsqueeze(0).repeat(target.shape[0], 1, 1)
+            )
+            print(
+                f"  shared codebook replicated to per-level "
+                f"{tuple(state_dict[cb_key].shape)}"
+            )
         # strict=False so the generator can resume into a fresh discriminator.
         result = module.load_state_dict(state_dict, strict=False)
         miss = [k for k in result.missing_keys if not k.startswith("discriminator")]
