@@ -342,7 +342,9 @@ class EMA(L.Callback):
 
 
 def get_trainer(
-    learning_parameters: LearningParameters, minutes: int = 9 * 60
+    learning_parameters: LearningParameters,
+    minutes: int = 9 * 60,
+    precision: str | int | None = None,
 ) -> L.Trainer:
     if not torch.cuda.is_available():
         warnings.warn("CUDA is not available, using CPU")
@@ -384,7 +386,10 @@ def get_trainer(
         patience=int(learning_parameters.epochs),
     )
 
-    precision = 16 if learning_parameters.amp else 32
+    # Lightning precision: config `train.precision` wins (e.g. "bf16-mixed");
+    # otherwise fall back to the legacy amp bool (fp16 / fp32).
+    if precision is None:
+        precision = 16 if learning_parameters.amp else 32
     model_summary = ModelSummary(max_depth=2)
     timer = Timer(duration={"minutes": minutes})
 
@@ -551,8 +556,13 @@ class MelSpecLoss:
     differentiable: bool = True
 
     def _mel_spec_and_process(self, x: torch.Tensor) -> torch.Tensor:
+        # dtype pinned: a bf16-true Trainer flips torch's default dtype, which
+        # would make this weighting matrix bf16 against an fp32 mel.
         lin_vector = torch.linspace(
-            self.lin_start, self.lin_end, self.mel_spec_converter.mel_spec.n_mels
+            self.lin_start,
+            self.lin_end,
+            self.mel_spec_converter.mel_spec.n_mels,
+            dtype=torch.float32,
         )
         eye_mat = torch.diag(lin_vector).to(x.device)
         mel_out = self.mel_spec_converter.convert(x.flatten(start_dim=0, end_dim=1))
@@ -750,7 +760,13 @@ class WeightedSumAggregator:
 
 
 class VQCodeBookFunc(torch.autograd.Function):
+    # Autocast does not manage custom Functions: without custom_fwd the codebook
+    # (fp32 leaf) would meet bf16 activations in cdist, and backward would hand
+    # AccumulateGrad a bf16 grad for an fp32 param. cast_inputs=float32 runs the
+    # whole select in fp32 (which the body already forced) and custom_bwd casts
+    # the incoming grad back, so grad_emb matches the parameter dtype.
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
     def forward(ctx, x_in: torch.Tensor, embedding_weights: torch.Tensor):
         ctx.batch_size = x_in.shape[0]
         embedding_batch = embedding_weights.unsqueeze(0).repeat((x_in.shape[0], 1, 1))
@@ -761,11 +777,12 @@ class VQCodeBookFunc(torch.autograd.Function):
         indices = torch.argmin(distances, dim=2, keepdim=True)
         x_out = torch.index_select(embedding_batch_flat, dim=0, index=indices.flatten())
         x_out = x_out.contiguous().view((x_in.shape[0], x_in.shape[2], x_in.shape[1]))
-        x_out = x_out.transpose(1, 2).contiguous()
+        x_out = x_out.transpose(1, 2).contiguous().to(x_in.dtype)
         ctx.save_for_backward(embedding_weights, indices)
         return x_out, indices
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_outputs, indices):
         grad_input = None
         grad_emb = None
@@ -788,7 +805,7 @@ class VQCodeBookFunc(torch.autograd.Function):
                 dtype=grad_outputs.dtype,
             )
             grad_emb_t.index_add_(0, flat_idx, flat_grad)
-            grad_emb = grad_emb_t.t()
+            grad_emb = grad_emb_t.t().to(embedding_weights.dtype)
         return grad_input, grad_emb, None, None
 
 
@@ -1248,9 +1265,11 @@ class TemporalEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, 1, L) waveform
-        window = torch.hann_window(self._win_length).to(x.device)
+        window = torch.hann_window(
+            self._win_length, device=x.device, dtype=torch.float32
+        )
         spec = torch.stft(
-            x.flatten(start_dim=1),
+            x.float().flatten(start_dim=1),
             n_fft=self._n_fft,
             hop_length=self._hop_length,
             win_length=self._win_length,
@@ -1259,7 +1278,7 @@ class TemporalEncoder(nn.Module):
         )  # (B, n_fft/2+1, T+1)
         n_frames = x.shape[-1] // self._hop_length
         feats = torch.cat([spec.real, spec.imag], dim=1)[..., :n_frames]
-        h = self._proj_in(feats)
+        h = self._proj_in(feats.to(self._proj_in.weight.dtype))
         h = self._res1(h)
         h = self._down(h)
         h = self._res2(h)
@@ -1346,11 +1365,12 @@ class TemporalDecoder(DecoderBase):
         h = self._res1(h)
         h = self._up(h)
         h = self._res2(h)
-        spec = self._proj_spec(h)
+        spec = self._proj_spec(h).float()  # cuFFT has no bf16 -> ISTFT in fp32
         b = self._spec_bins
         complex_spec = torch.complex(spec[:, :b], spec[:, b:])
-        y = self._istft(complex_spec)  # (B, L)
-        return self._end_conv(y.unsqueeze(1))  # (B, 1, L)
+        y = self._istft(complex_spec).unsqueeze(1)  # (B, 1, L)
+        # fp32 output: the loss stack (mrstft/chroma/melspec) runs torch.stft on it.
+        return self._end_conv(y.to(self._end_conv[0].weight.dtype)).float()
 
 
 # ===========================================================================
@@ -1412,9 +1432,21 @@ class MultiLvlVQVariationalAutoEncoder(Tokenizer):
         return self.vq_module(z_e)["indices"]
 
     def from_tokens(self, indices: torch.Tensor) -> torch.Tensor:
+        """
+        Decode RQ token indices straight back to a waveform (generation entry point).
+
+        Args:
+          indices (torch.Tensor): (B, T, num_rq) int64 code indices, as returned
+            by tokenize().
+
+        Returns:
+          torch.Tensor: (B, 1, L) reconstructed waveform, L = T * hop_length.
+        """
+        # (B, T, C) -> (B, C, T): the decoder is Conv1d over channels. This is
+        # the same tensor decode() feeds it as v_q[:, -1] (verified bit-exact),
+        # since the RQ embed_codebook already sums over levels.
         z_q = self.vq_module.vq_codebook.embed_codebook(indices)
-        quantized_outputs = z_q.transpose(1, 2).contiguous()
-        return self.decoder(quantized_outputs.transpose(1, 2).contiguous())
+        return self.decoder(z_q.transpose(1, 2).contiguous())
 
     def decode(self, z_e: torch.Tensor, origin_shape=None):
         vq_block_output = self.vq_module(z_e, extract_losses=True)
@@ -1487,9 +1519,9 @@ class MelSpecDiscriminator(DiscriminatorBase):
         self._mel_spec_converter = mel_spec_converter
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        x = self._mel_spec_converter.convert(x)
+        x = self._mel_spec_converter.convert(x.float())  # mel = torch.stft -> fp32
         x = self._post_mel_fn(x)
-        x = self.model(x)
+        x = self.model(x.to(next(self.model.parameters()).dtype))
         x = x.permute((0, 2, 3, 1)).flatten(start_dim=1, end_dim=2).contiguous()
         return {"logits": x}
 
@@ -1551,7 +1583,7 @@ class WaveformDiscriminator(DiscriminatorBase):
         )
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        x = self._init_conv(x)
+        x = self._init_conv(x.to(self._last_conv.weight.dtype))
         for conv, dim_change in zip(self._conv_list, self._dim_change_list):
             x = conv(x)
             x = dim_change(x)
@@ -2541,7 +2573,9 @@ def main() -> None:
             raise ValueError(f"No tracks matched single_song '{single_song}'")
 
     print("Initializing trainer...")
-    trainer = get_trainer(learning_params, minutes=tr["minutes"])
+    trainer = get_trainer(
+        learning_params, minutes=tr["minutes"], precision=tr.get("precision")
+    )
 
     print("Initializing module...")
     module = build_module(

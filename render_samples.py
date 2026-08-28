@@ -27,6 +27,11 @@ SLICES_PER_CLIP = 14  # ~10.4s clips (14 * 32768 / 44100); sequential slices sti
 CACHE = os.path.expanduser("~/.cache/infected_pbm/slices")
 OUT = os.path.join(os.path.dirname(__file__), "renders")
 
+# 2026-08-28 cleanup: checkpoints were deleted for every lineage leg EXCEPT
+# batch64, gancap10 and cont9h -- those three tags are the only ones that still
+# render. The other entries are kept as the lineage record (and their
+# tensorboard metrics survive under <dir>/lvl1_vqgan/); rendering them now
+# raises FileNotFoundError.
 CKPTS = {
     # tag -> checkpoint to render. cfg fields must match config.yaml's model block
     # (token_dim/hidden/num_rq/num_tokens/time_downsample/ze_norm). Paths point
@@ -87,7 +92,70 @@ CKPTS = {
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
         per_level_codebooks=True,
     ),
+    # 2026-08-21: +24h per-level leg 2 (config_20260821_perlevel.yaml), single
+    # variable = more wall clock. NEW ALL-TIME BEST 1.7691 / 0.1005 / 1.0245 /
+    # 0.0107; align/commit 0.994 and dead codes 183/6144, both still falling.
+    "perlevel48h": dict(
+        path="saved_20260821_perlevel/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        per_level_codebooks=True,
+    ),
+    # 2026-08-23: +24h per-level leg 3, batch 24 -> 64 (config_20260822_batch64.yaml).
+    # Composite/mrstft/chroma/phase all all-time best (1.7572 / 1.0173 / 0.0099 /
+    # 0.6151) but cdpam regressed to 0.1051. FIRST leg where best != last:
+    # best-on-monitor froze at 03:10 = 12.6h of 24.
+    "batch64": dict(
+        path="saved_20260822_batch64/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        per_level_codebooks=True,
+    ),
+    "batch64best": dict(
+        path="saved_20260822_batch64/lvl1_vqgan_best.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        per_level_codebooks=True,
+    ),
+    # 2026-08-25: 48h GAN re-acquisition from batch64 last (config_20260823_gan.yaml,
+    # d_weight_cap 10, peak 1e-4, batch 48). First adversarial leg on the per-level
+    # quantizer. Judge on the spectral table (spectral_table.py), not composite.
+    "gancap10": dict(
+        path="saved_20260823_gan/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        per_level_codebooks=True,
+    ),
+    # 2026-08-26: 48h GAN drive reduction from gancap10 last, d_weight_cap 10 -> 5,
+    # single variable (config_20260826_gancap5.yaml). Take last.ckpt: on any
+    # adversarial leg best.ckpt is the epoch-0 save, because loss_monitor is
+    # validation/total loss and the GAN inflates the generator term by construction.
+    "gancap5": dict(
+        path="saved_20260826_gancap5/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        per_level_codebooks=True,
+    ),
+    # Same run, the min-total-loss save at epoch 48 (5.5h in). Unlike a cold
+    # adversarial start, this leg warm-started with the GAN already converged,
+    # so validation/total loss is NOT inflated from epoch 0 and best.ckpt lands
+    # on a real minimum. Epoch 48 is the only point in the run that beat the
+    # starting weights; last.ckpt (epoch 288) sits inside an align blowup.
+    "gancap5best": dict(
+        path="saved_20260826_gancap5/lvl1_vqgan_best.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        per_level_codebooks=True,
+    ),
+    # 2026-08-28: 9h continuation from gancap5best (config_20260827_cont9h.yaml),
+    # single variable = wall clock. Test composite 1.8496 / cdpam 0.1013 /
+    # mrstft 1.1022 / chroma 0.0126. last.ckpt is safe here: its epoch (80) is
+    # calm (align 1.430) AND is the run's cdpam argmin, i.e. still improving at
+    # the cutoff.
+    "cont9h": dict(
+        path="saved_20260827_cont9h/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        per_level_codebooks=True,
+    ),
 }
+# TAGS env var: comma-separated subset of CKPTS to render (default: all).
+_only = [t for t in os.environ.get("TAGS", "").split(",") if t]
+if _only:
+    CKPTS = {t: CKPTS[t] for t in _only}
 # tracks to render (substrings of slice filenames); one set of clips per track
 TRACKS = ["deeply_disturbed", "Cookie_From_Space"]
 
@@ -163,12 +231,47 @@ def pick_clips(n_clips: int = 3) -> list[tuple[str, torch.Tensor]]:
 
 @torch.no_grad()
 def reconstruct(module, clip: torch.Tensor) -> torch.Tensor:
-    """clip [1, L] -> recon [1, L]; process slice-by-slice as in training."""
-    L = clip.shape[1]
-    n = L // SLICE
-    batch = clip[:, : n * SLICE].reshape(n, 1, SLICE)  # [n,1,SLICE]
-    out = module.model(batch)["slice"]  # [n,1,SLICE]
-    return out.reshape(1, -1)
+    """clip [1, L] -> recon [1, L]; decoded in ONE pass, not slice-by-slice.
+
+    The old path reshaped to [n,1,SLICE], decoded each slice independently and
+    hard-concatenated, which put a step discontinuity every 0.743 s -- a 1.35 Hz
+    click train in every rendered clip (sample-to-sample jump at the seams was
+    5.11x the local mean, vs 1.08x for real audio). The model is fully
+    convolutional + ISTFT with no length assumption, so decoding the whole clip
+    at once removes it entirely (measured jump ratio -> 1.01). Training is
+    unaffected either way: it feeds independent slices and never saw a seam.
+    """
+    out = module.model(clip.reshape(1, 1, -1))["slice"].reshape(1, -1)
+    return out[:, : clip.shape[1]]
+
+
+def loudness_match(
+    variants: dict[str, torch.Tensor], ref: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """Scale each variant to the reference rms, then apply one shared headroom scale.
+
+    Peak-normalizing every file independently -- what this script used to do --
+    silently biases the comparison: a reconstruction with sparse peak overshoot
+    is divided by a larger number, so orig and recon end up at different levels.
+    cdpam is level-sensitive, and the effect is not small: on identical audio,
+    peak-normed scored 0.2153 against 0.0176 rms-matched. It penalizes exactly
+    the high-crest models (the GAN ones), which is why per-clip render A/Bs
+    disagreed with the aggregate test metrics for months. A quieter file also
+    loses a blind ear A/B for reasons unrelated to fidelity.
+
+    Args:
+      variants (dict[str, torch.Tensor]): named waveforms (1, L).
+      ref (torch.Tensor): reference waveform (1, L) whose rms is the target.
+
+    Returns:
+      dict[str, torch.Tensor]: rms-matched waveforms sharing one headroom scale.
+    """
+    target = ref.pow(2).mean().sqrt()
+    out = {
+        k: v * (target / (v.pow(2).mean().sqrt() + 1e-8)) for k, v in variants.items()
+    }
+    peak = max(float(v.abs().max()) for v in out.values())
+    return {k: v / (peak + 1e-8) for k, v in out.items()}
 
 
 def main():
@@ -212,15 +315,18 @@ def main():
     print(f"\n{'clip':<24}{'model':<16}{'cdpam':>10}{'mrstft':>10}")
     print("-" * 60)
     for i, (name, clip) in enumerate(clips):
-        clip = clip / (clip.abs().max() + 1e-8)  # peak normalize for fair listen
-        torchaudio.save(os.path.join(OUT, f"clip{i}_{name}_ORIG.wav"), clip, SR)
-        for tag, module in modules.items():
-            rec = reconstruct(module, clip)
-            rec = rec / (rec.abs().max() + 1e-8)
+        clip = clip / (clip.abs().max() + 1e-8)
+        group = {"ORIG": clip}
+        group.update({tag: reconstruct(m, clip) for tag, m in modules.items()})
+        group = loudness_match(group, clip)  # equal rms: see loudness_match
+        ref = group["ORIG"]
+        for tag, rec in group.items():
             torchaudio.save(os.path.join(OUT, f"clip{i}_{name}_{tag}.wav"), rec, SR)
-            L = min(clip.shape[1], rec.shape[1])
-            cd = cdpam_score(clip[:, :L], rec[:, :L])
-            mr = multi_res_stft_dist(clip[:, :L], rec[:, :L])
+            if tag == "ORIG":
+                continue
+            L = min(ref.shape[1], rec.shape[1])
+            cd = cdpam_score(ref[:, :L], rec[:, :L])
+            mr = multi_res_stft_dist(ref[:, :L], rec[:, :L])
             print(f"{('clip'+str(i)+' '+name)[:23]:<24}{tag:<16}{cd:>10.4f}{mr:>10.4f}")
     print(f"\nWavs in: {OUT}")
 

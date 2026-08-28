@@ -1,0 +1,132 @@
+# Training configuration for the lvl1_vqgan music tokenizer.
+#
+# 2026-08-23 GAN RE-ACQUISITION, 48h. Parent is
+# saved_20260822_batch64/lvl1_vqgan_last.ckpt. First adversarial leg since
+# 2026-08-18; the per-level quantizer has had 72h of recon-only training since.
+#
+# PARENT CHOICE: last.ckpt, BY USER DECISION, against the render evidence.
+# Recorded so this leg is interpretable later. Leg 3 was the first leg in this
+# lineage where best != last (best-on-monitor froze at 03:10 = 12.6h of 24),
+# and the 12-clip render A/B said the remaining 11.4h hurt perceptually:
+#   mean cdpam:  parent 0.1433 | last 0.1504 | best 0.1403
+#   per-clip:    best beats last on cdpam 10/12; last beats parent only 3/12
+# Meanwhile the aggregate test composite hit an all-time best (1.7572) right
+# through that window, i.e. composite tracked chroma+phase+mrstft AWAY from the
+# ear. The case FOR last.ckpt: it is the better model on every spectral term
+# (mrstft 1.0173, chroma 0.00988, phase 0.6151, align/commit 0.921), and this
+# leg's whole purpose is spectral -- restoring HF tilt. cdpam has also been the
+# least ear-aligned metric in this lineage (the GAN legs sounded BETTER while
+# scoring worse). CONSEQUENCE FOR ATTRIBUTION: this run starts ~0.007 cdpam
+# behind where best.ckpt would have put it, so do NOT read a cdpam regression
+# here as caused by the GAN without subtracting that head start.
+#
+# WHY d_weight_cap 10. d_weight is ADAPTIVE (norm(rec_grads)/norm(gen_grads),
+# then clamped), so the cap only bites while the raw ratio exceeds it. On
+# gan48h the raw ratio ran 375 -> 18.6, meaning cap 30 STOPPED BINDING partway
+# and that run was effectively unclamped. Anything >=30 here is "no cap".
+# Effective adversarial drive is roughly cap x LR:
+#   gan48h     cap 30, lr 1e-4 = 3.0e-3  tilt acquired, crest 14.16 -> 15.45 dB,
+#                                        RMS 0.2052 -> 0.1748 (the audible
+#                                        "distortions + quieter" the ear caught)
+#   ganAnneal  cap 10, lr 2e-5 = 2.0e-4  87% of the HF win held, crest 28% back
+#   ganAnneal2 cap  5, lr 2e-5 = 1.0e-4  HF held, crest 62% back
+#   THIS RUN   cap 10, lr 1e-4 = 1.0e-3  3x below the run that did the damage
+# Cap 5 was the ENDPOINT OF A REPAIR ARC applied to a generator that already
+# had the tilt; its job was maintenance. This generator has never had
+# adversarial pressure in its per-level form, so the job is ACQUISITION and
+# needs drive. Cap 10 is a tested point (ganAnneal) that retained 87% of the HF
+# win with far less crest damage than 30.
+#
+# WHY lr 1e-4. Lineage continuation convention, and the same peak gan48h used,
+# so d_weight_cap is the SINGLE VARIABLE against the only other acquisition run
+# on record. Note this is NOT rescaled for batch 64 (sqrt scaling would be
+# ~1.6e-4); that confound is inherited from leg 3 and left deliberately
+# untouched rather than changing two things at once.
+#
+# WHY disc_warmup 3000. The checkpoint carries 192 trained discriminator
+# tensors (verified) via the strict=False load, but they were last trained on
+# ganAnneal2's generator, which scored composite 1.88 against today's 1.757.
+# A 72h-stale disc hands the generator garbage gradients on contact. The disc
+# gets 3000 steps to re-calibrate before adversarial gradients reach the
+# generator at step 1000+3000. (The "discriminator left at init" line printed
+# at load is a HARDCODED STRING -- the trained weights do carry.)
+#
+# !!! POST-LAUNCH CORRECTION (2026-08-23 21:20) -- THE WARMUP DID NOT HAPPEN.
+# _current_step is an nn.Parameter stored IN THE CHECKPOINT and it accumulates
+# across the whole lineage: the parent carries _current_step = 1,898,462. The
+# gate is `self._current_step >= self._adv_start` with _adv_start =
+# gan_start_step + disc_warmup = 4000, so it was ALREADY OPEN at step 0 of this
+# run. Adversarial gradients reached the generator immediately. gan_start_step
+# and disc_warmup are DEAD KNOBS on any warm-started continuation -- which also
+# means gan48h's advertised "1000 + 2000" lead-in never happened either.
+# Mitigation in practice: the discriminator also trains from step 0 (same gate),
+# so it co-adapts rather than staying stale; disc loss moved 0.7798 -> 0.7262
+# over the first 226 steps, i.e. healthy and not collapsing. Left running.
+# TO ACTUALLY GET A WARMUP, _current_step must be reset on load.
+#
+# ALSO OBSERVED AT STEP 0: d_weight logged 10.0 (pinned) then 9.42, so the raw
+# adaptive ratio has fallen to ~9.4 from the 375 seen in the gan48h era -- the
+# recon model is now good enough that adversarial and recon gradients are
+# nearly balanced on their own. CAP 10 IS THEREFORE BARELY BINDING; this leg is
+# running at close to the unclamped adaptive weight, NOT at 1/3 of it as the
+# rationale above assumed. If a genuinely sub-balanced clamp is wanted, cap 5
+# is the value that would still bite.
+#
+# BATCH 48, NOT 64 -- FORCED BY AN OOM ON THE FIRST ATTEMPT (21:06 -> 21:38,
+# died in epoch 2, exit 134). rank1 could not allocate 32 MiB; rank0 then hung
+# in allreduce until the NCCL watchdog aborted. THE REAL CEILING IS ~21 GB, NOT
+# 24.5: GPU1 drives the display and holds ~2.5 GB before training starts, so the
+# binding constraint is always the tighter rank. That also retro-explains the
+# b=96 OOM in the batch sweep at a predicted 22.2 GB. GAN-active memory is
+# ~4.2 GB fixed + 0.286 GB/sample (the discriminator adds ~0.094 GB/sample on
+# top of the 0.192 recon law), so b=64 wanted ~22.5 GB and b=48 wants ~18.5 GB,
+# leaving ~2.5 GB clear. Launched with PYTORCH_CUDA_ALLOC_CONF=
+# expandable_segments:True to cut fragmentation. Batch 48 also restores ~12% of
+# the optimizer steps the GAN's 0.48 it/s had taken away.
+#
+# ORIGINAL BATCH-64 RATIONALE (kept for the record). It cost cdpam in leg 3, but a larger batch stabilizes the
+# discriminator, which is where stability is wanted in an adversarial leg.
+#
+# PRE-REGISTERED READ. The aggregate metrics WILL look worse -- every GAN leg
+# in this lineage has regressed composite/mrstft/chroma while moving the ear.
+# Judge this run on the spectral table, not on composite:
+#   PASS: >5kHz energy climbs from ~0.01143 toward the original's 0.01352 and
+#         centroid moves 0.5 -> 0.6, WHILE crest stays under ~14.7 dB (leg-3
+#         baseline is ~14.2; gan48h's failure was 15.45).
+#   FAIL: crest goes past ~15.0 dB, or disc loss collapses below ~0.5 (disc
+#         winning outright = generator gets no usable gradient).
+# CHECK AT 24h, do not wait for the buzzer: leg 3 peaked at 12.6h of 24, so
+# expect best != last again and plan to take best.
+#
+# Lineage after this run: ~374h.
+
+
+model:
+  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  token_dim: 1024       # VQ latent / codebook token dimension
+  num_rq: 3             # residual quantization depth (codes per latent frame)
+  num_tokens: 2048      # codebook entries PER LEVEL
+  time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+  ze_norm: none         # unconstrained z_e (baseline default)
+  per_level_codebooks: true  # each RQ level owns its own codebook
+
+vq:
+  commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
+
+gan:
+  gan_start_step: 1000  # adversarial term starts affecting the generator here
+  disc_warmup: 3000     # ...plus this many disc-only steps first (stale disc)
+  d_weight_cap: 10.0    # <-- THE VARIABLE (gan48h = 30, anneals = 10 then 5)
+  disc_width: 1         # discriminator channel multiplier
+
+train:
+  devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
+  minutes: 2880         # 48h leg (true wall clock)
+  lr: 1.0e-4            # one-cycle peak, unscaled (same as gan48h)
+  lr_pct_start: 0.05    # short warmup, weights already trained
+  lr_div_factor: 50     # initial lr = peak / 50 = 2e-6
+  batch_size: 48        # FORCED DOWN FROM 64 after the 2026-08-23 21:38 OOM
+  precision: 32         # fp32; bf16-mixed and bf16-true both rejected 2026-08-22
+  single_song: null     # substring filter for single-song overfit; null = full dataset
+  save_path: saved_20260823_gan/
+  checkpoint: saved_20260822_batch64/lvl1_vqgan_last.ckpt  # user decision; see header

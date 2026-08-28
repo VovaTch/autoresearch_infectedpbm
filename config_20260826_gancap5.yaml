@@ -1,0 +1,118 @@
+# Training configuration for the lvl1_vqgan music tokenizer.
+#
+# 2026-08-26 GAN DRIVE REDUCTION, 48h. Parent is
+# saved_20260823_gan/lvl1_vqgan_last.ckpt (the 48h cap-10 acquisition leg:
+# composite 1.8616 / cdpam 0.1007 / mrstft 1.1148 / chroma 0.0124).
+#
+# SINGLE VARIABLE vs the parent run: d_weight_cap 10 -> 5. Everything else is
+# byte-identical -- peak lr 1e-4, div 50, pct 0.05, batch 48, per-level, fp32,
+# 2 GPUs, GAN on.
+#
+# WHY CAP 5 AND NOT CAP 10 AGAIN. d_weight is adaptive
+# (norm(rec_grads)/norm(gen_grads), then clamped), so a cap only bites while
+# the raw ratio exceeds it. On the parent leg d_weight ran mean 7.39 / median
+# 7.54 and sat at the cap only 24.4% of steps -- so "cap 10" was very nearly
+# the unclamped adaptive weight, NOT the 1/3-drive setting its config header
+# assumed. Cap 5 is below the run's own median and is the value that actually
+# clamps. Effective drive cap x lr: gan48h 30 x 1e-4 = 3.0e-3 (the leg whose
+# damage the user heard), parent 10 x 1e-4 = 1.0e-3, THIS RUN 5 x 1e-4 = 5.0e-4.
+#
+# WHY THE GAN STAYS ON -- THIS IS THE LOAD-BEARING DECISION.
+# The obvious alternative (recon-only continuation, which would buy back the
+# parent's +0.104 composite regression) is REFUTED BY THIS LINEAGE'S OWN DATA.
+# config_cont24h_perlevel.yaml ran exactly that experiment: GAN off, 24h, from
+# saved_48h_gan_anneal2 (a GAN-trained checkpoint). The spectral tilt collapsed:
+#   >5kHz  0.01352  original
+#          0.01273  ganAnneal2 (GAN on) = 68% of the way to original
+#          0.01143  after 24h GAN-off   = 14% of the way
+#          0.01108  lowlr48h = the pure recon-only attractor
+# i.e. ~79% of the retained GAN win was destroyed in 24h, and 48h would finish
+# the job. The reconstruction losses ARE what produce the 0.0111 tilt, so any
+# GAN-off leg pulls back to it no matter where it starts. The user's ear
+# prefers the GAN reconstruction; preserving that means keeping adversarial
+# pressure on and lowering its DRIVE, not switching it off.
+#
+# PRECEDENT FOR THE SIZE OF THE WIN. ganAnneal (cap 30 -> 10, lr 2e-5, 24h)
+# recovered composite 1.9268 -> 1.9054 (-0.021), mrstft -> 1.1494, chroma ->
+# 0.0137, while retaining ~87% of the HF win. So expect a MODEST recovery,
+# order 0.02-0.05 composite over 48h, not the full 0.104. This is a
+# conservative run by design: the user's framing was "at worst I'll have
+# something that sounds roughly the same."
+#
+# WHAT THIS RUN IS *NOT* CHASING: crest. The parent leg was scored a FAIL on a
+# pre-registered crest line of 15.0 dB (it hit 15.33). That criterion is now
+# retired as invalid. A loudness-matched 12-clip A/B on 2026-08-25 showed the
+# crest difference is INAUDIBLE and metrically nil -- gan_full (crest 15.38),
+# gan_lim (13.12) and gan_limsrc (12.29) scored cdpam 0.0282 / 0.0282 / 0.0283
+# and mrstft 0.2000 / 0.2000 / 0.2000, and the user could not tell them apart.
+# The audible "distortion spikes + low volume" were TWO RENDER BUGS, not model
+# defects: hard slice concatenation in render_samples.reconstruct (a 1.35 Hz
+# click train, boundary jump 5.11x vs 1.08x for real audio) and independent
+# per-file peak normalization (which inflated render cdpam 12x on high-crest
+# models: 0.2153 peak-normed vs 0.0176 rms-matched on identical audio). Both
+# are fixed in render_fixed.py; the peak-norm fix is ported into
+# render_samples.py for this run's A/B.
+#
+# GAN KNOBS ARE DEAD ON A WARM START. gan_start_step + disc_warmup gate on
+# _current_step, an nn.Parameter carried IN the checkpoint that accumulates
+# across the lineage (parent carries ~2.03M). The gate is already open at step
+# 0, so adversarial gradients reach the generator immediately and the values
+# below are inert. Left at the parent's values so the diff stays single-
+# variable. The discriminator's trained weights DO carry (strict=False load);
+# the "discriminator left at init" print is a hardcoded string.
+#
+# NOTE ON best.ckpt: loss_monitor is "validation/total loss", which contains
+# the generator term the GAN inflates by construction, so on every adversarial
+# leg the minimum IS the epoch-0 value and best.ckpt is effectively the parent
+# (the parent leg's was written 7 minutes into 48 hours). TAKE last.ckpt.
+# Left unchanged here so this run stays a clean single-variable diff; fix the
+# monitor before any future adversarial leg where best.ckpt matters.
+#
+# WATCH FOR: the parent leg had two transient blowups that recovered within an
+# epoch (epoch 176: align 13.54, val total 38.35; epoch 388: align 7.23, val
+# total 29.39). No recon-only leg in this lineage does that, so it is
+# adversarial gradient shock. Lower drive should reduce them; if they get worse
+# instead, cap 5 is not the stabilizer it looks like.
+#
+# PRE-REGISTERED READ (judge on the spectral table and the ear, not composite):
+#   PASS: composite/mrstft/chroma recover any distance toward the batch64
+#         parent (1.7572 / 1.0173 / 0.0099) WHILE centroid holds near the
+#         parent leg's 0.528 (original 0.531; the recon-only attractor is
+#         ~0.48). Crest is explicitly NOT a criterion.
+#   FAIL: centroid falls back toward 0.48, i.e. cap 5 is low enough that the
+#         recon losses win and the tilt drains -- the GAN-off failure mode
+#         arriving through the back door.
+#   WASH (the expected-worst case, and acceptable): everything within noise of
+#         the parent. The user's stated bar is "sounds roughly the same".
+#
+# Lineage after this run: ~422h.
+
+
+model:
+  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  token_dim: 1024       # VQ latent / codebook token dimension
+  num_rq: 3             # residual quantization depth (codes per latent frame)
+  num_tokens: 2048      # codebook entries PER LEVEL
+  time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+  ze_norm: none         # unconstrained z_e (baseline default)
+  per_level_codebooks: true  # each RQ level owns its own codebook
+
+vq:
+  commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
+
+gan:
+  gan_start_step: 1000  # inert on a warm start (see header)
+  disc_warmup: 3000     # inert on a warm start (see header)
+  d_weight_cap: 5.0     # <-- THE VARIABLE (parent = 10, gan48h = 30)
+  disc_width: 1         # discriminator channel multiplier
+
+train:
+  devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
+  minutes: 2880         # 48h leg (true wall clock)
+  lr: 1.0e-4            # one-cycle peak, same as the parent leg
+  lr_pct_start: 0.05    # short warmup, weights already trained
+  lr_div_factor: 50     # initial lr = peak / 50 = 2e-6
+  batch_size: 48        # same as parent (b=64 OOMs with the GAN active)
+  single_song: null     # substring filter for single-song overfit; null = full dataset
+  save_path: saved_20260826_gancap5/
+  checkpoint: saved_20260823_gan/lvl1_vqgan_last.ckpt

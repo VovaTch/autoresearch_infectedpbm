@@ -1,0 +1,103 @@
+# Training configuration for the lvl1_vqgan music tokenizer.
+#
+# 2026-08-27 CONTINUATION, 9h. User request: "do a training run for 9 more
+# hours from the latest checkpoint."
+#
+# SINGLE VARIABLE vs config_20260826_gancap5.yaml: minutes 2880 -> 540.
+# Everything else byte-identical -- d_weight_cap 5, peak lr 1e-4, div 50,
+# pct 0.05, batch 48, per-level, fp32, 2 GPUs, GAN on.
+#
+# ---------------------------------------------------------------------------
+# WHICH CHECKPOINT, AND WHY IT IS best.ckpt AND NOT last.ckpt.
+# The gancap5 leg was killed by an external outage at 08:04 after ~32.5h of 48
+# (288 epochs, no OOM/traceback in the log). Its last.ckpt was written DURING
+# an alignment-loss spike:
+#   ep 228 align 1.08 | ep 240 3.76 | ep 264 4.30 | ep 288 (last.ckpt) 7.40
+# with cdpam 0.1867 and mrstft 1.3991 at that epoch, vs calm-epoch medians of
+# 0.1265 / 1.1641. best.ckpt is epoch 48 (align 1.166, cdpam 0.1117, mrstft
+# 1.1101, total 14.708 = the run minimum), a calm point.
+#
+# These spikes are NOT divergence -- they are endemic to this adversarial
+# setup. Spike rate (validation align > 3): batch64 (GAN off) 0.0%, gancap10
+# 11.1% (47 spikes, peak 14.81), gancap5 7.3%. In-run, EVERY parent spike
+# recovered within 1-3 epochs.
+#
+# BUT THAT RECOVERY PRECEDENT DOES NOT TRANSFER TO A WARM RESTART, which is
+# why this run does not start from last.ckpt. train.py:2599-2633 loads WEIGHTS
+# ONLY -- trainer.fit() is called with no ckpt_path, so a new leg gets fresh
+# Adam moments, a restarted one-cycle LR, and (strict=False) a freshly
+# INITIALIZED discriminator. The in-run recoveries were driven by accumulated
+# momentum acting against a converged critic; a warm restart has neither.
+# Starting from the epoch-288 spike state therefore spends the first epochs
+# climbing out of an inflated-z_e basin with no momentum, for zero upside over
+# starting from the calm epoch-48 weights.
+#
+# best.ckpt IS TRUSTWORTHY ON THIS LEG, which contradicts the note in the
+# parent config. loss_monitor is validation/total loss, whose minimum is the
+# epoch-0 save on a COLD adversarial start (the generator term inflates it by
+# construction). This leg warm-started with the GAN already converged, so the
+# monitor tracked a real minimum: argmin(total) = epoch 48, not epoch 0.
+#
+# ---------------------------------------------------------------------------
+# WHAT THE 32.5h BOUGHT: A WASH, which is the pre-registered expected outcome
+# ("at worst I'll just have something that sounds roughly the same").
+# Calm-epoch (align < 3) medians, same validation split:
+#   leg               spike%   cdpam    mrstft   total
+#   batch64 (no GAN)    0.0    0.1077   1.0441   13.350
+#   gancap10 (parent)  11.1    0.1233   1.1781   15.808
+#   gancap5             7.3    0.1265   1.1641   15.593
+# Cap 5 cut spike frequency by a third and moved mrstft/total marginally the
+# right way; cdpam marginally the wrong way. All within run-to-run noise.
+#
+# ---------------------------------------------------------------------------
+# KNOWN AND DELIBERATELY NOT FIXED IN THIS RUN (would break the single-variable
+# diff; raise as its own experiment).
+# The discriminator is re-initialized on every leg while _current_step
+# (train.py:1848, an nn.Parameter carried IN the checkpoint, ~2.06M by now)
+# already exceeds _adv_start = gan_start_step + disc_warmup. So the generator
+# takes full-strength adversarial gradients from step 1 against a RANDOM
+# critic, every leg. That is the most likely cause of the spike pattern, and
+# it is consistent with the only 0%-spike leg being the one with the GAN off.
+# The gan_start_step / disc_warmup values below are inert for this reason.
+#
+# ---------------------------------------------------------------------------
+# PRE-REGISTERED READ (calm-epoch medians vs the gancap5 row above, plus the
+# spectral table; NOT last-epoch values, which are a coin flip on spike phase).
+#   PASS   calm cdpam < 0.1230 or calm mrstft < 1.160, AND centroid holds
+#          >= 0.52 (ORIG 0.531; the recon-only attractor is ~0.48).
+#   FAIL   centroid falls toward 0.48 (adversarial tilt draining), or spike
+#          rate rises above 11% (cap 5 not holding).
+#   WASH   everything within noise of gancap5. The expected outcome: 9h is
+#          ~80 epochs at this leg's 8.9 epochs/h, versus the 288 that produced
+#          a wash. Treat a wash as the signal to stop tuning the tokenizer.
+# Judge on last.ckpt only after confirming its epoch is calm; otherwise use
+# best.ckpt, for the reasons above.
+
+model:
+  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  token_dim: 1024       # VQ latent / codebook token dimension
+  num_rq: 3             # residual quantization depth (codes per latent frame)
+  num_tokens: 2048      # codebook entries PER LEVEL
+  time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+  ze_norm: none         # unconstrained z_e (baseline default)
+  per_level_codebooks: true  # each RQ level owns its own codebook
+
+vq:
+  commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
+
+gan:
+  gan_start_step: 1000  # inert on a warm start (see header)
+  disc_warmup: 3000     # inert on a warm start (see header)
+  d_weight_cap: 5.0     # same as parent leg (gancap10 = 10, gan48h = 30)
+  disc_width: 1         # discriminator channel multiplier
+
+train:
+  devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
+  minutes: 540          # <-- THE VARIABLE: 9h leg (true wall clock)
+  lr: 1.0e-4            # one-cycle peak, same as the parent leg
+  lr_pct_start: 0.05    # short warmup, weights already trained
+  lr_div_factor: 50     # initial lr = peak / 50 = 2e-6
+  batch_size: 48        # same as parent (b=64 OOMs with the GAN active)
+  single_song: null     # substring filter for single-song overfit; null = full dataset
+  save_path: saved_20260827_cont9h/
+  checkpoint: saved_20260826_gancap5/lvl1_vqgan_best.ckpt

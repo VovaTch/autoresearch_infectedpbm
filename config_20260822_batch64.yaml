@@ -1,0 +1,84 @@
+# Training configuration for the lvl1_vqgan music tokenizer.
+#
+# 2026-08-22 PER-LEVEL LEG 3 / BATCH 64: 24h continuation. Parent is
+# saved_20260821_perlevel/lvl1_vqgan_last.ckpt (1.7691 / 0.1005 / 1.0245 /
+# 0.0107 -- all-time best composite, mrstft and chroma). Last recon-only leg
+# before the GAN goes back on.
+#
+# WHY CONTINUE RATHER THAN TURN THE GAN ON NOW: same three signals as leg 2,
+# all still pointing the same way after 48h of per-level training.
+#   - lvl1_vqgan_best.ckpt == last.ckpt again (monitor still improving at 24h).
+#   - align/commit fell 1.11 -> 0.994 and was still falling; the 15-min probes
+#     pushed it to 0.88-0.95 in minutes, so there is slack left.
+#   - dead codes fell 241 -> 183 of 6144 (2.98%), monotone, still falling.
+#   - 12-clip render A/B vs the leg-1 parent: cdpam better 8/12, mrstft better
+#     9/12, means 0.1454->0.1433 and 0.2420->0.2409. Small, but both metrics
+#     agree in sign AND agree with the aggregate test set -- which the GAN legs
+#     conspicuously did not.
+#
+# SINGLE VARIABLE vs leg 2: batch_size 24 -> 64 per GPU (global 48 -> 128).
+# From the 2026-08-22 batch sweep (all 15-min, fp32, same parent, same LR):
+#   batch  peak_vram  steps  samples/s/GPU  composite  cdpam   chroma  align
+#      24    8339 MB   1825           48.7     1.7776  0.0982  0.01094  0.953
+#      64   16021 MB    905           64.4     1.7746  0.1043  0.01002  0.884
+#      72   17562 MB    807           64.6     1.7861  0.1016  0.01070  0.899
+#      96       OOM      --             --         --      --       --     --
+# Throughput saturates at ~64 samples/s from b=64 onward, so b=64 is the
+# efficient point: b=72 is no faster, costs 1.5 GB more and gives up 12% of the
+# optimizer steps. Memory is exactly 192 MB/sample + 3.73 GB fixed. b=96 OOM'd
+# despite a predicted 22.2 GB of 24.5 -- and cost 30 min, because rank0's OOM
+# left rank1 blocked in allreduce until the NCCL watchdog aborted. Do not retry
+# b=96 without expandable_segments and without dropping the repeat((B,1,1)) in
+# VQCodeBookFunc (B x 25 MB of codebook duplication that cdist would broadcast).
+#
+# LR DELIBERATELY LEFT AT 1e-4, UNSCALED. Large-batch practice says raise it
+# (sqrt(2.67) = 1.6e-4 for this jump), and that may well be the right move --
+# but changing it here would make this leg a two-variable run against a lineage
+# whose entire value is single-variable attribution. The probe at unscaled LR
+# was roughly a wash (composite marginally better, cdpam worse, chroma/phase/
+# align better), so the honest state is: LR RESCALING IS UNTESTED and is the
+# obvious follow-up if this leg under-trains.
+#
+# PRE-REGISTERED READ. Pass: composite beats 1.7691 and align/commit keeps
+# falling. Fail: cdpam regresses beyond ~0.102 without a composite win -- that
+# would mean the 56% cut in optimizer steps costs more than the 32% throughput
+# gain buys, and the next leg should go back to b=24 or scale the LR.
+# WATCH cdpam SPECIFICALLY: it is the one metric that got worse at every batch
+# size tested, and it is the metric the ear has historically agreed with least.
+#
+# NO ERROR BARS on any of the probe deltas (one 15-min run per arm, no repeats);
+# composite differences of 0.003-0.009 are not established above run-to-run
+# noise. What is solid: the VRAM law, the OOM boundary, and the throughput step.
+#
+# Lineage after this run: ~326h. GAN goes on next.
+
+
+model:
+  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  token_dim: 1024       # VQ latent / codebook token dimension
+  num_rq: 3             # residual quantization depth (codes per latent frame)
+  num_tokens: 2048      # codebook entries PER LEVEL
+  time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+  ze_norm: none         # unconstrained z_e (baseline default)
+  per_level_codebooks: true  # each RQ level owns its own codebook
+
+vq:
+  commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
+
+gan:
+  gan_start_step: 100000000 # GAN OFF (last recon-only leg)
+  disc_warmup: 0        # unused with the GAN off
+  d_weight_cap: 1.0     # unused with the GAN off
+  disc_width: 1         # discriminator channel multiplier
+
+train:
+  devices: 2            # GPUs: integer count, "auto" (all visible), or a list like [0,1]
+  minutes: 1440         # 24h leg (true wall clock)
+  lr: 1.0e-4            # one-cycle peak, UNSCALED (see header)
+  lr_pct_start: 0.05    # short warmup, weights already trained
+  lr_div_factor: 50     # initial lr = peak / 50 = 2e-6
+  batch_size: 64        # <-- THE ONLY VARIABLE (leg 2 = 24); ~16.0 GB of 24.5
+  precision: 32         # fp32; bf16-mixed and bf16-true both rejected 2026-08-22
+  single_song: null     # substring filter for single-song overfit; null = full dataset
+  save_path: saved_20260822_batch64/
+  checkpoint: saved_20260821_perlevel/lvl1_vqgan_last.ckpt

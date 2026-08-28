@@ -99,7 +99,10 @@ class SimpleMelSpecConverter(MelSpecConverter):
         self.mel_spec = MelSpectrogram(**asdict(mel_spec_params))
 
     def convert(self, slice: torch.Tensor) -> torch.Tensor:
-        self.mel_spec = self.mel_spec.to(slice.device)
+        # Audio front-end stays fp32: cuFFT has no bf16, and a bf16 Trainer
+        # precision casts this module's window + mel filterbank buffers (it is
+        # reachable from the discriminator, which IS a LightningModule child).
+        self.mel_spec = self.mel_spec.to(device=slice.device, dtype=torch.float32)
         return self.mel_spec(slice.float())
 
 
@@ -427,7 +430,10 @@ def _stft_mag(x: torch.Tensor, n_fft: int, hop: int) -> torch.Tensor:
     """Magnitude STFT. x: [B,1,L] or [B,L] -> [B, 1+n_fft//2, T]. Differentiable."""
     if x.dim() == 3:
         x = x.squeeze(1)
-    window = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
+    # fp32 pinned: cuFFT has no bf16, and a bf16 Trainer precision hands this
+    # both a bf16 target batch and a bf16 torch default dtype.
+    x = x.float()
+    window = torch.hann_window(n_fft, device=x.device, dtype=torch.float32)
     spec = torch.stft(
         x, n_fft=n_fft, hop_length=hop, window=window, return_complex=True
     )
@@ -497,7 +503,8 @@ def _stft_complex(x: torch.Tensor, n_fft: int, hop: int) -> torch.Tensor:
     """Complex STFT. x: [B,1,L] or [B,L] -> [B, 1+n_fft//2, T] complex."""
     if x.dim() == 3:
         x = x.squeeze(1)
-    window = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
+    x = x.float()  # fp32 pinned: cuFFT has no bf16
+    window = torch.hann_window(n_fft, device=x.device, dtype=torch.float32)
     return torch.stft(
         x, n_fft=n_fft, hop_length=hop, window=window, return_complex=True
     )
