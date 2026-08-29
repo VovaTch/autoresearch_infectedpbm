@@ -12,7 +12,7 @@ so it reflects roughly the last batch -- enough for dead-code revival, useless
 as a distribution estimate.
 
 Usage:
-    CKPT=saved_20260822_batch64/lvl1_vqgan_last.ckpt uv run python codebook_usage.py
+    CKPT=saved_20260827_cont9h/lvl1_vqgan_last.ckpt uv run python codebook_usage.py
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ def level_stats(counts: torch.Tensor) -> dict[str, float]:
 def main() -> None:
     """Load a checkpoint, tokenize cached audio, print per-level usage stats."""
     torch.set_num_threads(int(os.environ.get("THREADS", "4")))
-    ckpt = os.environ.get("CKPT", "saved_20260822_batch64/lvl1_vqgan_last.ckpt")
+    ckpt = os.environ.get("CKPT", "saved_20260827_cont9h/lvl1_vqgan_last.ckpt")
     num_tokens = int(os.environ.get("NUM_TOKENS", "2048"))
 
     module = load_module(

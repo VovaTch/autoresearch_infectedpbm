@@ -1,0 +1,61 @@
+# Training configuration for the lvl1_vqgan music tokenizer.
+#
+# 2026-08-28 CONTROL ARM for config_20260828_freqpool2.yaml. Read that file's
+# header for the full rationale, the measured loss-budget table, the critic
+# sizing numbers, the checkpoint-compatibility argument, and the PRE-REGISTERED
+# READ. This file exists only so the treatment has something valid to be
+# compared against.
+#
+# SINGLE VARIABLE vs config_20260828_freqpool2.yaml: disc_freq_pool 2 -> 5
+# (the legacy value, i.e. no change from cont9h's critic geometry). Everything
+# else byte-identical, including the warm-start checkpoint.
+#
+# WHY A CONTROL IS MANDATORY HERE rather than reusing cont9h's numbers: a new
+# leg is a WEIGHTS-ONLY warm start. trainer.fit() runs with no ckpt_path, so
+# this leg gets fresh Adam moments and a restarted one-cycle LR over 6h instead
+# of cont9h's 9h. Those differences alone move every metric, so cont9h's
+# endpoint cannot serve as the reference for a 6h leg. The only sound reference
+# is an identically-scheduled 6h leg that differs in exactly one field.
+#
+# disc_freq_pool adds no parameters, so this arm and the treatment arm draw the
+# SAME train/val split (verified bit-identical) and can be compared slice by
+# slice with band_error.py.
+#
+# GPU ASSIGNMENT: this arm on GPU 0, treatment on GPU 1. Per the GPU-asymmetry
+# finding (GPU1 scores ~0.02-0.03 lower cdpam than GPU0) this layout biases
+# toward the treatment passing, so a PASS must be confirmed by swapping GPUs
+# and rerunning.
+#
+# Command (detached, per the power-loss finding):
+#   CUDA_VISIBLE_DEVICES=0 setsid nohup uv run python train.py \
+#     --config config_20260828_freqpool5.yaml > logs/train_freqpool5.log 2>&1 &
+
+model:
+  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  token_dim: 1024       # VQ latent / codebook token dimension
+  num_rq: 3             # residual quantization depth (codes per latent frame)
+  num_tokens: 2048      # codebook entries PER LEVEL
+  time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+  ze_norm: none         # unconstrained z_e (baseline default)
+  per_level_codebooks: true  # each RQ level owns its own codebook
+
+vq:
+  commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
+
+gan:
+  gan_start_step: 1000  # inert on a warm start (critic is restored, not reset)
+  disc_warmup: 3000     # inert on a warm start; harmless, see header
+  d_weight_cap: 5.0     # same as cont9h
+  disc_width: 1         # unchanged -- see header for why width is NOT the variable
+  disc_freq_pool: 5     # <-- THE VARIABLE: 5 = legacy 32x freq collapse (control)
+
+train:
+  devices: 1            # one GPU; the treatment arm takes the other (see header)
+  minutes: 360          # 6h leg, ~24 epochs at the paired 1-GPU rate
+  lr: 1.0e-4            # one-cycle peak, same as cont9h
+  lr_pct_start: 0.05    # short warmup, weights already trained
+  lr_div_factor: 50     # initial lr = peak / 50 = 2e-6
+  batch_size: 48        # per GPU; note effective batch is 48 here vs 96 on cont9h
+  single_song: null     # substring filter for single-song overfit; null = full dataset
+  save_path: saved_20260828_freqpool5/
+  checkpoint: saved_20260827_cont9h/lvl1_vqgan_best.ckpt

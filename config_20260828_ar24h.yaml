@@ -1,0 +1,73 @@
+# 24h AR baseline over the frozen cont9h tokenizer. First real generative run.
+#
+# 2026-08-28. Token cache tokens_ea052b5c4acf: 53 tracks, 3,876,852 frames,
+# 6.25 h, built whole-track (no slice-concat seams) from onnx/encoder.onnx.
+#
+# MEASURED BEFORE LAUNCH (free A5000, batch 8, crop 4096):
+#   94.7 M params, 710 ms/step, 138k tokens/s, 19.24 GiB peak of 23.55 GiB.
+#   SDPA selects the FlashAttention kernel, so no flash-attn dependency.
+#
+# EXPECT MEMORIZATION, AND WATCH FOR IT. 24 h at 710 ms is ~122k steps x 32,768
+# frames = ~1030 passes over a 3.88M-frame corpus, with 94.7 M parameters. PLAN
+# section 3.2 puts the memorization floor near 100 h of audio; this is 6.25 h.
+# The run is still worth its wall clock because ModelCheckpoint monitors
+# val/loss with save_top_k=1, so the best pre-divergence model is kept even if
+# the tail of the run is pure overfit. The number to read is the train/val gap
+# and the per-depth CE split, not the train curve.
+#
+# VALIDATION IS CONTEXT-MATCHED: each val item is a full 4096-frame crop ending
+# at a held-out window, with the loss masked to the held-out frames only. Val
+# therefore measures the same 23.8 s-context task as training. Without this it
+# would sit above train CE purely from shorter context.
+#
+# Command (detached, per the power-loss finding):
+#   CUDA_VISIBLE_DEVICES=0 setsid nohup uv run python train_ar.py \
+#     --config config_20260828_ar24h.yaml > logs/train_ar24h.log 2>&1 &
+
+tokenizer:
+  encoder_onnx: onnx/encoder.onnx
+  meta: onnx/tokenizer_meta.json
+  checkpoint: saved_20260827_cont9h/lvl1_vqgan_last.ckpt  # codebook source
+  tracks_dir: ~/.cache/infected_pbm/tracks
+  slices_dir: ~/.cache/infected_pbm/slices  # fallback for 7 mp3s torchcodec rejects
+  cache_root: ~/.cache/infected_pbm
+  chunk_frames: 4096    # frames emitted per encoder window
+  margin: 256           # context frames discarded per side; trunk RF is ~120
+  verify_tolerance: 0.005  # argmax near-tie floor; level 0 must still be exact
+
+data:
+  crop_frames: 4096     # 23.8 s @ 172.27 fps
+  frames_per_pos: 1     # >1 folds F frames into one position; F=1 is the tested path
+  style_window_sec: 10.0
+  val_frac: 0.04        # held-out share per track
+  val_windows_per_track: 2
+  min_val_window: 512
+  split_seed: 1234      # split depends on data only, never on the model
+  track_weighting: length
+  steps_per_epoch: 500  # an "epoch" is a logging interval, not a corpus pass
+  single_track: null    # substring filter, for the one-track overfit check
+
+model:
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  dropout: 0.0
+  style_bottleneck: 128 # keeps the style stream low-bandwidth (section 11.3)
+  p_drop_cond: 0.1      # per-stream, independent coins (section 11.2)
+  rope_theta: 10000.0
+
+train:
+  devices: 1
+  minutes: 1440
+  lr: 3.0e-4
+  lr_pct_start: 0.05
+  lr_div_factor: 25
+  batch_size: 8
+  precision: bf16-mixed
+  weight_decay: 0.01
+  grad_clip: 1.0
+  num_workers: 4
+  ema_decay: null
+  seed: 42
+  save_path: saved_ar_20260828_24h/
+  checkpoint: null

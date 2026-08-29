@@ -41,7 +41,7 @@ from render_samples import (
     pick_clips,
 )
 
-CKPT = os.environ.get("CKPT", "saved_20260823_gan/lvl1_vqgan_last.ckpt")
+CKPT = os.environ.get("CKPT", "saved_20260827_cont9h/lvl1_vqgan_last.ckpt")
 TAG = os.environ.get("TAG", "gan")
 LIM_K = float(os.environ.get("LIM_K", "4.0"))
 LIM_CEIL = float(os.environ.get("LIM_CEIL", "1.15"))

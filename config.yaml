@@ -1,12 +1,12 @@
 # Training configuration for the lvl1_vqgan music tokenizer.
 #
-# BASELINE (2026-07-16): nonorm-lineage reset. Current best model =
-# saved_12h_nonorm/ (composite 2.022 / cdpam 0.1007 / mrstft 1.234 / chroma
-# 0.0163, 15h lineage, ear-confirmed). Produced by: 3h from scratch with the
-# fixed codebook gradient (84e7cb5) + ze_norm none, then 12h continuation
-# (config_cont12h_nonorm.yaml). This file = the from-scratch recipe of that
-# lineage; continuations should warm-start saved_12h_nonorm and follow the
-# one-cycle continuation convention (peak ~1e-4, div 50, pct 0.05).
+# BASELINE from-scratch recipe. The 2026-07-16 nonorm reset that this file
+# describes has since run out to cont9h -> {freqpool5, freqpool2}; every
+# checkpoint before cont9h was deleted on 2026-08-29, so the warm-start below
+# points at cont9h. Continuations follow the one-cycle continuation convention
+# (peak ~1e-4, div 50, pct 0.05); note this file keeps the from-scratch model
+# block, which predates per_level_codebooks -- copy a recent leg's config for a
+# continuation rather than editing this one.
 
 model:
   hidden: 1024 # temporal conv channel width (Res1DBlocks)
@@ -33,4 +33,4 @@ train:
   batch_size: 24 # 2x the legacy default; fits in 24GB with headroom
   single_song: null # substring filter for single-song overfit; null = full dataset
   save_path: saved/
-  checkpoint: saved_24h_nonorm/lvl1_vqgan_last.ckpt
+  checkpoint: saved_20260827_cont9h/lvl1_vqgan_last.ckpt

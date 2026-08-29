@@ -1,0 +1,166 @@
+# Training configuration for the lvl1_vqgan music tokenizer.
+#
+# 2026-08-28 TREATMENT ARM. User request: crisper sound at FIXED BITRATE
+# ("quality is good enough for generative testing... there is still a
+# distortion with the melody"). Bitrate, token stream, frame rate, num_rq and
+# num_tokens are all untouched, so whatever the generative stage is built on
+# does not move.
+#
+# SINGLE VARIABLE vs config_20260828_freqpool5.yaml (the control, launched
+# alongside this one): disc_freq_pool 5 -> 2. Everything else byte-identical.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS KNOB, AND WHY NOT THE OBVIOUS ONES.
+#
+# A prior analysis in this lineage claimed the mel loss budget was bass-heavy
+# ("94% below 4 kHz") and proposed log-mel rebalancing. THAT WAS WRONG -- it
+# ignored MelSpecLoss's per-bin lin_start/lin_end ramp and its transform_func
+# (tanh(x)*2-1). Measured against the real pipeline, the budget is already
+# HF-tilted and peaks exactly where the distortion is:
+#     band     raw mel   +lin ramp   +ramp+tanh (ACTUAL)
+#     0-250      29.3%       13.5%                 6.5%
+#     250-1k     36.7%       30.7%                22.9%
+#     1k-4k      27.8%       40.4%                44.2%
+#     4k-10k      5.1%       12.0%                19.0%
+#     10k+        1.1%        3.4%                 7.4%
+# So 1-4 kHz already receives 44.2% of the mel budget and STILL sits at 0.6030
+# relative magnitude error (band_error.py, 512 val slices, cont9h best). More
+# reconstruction weight on a band that is already the most-weighted band is not
+# the lever. Log-mel would if anything move budget back toward bass, since it
+# compresses loud bins less aggressively than the saturating tanh does.
+#
+# At a rate-distortion limit a reconstruction loss converges to the conditional
+# mean, and the conditional mean IS blur. The tool for buying perceived detail
+# without buying bits is the critic -- and this lineage's own history agrees
+# (see memory: GAN sounds better by ear despite worse cdpam). But the critic
+# here is barely a critic:
+#   * 0.19M parameters TOTAL across all four sub-discriminators, against a 145M
+#     generator (0.13%). The three mel critics are 25.2K params EACH.
+#   * The whole ensemble emits 108 scalars to judge a 32768-sample slice.
+#   * Worst: channel_list has 5 entries -> 5 stride-2 conv layers -> the
+#     frequency axis is downsampled 32x. disc1 collapses 128 mel bins to FOUR
+#     bands spanning 0-22 kHz. The critic cannot localize a defect to a band,
+#     so it cannot say "this harmonic at 2.3 kHz is smeared" -- exactly the
+#     complaint being chased.
+#
+# disc_freq_pool sets how many of the 5 mel conv layers stride in FREQUENCY.
+# The rest stride in time only. At 2, per-slice ensemble logits go 108 -> 640
+# (disc1 20->160, disc2 24->192, disc3 32->256; the waveform critic is
+# untouched at 32). Measured cost on an A5000 at batch 48, fwd+bwd:
+#     disc_freq_pool=5 (legacy)  0.19M  0.71 GiB  63.7 ms  108 logits
+#     disc_freq_pool=2 (this)    0.19M  0.75 GiB  51.2 ms  640 logits
+# +0.04 GiB and no slowdown, for 5.9x the critic resolution.
+#
+# WIDTH WAS REJECTED as the variable, on two grounds. It costs real VRAM for no
+# structural change (disc_width 3 = 2.08 GiB, still 108 logits, still 4 frequency
+# bands). And disc_width CHANGES THE TRAIN/VAL SPLIT: random_split() draws from
+# the global RNG after build_module()'s weight init, so a width change reshuffles
+# the split to 3.8% overlap -- i.e. past width comparisons in this lineage scored
+# two models on different held-out sets, each overlapping the other's training
+# data. disc_freq_pool adds no parameters, so the split is bit-identical between
+# these two arms (verified). Width remains available as a follow-up once
+# resolution is settled.
+#
+# ---------------------------------------------------------------------------
+# CHECKPOINT COMPATIBILITY. stride is not a parameter, so the trained critic in
+# cont9h's checkpoint loads at disc_freq_pool=2 with strict=True, zero shape
+# mismatches (verified, 200/200 keys). This leg inherits a CONVERGED critic and
+# only changes where it is evaluated -- it does not start from a random one.
+# The conv weights keep their meaning; what changes is that the deeper layers'
+# frequency receptive field narrows from ~63 mel bins to ~31, turning the critic
+# from a broad-band judge into a local-harmonic-structure judge. Some adaptation
+# is expected, but from a sane starting point rather than from scratch.
+#
+# CORRECTION TO THE cont9h HEADER: it states the discriminator is re-initialized
+# every leg and that gan_start_step / disc_warmup are therefore inert-and-harmful.
+# The first half is false. train.py loads weights with strict=False, but every
+# discriminator key IS present and shape-matched in the checkpoint, so the critic
+# is RESTORED, not reset. disc_warmup being inert is therefore harmless -- the
+# gate opens on a warm critic, which is correct. That deferred "most plausible
+# cause of the spikes" item is dead.
+#
+# ---------------------------------------------------------------------------
+# RUN DESIGN: PAIRED, CONCURRENT, ONE GPU PER ARM.
+# Launch this and config_20260828_freqpool5.yaml at the same time, GPU 0 and
+# GPU 1. Both warm-start from the same cont9h checkpoint; a new leg restarts the
+# one-cycle schedule with fresh Adam moments, so cont9h's own endpoint is NOT a
+# valid control and a real control arm is mandatory.
+#
+# Concurrency costs steps (see memory: concurrency noise), but it costs BOTH
+# arms equally, which is precisely the paired design that finding calls for. Do
+# NOT read either arm's absolute numbers against cont9h's; read the two arms
+# against each other.
+#
+# Note GPU asymmetry (memory: GPU1 scores ~0.02-0.03 lower cdpam than GPU0).
+# The treatment is on GPU 1 here, which BIASES TOWARD PASS. If this passes,
+# swap the GPUs and rerun before believing it.
+#
+# EPOCH BUDGET, HONESTLY. cont9h did 81 epochs in 9h on 2 GPUs = 9 epochs/h.
+# One GPU per arm plus the concurrency penalty puts each arm near 4 epochs/h,
+# so 6h is roughly 24 epochs each. That is enough to read DIRECTION on a change
+# that needs no critic relearning, and it is not enough to read final magnitude
+# -- cont9h's cdpam was still falling at its last epoch. Treat this as a go/no-go
+# probe, not a quality verdict. For ~54 epochs per arm instead, set devices: 2 in
+# both files and run them SEQUENTIALLY (12h total), which also removes the
+# concurrency penalty and the GPU-asymmetry confound.
+#
+# ---------------------------------------------------------------------------
+# PRE-REGISTERED READ. Primary instrument is band_error.py, which scores both
+# arms on the SAME held-out slices with no peak normalization (render_samples.py
+# peak-normalizes per file and inflates error up to 12x on high-crest models --
+# do not judge this on renders). Baseline, cont9h best, 512 val slices:
+#     band     median   (mean +- stderr)
+#     0-250    0.0789   (0.1575 +- 0.0221)
+#     250-1k   0.3217   (0.3365 +- 0.0074)
+#     1k-4k    0.6030   (0.6008 +- 0.0049)
+#     4k-10k   0.6522   (0.6816 +- 0.0052)
+#     10k+     0.6313   (0.6686 +- 0.0071)
+#
+#   PASS   1k-4k median falls vs the CONTROL arm by more than 2 stderr
+#          (i.e. treatment mean below control mean by > 0.010), AND 0-250
+#          does not regress by more than 1 stderr, AND crest factor stays
+#          within 1 dB of the control (no transient damage bought with tilt).
+#   FAIL   1k-4k flat or worse than control, or 0-250/250-1k regress beyond
+#          1 stderr (critic resolution traded bass accuracy for mid detail),
+#          or validation align spike rate exceeds the control's.
+#   WASH   both arms within 2 stderr on every band. Then critic RESOLUTION is
+#          not the limiter, and the next candidate is critic CAPACITY
+#          (disc_width, accepting the split-reshuffle caveat) or accepting that
+#          5.68 kbps is the binding constraint and spending bits instead.
+# Judge on best.ckpt unless last.ckpt's epoch is confirmed calm (align < 3).
+# Ear A/B is the tiebreaker on a WASH, per the GAN-vs-cdpam finding.
+#
+# ---------------------------------------------------------------------------
+# Command (detached, per the power-loss finding):
+#   CUDA_VISIBLE_DEVICES=1 setsid nohup uv run python train.py \
+#     --config config_20260828_freqpool2.yaml > logs/train_freqpool2.log 2>&1 &
+
+model:
+  hidden: 1024          # temporal conv channel width (Res1DBlocks)
+  token_dim: 1024       # VQ latent / codebook token dimension
+  num_rq: 3             # residual quantization depth (codes per latent frame)
+  num_tokens: 2048      # codebook entries PER LEVEL
+  time_downsample: 1    # latent time downsample (1 -> 128 frames/slice, 172 fps)
+  ze_norm: none         # unconstrained z_e (baseline default)
+  per_level_codebooks: true  # each RQ level owns its own codebook
+
+vq:
+  commit_weight: 0.75   # commitment loss weight (anchors z_e to the codebook)
+
+gan:
+  gan_start_step: 1000  # inert on a warm start (critic is restored, not reset)
+  disc_warmup: 3000     # inert on a warm start; harmless, see header
+  d_weight_cap: 5.0     # same as cont9h
+  disc_width: 1         # unchanged -- see header for why width is NOT the variable
+  disc_freq_pool: 2     # <-- THE VARIABLE: 5 = legacy 32x freq collapse, 2 = keep resolution
+
+train:
+  devices: 1            # one GPU; the control arm takes the other (see header)
+  minutes: 360          # 6h leg, ~24 epochs at the paired 1-GPU rate
+  lr: 1.0e-4            # one-cycle peak, same as cont9h
+  lr_pct_start: 0.05    # short warmup, weights already trained
+  lr_div_factor: 50     # initial lr = peak / 50 = 2e-6
+  batch_size: 48        # per GPU; note effective batch is 48 here vs 96 on cont9h
+  single_song: null     # substring filter for single-song overfit; null = full dataset
+  save_path: saved_20260828_freqpool2/
+  checkpoint: saved_20260827_cont9h/lvl1_vqgan_best.ckpt

@@ -16,7 +16,7 @@ Two measurements, both encoder-only on CPU:
      the payoff of width is set by the smaller number.
 
 Usage:
-    CKPT=saved_20260822_batch64/lvl1_vqgan_last.ckpt uv run python rq_residual.py
+    CKPT=saved_20260827_cont9h/lvl1_vqgan_last.ckpt uv run python rq_residual.py
 """
 
 from __future__ import annotations
@@ -93,7 +93,7 @@ def measure(
 def main() -> None:
     """Load a checkpoint, measure RQ decay and z_e intrinsic dimension, print both."""
     torch.set_num_threads(int(os.environ.get("THREADS", "4")))
-    ckpt = os.environ.get("CKPT", "saved_20260822_batch64/lvl1_vqgan_last.ckpt")
+    ckpt = os.environ.get("CKPT", "saved_20260827_cont9h/lvl1_vqgan_last.ckpt")
 
     module = load_module(
         ckpt,

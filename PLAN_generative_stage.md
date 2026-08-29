@@ -341,3 +341,249 @@ These follow from §7 and are cheap to build in now, expensive to retrofit:
   it flags the pairs the rater found hard, and hard pairs are the informative ones.
 - Repeat pairs and anchor pairs (§7.6) get injected by the pair sampler, not by the
   UI; the UI must not be able to tell them apart from normal pairs.
+
+---
+
+## 10. Novelty: why AR will replay, and what actually fixes it
+
+Added 2026-08-28, from a design discussion. Nothing here is implemented or measured
+yet.
+
+The concern that opened the discussion: with 53 tracks, an AR model will reproduce
+the training material rather than generate anything new. That concern is correct —
+§3.2 already flagged it as the real bottleneck. This section is about what to do
+about it.
+
+### 10.1 Track-ID conditioning is the wrong lever
+
+The first instinct is to index the 53 tracks, condition the AR on a track ID, and
+mix by conditioning on two IDs at once. This fails for two structural reasons.
+
+**It makes memorization worse.** A track ID is a free variable that explains
+everything about the sequence. The model stops learning structure shared across
+tracks and becomes a 53-way replayer with a selector input. Identity conditioning is
+the most memorization-friendly signal available.
+
+**Mixing two IDs is off-manifold.** The average of two one-hot embeddings never
+occurs in training, so nothing constrains the model's behaviour there. Expect it to
+snap to one track or produce mush.
+
+General rule: **conditioning interpolates only if it is continuous, many-valued, and
+densely sampled during training.** 53 discrete atoms fail all three.
+
+### 10.2 Replace identity with decomposed continuous descriptors
+
+Condition on features computed from the audio, not on which file it came from:
+
+- **Global / style** — MERT or CLAP embedding of a ~10 s window, or the tokenizer's
+  own time-averaged `z_e`. Continuous, thousands of distinct values across the
+  corpus. Attach as a projected prefix token.
+- **Time-varying / content** — chroma, onset envelope, RMS envelope, beat grid,
+  section boundary. Attach per frame, added to the frame embedding.
+
+"Mix A and B" then has semantics: content from A with style from B, or a blend of
+the two style embeddings. Both are in-distribution, because the model saw those
+descriptor *values* everywhere — it just never saw them as an identity.
+
+This also subsumes §4's structure-conditioning idea: the time-varying stream *is*
+the low-rate structure track.
+
+### 10.3 The bigger lever — manufacture novelty in the data
+
+**Stem separation.** Run Demucs over the 53 tracks, 4 stems each, then train on
+random re-mixes of stems drawn from *different* tracks. Three effects:
+
+- combined music becomes the training distribution rather than an inference-time
+  extrapolation
+- the corpus expands combinatorially instead of linearly
+- the memorize-a-whole-track shortcut disappears, because no whole track remains in
+  the data
+
+This is the strongest single move available on the data side, and it hands over
+stem-level conditioning as a by-product.
+
+Alongside it: pitch shift ±3 semitones, time stretch ±10%, random crop offsets.
+Exact-sequence memorization stops being reachable.
+
+### 10.4 Measure memorization; do not argue about it
+
+Build this before the AR baseline is judged, not after.
+
+For each generated sequence, compute the **longest matching n-gram against the
+training token corpus** (suffix automaton or rolling hash over level-0 codes).
+Compare the distribution against the same statistic computed *between two held-out
+real tracks* — that is the natural baseline for "how much do two different pieces of
+this artist's music coincide anyway". Generated max-match far above the real-vs-real
+match means replay.
+
+Prerequisite: **hold out ~5 of the 53 tracks.** Without a held-out split there is no
+way to separate memorization from generalization at all.
+
+### 10.5 Reframe what "novel" means here
+
+Two different goals get conflated:
+
+- *Generalize to unseen music* — not reachable at 53 tracks. Stop aiming at it.
+- *Recombine learned vocabulary into new arrangements* — reachable, and is what
+  novelty means at this scale.
+
+Novelty comes from sampling and from conditioning combinations, not from
+data-driven generalization. Aim at the second.
+
+### 10.6 Blocking prerequisite: token rate
+
+`config.yaml` currently has `time_downsample: 1` → 172 fps × 3 depths = **516
+tok/s**. A 10 s clip is ~5.2k tokens. §3.1 set >100 tok/s as the danger line; the
+tokenizer is 5× over it, so AR context cannot reach past a couple of seconds at
+sane VRAM.
+
+Sweep `time_downsample` to 4 or 8 (→ 129 / 65 tok/s) and re-measure cdpam/mrstft to
+price the fidelity cost. This decides whether the AR stage is feasible at all, so it
+comes before any generative training.
+
+### 10.7 Effect on the build order
+
+§8 stands, with these insertions:
+
+- before step 1: the `time_downsample` sweep (§10.6) — the tokenizer cannot be
+  frozen at 516 tok/s
+- new step between 2 and 3: stem separation + augmentation pipeline (§10.3)
+- new step alongside 4: novelty metric (§10.4), and hold out 5 tracks
+- step 7's conditioning stream is specified by §10.2
+
+If literal splicing — mask the middle of A, condition on B's context — turns out to
+be the actual endgame rather than a side effect, the masked/MaskGIT family (§6)
+becomes the primary bet instead of AR, and this whole section carries over
+unchanged: the conditioning design is orthogonal to which family generates.
+
+---
+
+## 11. Classifier-free guidance as the mixing knob
+
+The mechanism that makes "condition on two tracks, get a mix" work. Standard CFG,
+applied to AR logits. MusicGen already does exactly this for text conditioning.
+
+### 11.1 Mechanism
+
+At each step the model emits logits `l(prefix, c)` — one score per codebook entry.
+Run three forward passes over the same prefix with different conditioning:
+
+```
+l(∅)    generic continuation, no conditioning
+l(c1)   conditioned on A
+l(c2)   conditioned on B
+```
+
+Subtract to isolate what each condition contributes:
+
+```
+dA = l(c1) − l(∅)
+dB = l(c2) − l(∅)
+```
+
+Then recombine:
+
+```
+l_final = l(∅) + w1·dA + w2·dB
+```
+
+Softmax `l_final`, sample, append, repeat. `w1=1, w2=0` is plain A; `w1=w2=0.5` is
+an even mix; `w2` negative pushes away from B.
+
+**Why this works where embedding averaging does not:** every forward pass uses a
+conditioning value the model actually saw. The blend happens in *output* space,
+after the model. Averaging two embeddings instead invents an input the model has
+never seen, where its behaviour is undefined — the §10.1 off-manifold failure.
+
+### 11.2 Training change: conditioning dropout, nothing else
+
+Targets and loss are unchanged — plain next-token cross-entropy against the real
+next token. The only change is that `c` is randomly replaced by a learned null
+embedding ~10% of the time. One forward pass per example, coin-flipped, exactly as
+diffusion CFG does it — *not* two passes per example.
+
+```python
+# tokens: [B, T, D] int64, c: [B, C] float
+drop = torch.rand(B, device=c.device) < 0.1
+c_in = torch.where(drop[:, None], null_emb.expand(B, -1), c)
+
+logits = model(tokens[:, :-1], c_in)          # [B, T-1, D, V]
+loss = F.cross_entropy(logits.reshape(-1, V), tokens[:, 1:].reshape(-1))
+```
+
+Two conditions are never seen together during training. The blend is purely an
+inference-time construct — the same leap ordinary CFG already makes when `w>1`
+extrapolates past anything in the data.
+
+**Drop each conditioning stream on its own coin.** With style and chroma as separate
+streams, independent dropout is what allows separate guidance weights at inference
+(style from B, chroma from A). One shared coin forecloses that, and it cannot be
+retrofitted without retraining.
+
+Under the delay pattern, targets are the delayed token grid with pad positions
+masked out of the loss. Same collate step as the dropout — wire them together.
+
+### 11.3 Conditioning leakage — the trap to test for
+
+If `c` is computed from the same audio window being predicted, it becomes a
+compressed copy of the answer. Training loss looks excellent and generation is
+worthless.
+
+Mitigations: compute `c` from a *different* window of the same track; keep it
+low-bandwidth (small dim, quantized, or noised).
+
+Diagnostic: train a run with `c` shuffled across the batch. Loss barely moves → the
+conditioning was doing nothing. Loss explodes → it was doing too much, i.e. leaking.
+
+### 11.4 Guidance strength for audio
+
+`w > 1` is standard, but the useful range is much narrower than in image diffusion.
+
+| Setting | Typical w |
+|---|---|
+| Image diffusion (SD-family) | 7–15 |
+| Stable Audio / AudioLDM, text cond | ~6–7 |
+| MusicGen, text→tokens (AR) | 3.0 |
+| Melody/chroma-conditioned MusicGen | ~3, lower works |
+
+Two reasons audio sits lower:
+
+- **Conditioning bandwidth.** Text is a weak hint and needs amplification. The §10.2
+  descriptors are high-bandwidth and already constrain heavily — expect **w ≈ 1–3**.
+  The more `c` determines, the less guidance it needs.
+- **AR degrades differently from diffusion.** Over-guidance in diffusion
+  oversaturates colour; in AR over discrete codes it makes logits extremely peaked,
+  sampling goes near-greedy, and output collapses into loops and stuck rhythmic
+  patterns. Audio-specific variant: high `w` promotes tokens that are unlikely
+  *unconditionally*, which in RVQ space are often rare codes that decode to metallic
+  ringing and buzz. Over-guided audio sounds harsh, not vivid.
+
+CFG already sharpens the distribution, so it must be tuned jointly with temperature
+and top-k, never independently. MusicGen ships `w=3, top_k=250, temp=1.0`.
+
+### 11.5 Parameterize strength and blend separately
+
+`w1` and `w2` are entangled — their sum is guidance strength, their ratio is the
+mix. Sweeping them independently wastes runs. Split:
+
+```
+l_final = l(∅) + s·[ m·dA + (1−m)·dB ]
+```
+
+`s` = strength (sweep ~1–4, set once per model), `m` = blend (0 → B, 0.5 → even,
+1 → A). `m` is the knob to expose in the UI.
+
+### 11.6 `s` is a novelty/fidelity dial — sweep it against the metric
+
+On a corpus this small, raising `s` means obeying the conditioning harder, which
+means replaying training material harder. Sweep `s` against the §10.4 novelty metric
+rather than by ear alone. The expected finding is that the ear prefers a higher `s`
+than novelty tolerates — precisely the gap the metric exists to expose, and the same
+metric/ear split already documented for GAN vs cdpam.
+
+### 11.7 Untried idea — per-level guidance
+
+Not from the literature; an experiment, not a default. Level 0 carries structure and
+should benefit from guidance, while levels 1–2 are residuals where large `w` may
+mostly amplify noise. Guiding level 0 at `s≈3` and lower levels at `s≈1` is cheap to
+try once the AR baseline runs.

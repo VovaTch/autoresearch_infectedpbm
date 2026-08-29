@@ -100,4 +100,4 @@ train:
   batch_size: 48        # same as parent (b=64 OOMs with the GAN active)
   single_song: null     # substring filter for single-song overfit; null = full dataset
   save_path: saved_20260827_cont9h/
-  checkpoint: saved_20260826_gancap5/lvl1_vqgan_best.ckpt
+  checkpoint: saved_20260826_gancap5/lvl1_vqgan_best.ckpt  # DELETED 2026-08-29; kept as provenance, this config no longer reruns

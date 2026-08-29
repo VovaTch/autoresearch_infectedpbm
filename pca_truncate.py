@@ -18,7 +18,7 @@ real mrstft, the tail is signal the quantizer is currently discarding, and a
 low-dim bottleneck before lookup (DAC/EnCodec factorized codes) has a target.
 
 Usage:
-    CKPT=saved_20260822_batch64/lvl1_vqgan_last.ckpt uv run python pca_truncate.py
+    CKPT=saved_20260827_cont9h/lvl1_vqgan_last.ckpt uv run python pca_truncate.py
 """
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ def pca_basis(
 def main() -> None:
     """Load a checkpoint, PCA-truncate z_e at several ranks, score each decode."""
     torch.set_num_threads(int(os.environ.get("THREADS", "4")))
-    ckpt = os.environ.get("CKPT", "saved_20260822_batch64/lvl1_vqgan_last.ckpt")
+    ckpt = os.environ.get("CKPT", "saved_20260827_cont9h/lvl1_vqgan_last.ckpt")
 
     module = load_module(
         ckpt,

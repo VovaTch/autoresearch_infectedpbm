@@ -28,6 +28,7 @@ dev = [
     "notebook>=7.6.2",
     "onnx>=1.22.0",
     "onnxruntime>=1.29.0",
+    "onnxruntime-gpu>=1.29.0",
     "onnxscript>=0.7.1",
     "pytest>=9.0.3",
 ]

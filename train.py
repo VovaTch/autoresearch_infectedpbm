@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from math import prod
-from typing import Any, Callable, Iterable, Literal, Protocol
+from typing import Any, Callable, Iterable, Literal, Protocol, Sequence
 
 import lightning as L
 import torch
@@ -1481,10 +1481,25 @@ class DiscriminatorBase(ABC, nn.Module):
 
 
 class MelSpecDiscriminator(DiscriminatorBase):
+    """
+    Patch critic over a mel spectrogram.
+
+    Args:
+      channel_list (list[int]): output channels per strided conv layer.
+      stride (int | Sequence[int | tuple[int, int]]): conv stride. A scalar
+        strides both axes in every layer; a sequence gives one (freq, time)
+        stride per layer, letting the critic keep mel resolution while still
+        pooling over time.
+      kernel_size (int): square conv kernel.
+      mel_spec_converter (SimpleMelSpecConverter): waveform -> mel front end.
+      post_mel_fn (Callable): compression applied to the mel before the convs.
+      activation_fn (nn.Module): activation between conv layers.
+    """
+
     def __init__(
         self,
         channel_list: list[int],
-        stride: int,
+        stride: int | Sequence[int | tuple[int, int]],
         kernel_size: int,
         mel_spec_converter: SimpleMelSpecConverter,
         post_mel_fn: Callable = lambda x: x,
@@ -1494,13 +1509,22 @@ class MelSpecDiscriminator(DiscriminatorBase):
         layers = []
         channel_list = [1] + list(channel_list)
         self._post_mel_fn = post_mel_fn
-        for idx in range(len(channel_list) - 1):
+        num_layers = len(channel_list) - 1
+        strides = (
+            [stride] * num_layers if isinstance(stride, int) else list(stride)
+        )
+        if len(strides) != num_layers:
+            raise ValueError(
+                f"stride sequence has {len(strides)} entries, "
+                f"expected {num_layers} (one per conv layer)"
+            )
+        for idx in range(num_layers):
             layers.append(
                 nn.Conv2d(
                     in_channels=channel_list[idx],
                     out_channels=channel_list[idx + 1],
                     kernel_size=kernel_size,
-                    stride=stride,
+                    stride=strides[idx],
                     padding=kernel_size // 2,
                 )
             )
@@ -2400,8 +2424,29 @@ def _spectralize_disc(module: nn.Module) -> nn.Module:
     return module
 
 
-def build_discriminator(disc_width: int = 1) -> EnsembleDiscriminator:
+def build_discriminator(
+    disc_width: int = 1, disc_freq_pool: int = 5
+) -> EnsembleDiscriminator:
+    """
+    Build the 4-way critic ensemble (3 mel scales + 1 raw waveform).
+
+    Args:
+      disc_width (int): channel multiplier for every sub-discriminator.
+      disc_freq_pool (int): how many of the 5 mel conv layers stride in the
+        FREQUENCY axis. The remaining layers stride in time only, so the mel
+        critics keep frequency resolution and emit a per-band verdict. At the
+        legacy value 5 the frequency axis collapses 32x (disc1: 128 mel bins ->
+        4 bands over 0-22 kHz), so the critic cannot localize a defect to a
+        band. Time striding is unchanged at 2 per layer either way.
+
+    Returns:
+      EnsembleDiscriminator: spectral-normalized, BatchNorm-stripped ensemble.
+    """
     w = disc_width
+    num_layers = 5
+    if not 0 <= disc_freq_pool <= num_layers:
+        raise ValueError(f"disc_freq_pool must be in [0, {num_layers}]")
+    mel_strides = [(2, 2)] * disc_freq_pool + [(1, 2)] * (num_layers - disc_freq_pool)
 
     def make_mel_conv(n_fft, hop_length, n_mels, power) -> SimpleMelSpecConverter:
         return SimpleMelSpecConverter(
@@ -2420,7 +2465,7 @@ def build_discriminator(disc_width: int = 1) -> EnsembleDiscriminator:
 
     disc1 = MelSpecDiscriminator(
         channel_list=[4 * w, 8 * w, 16 * w, 32 * w, 64 * w],
-        stride=2,
+        stride=mel_strides,
         kernel_size=3,
         activation_fn=nn.GELU(),
         post_mel_fn=log_normal,
@@ -2428,7 +2473,7 @@ def build_discriminator(disc_width: int = 1) -> EnsembleDiscriminator:
     )
     disc2 = MelSpecDiscriminator(
         channel_list=[4 * w, 8 * w, 16 * w, 32 * w, 64 * w],
-        stride=2,
+        stride=mel_strides,
         kernel_size=3,
         activation_fn=nn.GELU(),
         post_mel_fn=transparent,
@@ -2436,7 +2481,7 @@ def build_discriminator(disc_width: int = 1) -> EnsembleDiscriminator:
     )
     disc3 = MelSpecDiscriminator(
         channel_list=[4 * w, 8 * w, 16 * w, 32 * w, 64 * w],
-        stride=2,
+        stride=mel_strides,
         kernel_size=3,
         activation_fn=nn.GELU(),
         post_mel_fn=tanh_fn,
@@ -2467,6 +2512,7 @@ def build_module(
     num_tokens: int = 2048,
     time_downsample: int = 1,
     disc_width: int = 1,
+    disc_freq_pool: int = 5,
     d_weight_cap: float = 1.0,
     disc_warmup: int = 0,
     hidden: int = 1024,
@@ -2483,7 +2529,9 @@ def build_module(
         ze_norm=ze_norm,
         per_level_codebooks=per_level_codebooks,
     )
-    discriminator = build_discriminator(disc_width=disc_width)
+    discriminator = build_discriminator(
+        disc_width=disc_width, disc_freq_pool=disc_freq_pool
+    )
 
     discriminator_loss = DiscriminatorHingeLoss(
         name="discriminator_loss",
@@ -2589,6 +2637,8 @@ def main() -> None:
         num_tokens=m["num_tokens"],
         time_downsample=m["time_downsample"],
         disc_width=gan["disc_width"],
+        # 5 = legacy (freq axis collapses 32x); lower keeps mel resolution.
+        disc_freq_pool=gan.get("disc_freq_pool", 5),
         d_weight_cap=gan["d_weight_cap"],
         disc_warmup=gan.get("disc_warmup", 0),
         hidden=m["hidden"],

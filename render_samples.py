@@ -27,120 +27,14 @@ SLICES_PER_CLIP = 14  # ~10.4s clips (14 * 32768 / 44100); sequential slices sti
 CACHE = os.path.expanduser("~/.cache/infected_pbm/slices")
 OUT = os.path.join(os.path.dirname(__file__), "renders")
 
-# 2026-08-28 cleanup: checkpoints were deleted for every lineage leg EXCEPT
-# batch64, gancap10 and cont9h -- those three tags are the only ones that still
-# render. The other entries are kept as the lineage record (and their
-# tensorboard metrics survive under <dir>/lvl1_vqgan/); rendering them now
-# raises FileNotFoundError.
+# 2026-08-29 cleanup: every checkpoint older than cont9h was deleted (~13 GB),
+# together with its config and tensorboard run. The surviving lineage is
+# cont9h -> {freqpool5, freqpool2}. Earlier legs live only in git history
+# (their configs carry the metrics) and in memory/FINDINGS notes.
 CKPTS = {
     # tag -> checkpoint to render. cfg fields must match config.yaml's model block
     # (token_dim/hidden/num_rq/num_tokens/time_downsample/ze_norm). Paths point
     # at the best-on-monitor checkpoint (model_name + "_best.ckpt").
-    # 2026-07-16 baseline reset: nonorm12h is the only surviving lineage
-    # (all other checkpoints deleted; ear-confirmed best + all-time best
-    # composite/cdpam/chroma).
-    "nonorm12h": dict(
-        path="saved_12h_nonorm/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-    ),
-    # 2026-07-17: +12h continuation of nonorm12h (config_cont24h_nonorm.yaml).
-    # All-time best every metric: 1.9146/0.0967/1.1437/0.0139.
-    "nonorm24h": dict(
-        path="saved_24h_nonorm/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-    ),
-    # 2026-08-07: +48h continuation of nonorm24h (config_cont48h_resume.yaml,
-    # relaunched after the 2026-08-05 power loss). Composite 1.8227 / mrstft
-    # 1.0678 / chroma 0.0115 all beat nonorm24h; cdpam 0.0998 slightly worse.
-    "nonorm48h": dict(
-        path="saved_48h_nonorm_resume/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-    ),
-    # 2026-08-10: +48h continuation of nonorm48h at 1/5 the peak LR (2e-5,
-    # config_cont48h_lowlr.yaml). Test metrics essentially flat vs nonorm48h:
-    # 1.8210/0.1015/1.0653/0.0115.
-    "lowlr48h": dict(
-        path="saved_48h_lowlr/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-    ),
-    # 2026-08-14: +48h GAN leg from lowlr48h (config_cont48h_gan.yaml, cap 30).
-    # cdpam IMPROVED 0.1015 -> 0.0993 while composite/mrstft/chroma regressed
-    # (1.9268/1.1719/0.0143) -- the ear decides this one, not the metrics.
-    "gan48h": dict(
-        path="saved_48h_gan/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-    ),
-    # 2026-08-16: 24h GAN anneal from gan48h (config_cont24h_gan_anneal.yaml,
-    # cap 30->10, peak 2e-5). Repair pass for the transient artifacts; the
-    # verdict is crest factor + HF retention, not the aggregate metrics
-    # (1.9054/0.1023/1.1494/0.0137).
-    "ganAnneal": dict(
-        path="saved_24h_gan_anneal/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-    ),
-    # 2026-08-18: 48h second anneal from ganAnneal (config_cont48h_gan_anneal2.yaml,
-    # cap 10->5). 1.8800/0.1034/1.1236/0.0140.
-    "ganAnneal2": dict(
-        path="saved_48h_gan_anneal2/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-    ),
-    # 2026-08-19: 24h per-level codebooks from ganAnneal2
-    # (config_cont24h_perlevel.yaml). Each RQ level owns a 2048-entry table;
-    # same bitrate, GAN off, peak 1e-4.
-    "perlevel24h": dict(
-        path="saved_24h_perlevel/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-        per_level_codebooks=True,
-    ),
-    # 2026-08-21: +24h per-level leg 2 (config_20260821_perlevel.yaml), single
-    # variable = more wall clock. NEW ALL-TIME BEST 1.7691 / 0.1005 / 1.0245 /
-    # 0.0107; align/commit 0.994 and dead codes 183/6144, both still falling.
-    "perlevel48h": dict(
-        path="saved_20260821_perlevel/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-        per_level_codebooks=True,
-    ),
-    # 2026-08-23: +24h per-level leg 3, batch 24 -> 64 (config_20260822_batch64.yaml).
-    # Composite/mrstft/chroma/phase all all-time best (1.7572 / 1.0173 / 0.0099 /
-    # 0.6151) but cdpam regressed to 0.1051. FIRST leg where best != last:
-    # best-on-monitor froze at 03:10 = 12.6h of 24.
-    "batch64": dict(
-        path="saved_20260822_batch64/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-        per_level_codebooks=True,
-    ),
-    "batch64best": dict(
-        path="saved_20260822_batch64/lvl1_vqgan_best.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-        per_level_codebooks=True,
-    ),
-    # 2026-08-25: 48h GAN re-acquisition from batch64 last (config_20260823_gan.yaml,
-    # d_weight_cap 10, peak 1e-4, batch 48). First adversarial leg on the per-level
-    # quantizer. Judge on the spectral table (spectral_table.py), not composite.
-    "gancap10": dict(
-        path="saved_20260823_gan/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-        per_level_codebooks=True,
-    ),
-    # 2026-08-26: 48h GAN drive reduction from gancap10 last, d_weight_cap 10 -> 5,
-    # single variable (config_20260826_gancap5.yaml). Take last.ckpt: on any
-    # adversarial leg best.ckpt is the epoch-0 save, because loss_monitor is
-    # validation/total loss and the GAN inflates the generator term by construction.
-    "gancap5": dict(
-        path="saved_20260826_gancap5/lvl1_vqgan_last.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-        per_level_codebooks=True,
-    ),
-    # Same run, the min-total-loss save at epoch 48 (5.5h in). Unlike a cold
-    # adversarial start, this leg warm-started with the GAN already converged,
-    # so validation/total loss is NOT inflated from epoch 0 and best.ckpt lands
-    # on a real minimum. Epoch 48 is the only point in the run that beat the
-    # starting weights; last.ckpt (epoch 288) sits inside an align blowup.
-    "gancap5best": dict(
-        path="saved_20260826_gancap5/lvl1_vqgan_best.ckpt",
-        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
-        per_level_codebooks=True,
-    ),
     # 2026-08-28: 9h continuation from gancap5best (config_20260827_cont9h.yaml),
     # single variable = wall clock. Test composite 1.8496 / cdpam 0.1013 /
     # mrstft 1.1022 / chroma 0.0126. last.ckpt is safe here: its epoch (80) is
@@ -148,6 +42,24 @@ CKPTS = {
     # the cutoff.
     "cont9h": dict(
         path="saved_20260827_cont9h/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        per_level_codebooks=True,
+    ),
+    # 2026-08-28 PAIRED ARMS, 6h each from cont9h best, one GPU each, single
+    # variable disc_freq_pool 5 -> 2 (how many of the 5 mel conv layers stride in
+    # FREQUENCY; 5 collapses the critic's freq axis 32x to 4 bands over 0-22 kHz).
+    # best == last on both (epoch 30 was the minimum). Aggregate metrics favour
+    # fp2 across the board (composite 1.8324 vs 1.8466, cdpam 0.0996 vs 0.1002,
+    # mrstft 1.0880 vs 1.0999), but band_error.py disagrees per band: fp2 wins
+    # 1k-4k (+0.0100, t=7.8) and 10k+ (+0.0152, t=5.6) and LOSES 4k-10k
+    # (-0.0415, t=-6.8). These two exist to settle that by ear.
+    "freqpool5": dict(
+        path="saved_20260828_freqpool5/lvl1_vqgan_last.ckpt",
+        token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
+        per_level_codebooks=True,
+    ),
+    "freqpool2": dict(
+        path="saved_20260828_freqpool2/lvl1_vqgan_last.ckpt",
         token_dim=1024, num_rq=3, num_tokens=2048, time_downsample=1, hidden=1024,
         per_level_codebooks=True,
     ),
