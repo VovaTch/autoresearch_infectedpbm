@@ -1,0 +1,87 @@
+# A/B preference harness (PLAN_generative_stage.md section 7).
+#
+# The tier split is the load-bearing setting. A harness built only on 10 s clips
+# can see fidelity and nothing else, because interestingness needs time to
+# reveal itself; a harness built only on long clips buys a tenth of the pairs
+# for the same listening budget. Changing bulk_share after pairs are collected
+# does not invalidate them -- changing the questions or the clip lengths does.
+#
+# Commands:
+#   uv run python bake_ab_bank.py --config config_ab.yaml --smoke
+#   uv run python -m ab_harness.app --config config_ab.yaml
+#   uv run python -m ab_harness.model.stats ~/.cache/infected_pbm/ab
+
+bank:
+  root: ~/.cache/infected_pbm/ab   # beside tracks/ and tokens_*/, which it points into
+
+generator:
+  # ar_latest, not ar_best: config_20260829_ar24h.yaml records val/loss bottoming
+  # near step 1500 and rising after, so ar_best is pinned to a barely-trained
+  # model. At this corpus size val CE is a memorization thermometer.
+  checkpoint: saved_ar_20260829_24h/ar_frozen_0829.ckpt
+  decoder_onnx: onnx/decoder.onnx
+  device: cuda:0
+  window_frames: 4096       # == crop_frames; sampling stays inside trained geometry
+  reprime_frac: 0.25        # drop a quarter of the window per re-prime
+  use_gpu_decoder: true
+  # Sampling is bound by kernel launch latency, not arithmetic: a step costs
+  # 7.4 ms at batch 1 and 7.6 ms at batch 16. Raising max_batch is close to free
+  # throughput -- 12.9 s per 10 s clip alone, 0.8 s each in a batch of 16 -- and
+  # it is what lets the app generate during a rating session at all.
+  max_batch: 8
+  batch_wait_s: 0.5
+
+sampler:
+  fps: 172.265625
+  bulk_seconds: 10.0
+  structure_seconds: 90.0
+  bulk_share: 0.8
+  repeat_rate: 0.1          # section 7.6: self-agreement needs repeats in the stream
+  anchor_rate: 0.05         # gen vs real tokens; detects fatigue sessions
+  prompt_seconds: 3.0
+  p_track_id: 0.5           # each stream nulled independently, so all 8 combos occur
+  p_style: 0.5
+  p_prompt: 0.8             # Cold starts are off-distribution: training crops always
+                            # begin mid-track, so the model has never seen "start
+                            # from nothing". Measured over 200 clips, near-silence
+                            # runs 18.8% of a cold start against 12.0% prompted.
+  # 8 conditioning combos x 4 strengths + 1 unconditional = 29 cells, and 49
+  # judgements put ~1.7 in each -- too few to compare anything. Two strengths
+  # cut that to 15.
+  #
+  # Corrected 2026-08-29: 1.0 IS plain conditional, not mild guidance --
+  # l(null) + 1.0*(l(cond) - l(null)) reduces to l(cond), and cfg 0 and cfg 1
+  # were verified to give bit-identical tokens from the same seed. So [1.0, 2.0]
+  # was guidance-vs-none, and half the draws were the unguided case it meant to
+  # drop. [2.0, 3.0] is the two-cell version that actually compares strengths,
+  # and 3.0 is the single biggest lever against dead air: on the 90 s tier,
+  # near-silence runs 30-36% at cfg 0-2 and 12.9% at cfg 3.
+  cfg_strengths: [2.0, 3.0]
+  temperature: 1.0
+  top_k: 250
+  top_p: 0.0
+
+session:
+  target_lufs: -23.0        # section 7.7: non-optional, louder wins blind A/B
+  prefetch_depth: 4        # 4 pairs = 8 clips = exactly one sampling batch
+  seed: null
+  crossfade_ms: 5.0
+  structure_live: false     # drawing a 90 s pair inline stalls the queue ~2 min
+  # The structure tier cannot be produced on demand: a 90 s pair is ~130 s of
+  # sampling against ~10 s of rating, so the GPU is roughly 3x too slow for the
+  # configured 20% share. Instead one pair is generated in the background
+  # whenever the rating queue is full; it lands in the bank and is served by
+  # later draws and later sessions, so the tier fills in as you rate. Run
+  # bake_ab_bank.py --tier structure to seed it faster.
+  structure_backfill: 1
+  # Drop a pair before it is ever shown if either generated side is emptier
+  # than this. The model has a low-energy attractor: measured over 200 clips,
+  # the 90 s tier averages 30% near-silent and the 10 s tier 10%, against 0.0%
+  # for the real tokens of the same spans. A dead clip costs a listen and
+  # teaches a reward model only that energy wins -- the section 7.7 trap. This
+  # is best-of-N on a free metric, so no human time is spent on it. 0 disables.
+  min_fill: 0.25
+  # The worklist can hide pairs that are mostly silence. Below this fraction of
+  # the clip above the near-silence floor, a generation is not worth a listen --
+  # and at 90 s it is not worth two minutes of one either.
+  quiet_fill: 0.25

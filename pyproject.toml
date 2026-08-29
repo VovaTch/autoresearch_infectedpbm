@@ -20,6 +20,8 @@ dependencies = [
     "tqdm>=4.67.3",
     "ipykernel>=7.3.0",
     "pyside6>=6.11.2",
+    "pyloudnorm>=0.2.0",
+    "soundfile>=0.13.1",
 ]
 
 [dependency-groups]
@@ -32,3 +34,8 @@ dev = [
     "onnxscript>=0.7.1",
     "pytest>=9.0.3",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

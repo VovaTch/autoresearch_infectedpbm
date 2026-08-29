@@ -144,7 +144,11 @@ def decode_tokens(
 
 
 def sample_step(
-    logits: torch.Tensor, temperature: float, top_k: int, top_p: float
+    logits: torch.Tensor,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """
     Sample one token per RVQ depth from a single position's logits.
@@ -154,6 +158,9 @@ def sample_step(
       temperature (float): softmax temperature; <= 0 selects argmax.
       top_k (int): keep only the k highest logits (0 disables).
       top_p (float): nucleus threshold (0 disables).
+      generator (torch.Generator | None): per-clip RNG. Passing one keeps a clip
+        reproducible from its seed even when several clips are sampled in the
+        same batch, where the global RNG would interleave their draws.
 
     Returns:
       torch.Tensor: (R,) int64 sampled indices.
@@ -171,7 +178,9 @@ def sample_step(
         drop = cum - ordered.softmax(dim=-1) > top_p
         ordered = ordered.masked_fill(drop, float("-inf"))
         logits = ordered.gather(-1, order.argsort(dim=-1))
-    return torch.multinomial(logits.softmax(dim=-1), num_samples=1).squeeze(-1)
+    return torch.multinomial(
+        logits.softmax(dim=-1), num_samples=1, generator=generator
+    ).squeeze(-1)
 
 
 @torch.no_grad()
@@ -224,16 +233,27 @@ def generate(
     # Priming: force the first positions to the real delayed grid instead of
     # sampling them, so the model continues actual music rather than its own
     # cold start.
+    #
+    # Only the entries the prompt actually covers may be forced. build_delay_grid
+    # pads the corners of the delayed grid, and its trailing corner lands on real
+    # output frames: forcing it wrote pad_id -- one past the last codebook entry
+    # -- into the depth-1 frames straight after every prompt, which the decoder
+    # then gathered out of range. Level d of grid row s holds aligned frame s-d,
+    # so an entry is real exactly when 0 <= s-d < len(prompt).
     forced = None
+    prompt_len = 0
     if prompt is not None and prompt.numel():
         forced = build_delay_grid(prompt[None].to(device), pad)[0]
+        prompt_len = int(prompt.shape[0])
+    offsets = torch.arange(depth, device=device)
 
     for step in range(length):
         logits = model(inputs, ids, styles, keep, keep)[0, -1]
+        nxt = sample_step(logits.float(), temperature, top_k, top_p)
         if forced is not None and step < forced.shape[0]:
-            nxt = forced[step]
-        else:
-            nxt = sample_step(logits.float(), temperature, top_k, top_p)
+            aligned = step - offsets
+            real = (aligned >= 0) & (aligned < prompt_len)
+            nxt = torch.where(real, forced[step], nxt)
         nxt = nxt.view(1, 1, depth)
         grid = torch.cat([grid, nxt], dim=1)
         if step + 1 < length:

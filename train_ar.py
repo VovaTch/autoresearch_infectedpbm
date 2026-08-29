@@ -1034,6 +1034,71 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     ).flatten(-2)
 
 
+class KVCache:
+    """
+    Per-layer key/value store for incremental decoding.
+
+    Sampling without one costs O(L^2) forwards -- generate_ar.generate re-runs
+    the whole prefix every step, which is minutes for a 10 s clip and hours for
+    90 s. Keys and values are preallocated once so no step allocates.
+
+    Args:
+      n_layers (int): number of transformer blocks.
+      batch (int): batch size.
+      n_heads (int): attention heads.
+      head_dim (int): per-head width.
+      max_length (int): longest sequence the cache must hold, prefix included.
+      device (torch.device): storage device.
+      dtype (torch.dtype): storage dtype.
+    """
+
+    def __init__(
+        self,
+        n_layers: int,
+        batch: int,
+        n_heads: int,
+        head_dim: int,
+        max_length: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        shape = (batch, n_heads, max_length, head_dim)
+        self.keys = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(n_layers)]
+        self.values = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(n_layers)]
+        self.max_length = max_length
+        self.length = 0
+
+    def reset(self) -> None:
+        """Drop everything stored without freeing the buffers."""
+        self.length = 0
+
+    def append(
+        self, layer: int, key: torch.Tensor, value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Store one layer's new keys/values and return the full history.
+
+        `length` is advanced by the last layer only, so every layer in a step
+        sees the same offset.
+
+        Args:
+          layer (int): block index.
+          key (torch.Tensor): (B, H, L, Dh) new keys.
+          value (torch.Tensor): (B, H, L, Dh) new values.
+
+        Returns:
+          tuple[torch.Tensor, torch.Tensor]: (B, H, offset + L, Dh) keys and values.
+        """
+        start, end = self.length, self.length + key.shape[2]
+        if end > self.max_length:
+            raise ValueError(f"cache overflow: {end} > {self.max_length}")
+        self.keys[layer][:, :, start:end] = key
+        self.values[layer][:, :, start:end] = value
+        if layer == len(self.keys) - 1:
+            self.length = end
+        return self.keys[layer][:, :, :end], self.values[layer][:, :, :end]
+
+
 class CausalSelfAttention(nn.Module):
     """
     Multi-head causal attention over SDPA.
@@ -1061,13 +1126,22 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(d_model, d_model, bias=False)
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache: KVCache | None = None,
+        layer: int = 0,
     ) -> torch.Tensor:
         """
         Args:
           x (torch.Tensor): (B, L, d_model) input.
-          cos (torch.Tensor): (L, head_dim // 2) rotary cosines.
+          cos (torch.Tensor): (L, head_dim // 2) rotary cosines, already sliced
+            to this segment's absolute positions.
           sin (torch.Tensor): (L, head_dim // 2) rotary sines.
+          cache (KVCache | None): incremental decoding store; None is the
+            training path and is bit-identical to the pre-cache code.
+          layer (int): this block's index, for the cache.
 
         Returns:
           torch.Tensor: (B, L, d_model) attended output.
@@ -1076,12 +1150,35 @@ class CausalSelfAttention(nn.Module):
         qkv = self.qkv(x).view(batch, length, 3, self.n_heads, self.head_dim)
         query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         query, key = apply_rope(query, cos, sin), apply_rope(key, cos, sin)
+        if cache is None:
+            out = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                is_causal=True,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
+            return self.proj(out.transpose(1, 2).reshape(batch, length, -1))
+
+        offset = cache.length
+        key, value = cache.append(layer, key, value)
+        if length == 1:
+            # one query against the whole history: nothing to mask out
+            mask = None
+        elif offset == 0:
+            mask = None
+        else:
+            # row i may see keys up to i + offset
+            mask = torch.ones(
+                length, offset + length, dtype=torch.bool, device=x.device
+            ).tril(diagonal=offset)
         out = F.scaled_dot_product_attention(
             query,
             key,
             value,
-            is_causal=True,
-            dropout_p=self.dropout if self.training else 0.0,
+            attn_mask=mask,
+            is_causal=mask is None and length > 1,
+            dropout_p=0.0,
         )
         return self.proj(out.transpose(1, 2).reshape(batch, length, -1))
 
@@ -1131,18 +1228,25 @@ class Block(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache: KVCache | None = None,
+        layer: int = 0,
     ) -> torch.Tensor:
         """
         Args:
           x (torch.Tensor): (B, L, d_model) input.
           cos (torch.Tensor): rotary cosines.
           sin (torch.Tensor): rotary sines.
+          cache (KVCache | None): incremental decoding store.
+          layer (int): this block's index, for the cache.
 
         Returns:
           torch.Tensor: (B, L, d_model) output.
         """
-        x = x + self.drop(self.attn(self.norm_attn(x), cos, sin))
+        x = x + self.drop(self.attn(self.norm_attn(x), cos, sin, cache, layer))
         return x + self.drop(self.mlp(self.norm_mlp(x)))
 
 
@@ -1244,7 +1348,7 @@ class ArTransformer(nn.Module):
             nn.init.normal_(module.weight, std=0.02)
 
     def _rope(
-        self, length: int, device: torch.device, dtype: torch.dtype
+        self, length: int, device: torch.device, dtype: torch.dtype, offset: int = 0
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Fetch rotary factors, rebuilding the cache when it is too small.
@@ -1253,22 +1357,27 @@ class ArTransformer(nn.Module):
           length (int): sequence length needed.
           device (torch.device): target device.
           dtype (torch.dtype): target dtype.
+          offset (int): absolute position of the first element. Non-zero only
+            during incremental decoding, where the segment being scored does not
+            start at position 0.
 
         Returns:
-          tuple[torch.Tensor, torch.Tensor]: cos and sin sliced to `length`.
+          tuple[torch.Tensor, torch.Tensor]: cos and sin for positions
+            [offset, offset + length).
         """
         head_dim = self.cfg.d_model // self.cfg.n_heads
+        end = offset + length
         if (
             self._cos is None
-            or self._cos.shape[0] < length
+            or self._cos.shape[0] < end
             or self._cos.device != device
             or self._cos.dtype != dtype
         ):
             self._cos, self._sin = rope_cache(
-                max(length, self.max_positions), head_dim, self.cfg.rope_theta, device, dtype
+                max(end, self.max_positions), head_dim, self.cfg.rope_theta, device, dtype
             )
         assert self._sin is not None
-        return self._cos[:length], self._sin[:length]
+        return self._cos[offset:end], self._sin[offset:end]
 
     def conditioning(
         self,
@@ -1318,30 +1427,135 @@ class ArTransformer(nn.Module):
         Returns:
           torch.Tensor: (B, L, R, num_tokens) logits aligned with the input grid.
         """
-        batch, length, depth = tokens_in.shape
-        fold = self.frames_per_pos
-        if length % fold:
-            raise ValueError(f"sequence {length} not divisible by frames_per_pos {fold}")
-
-        embedded = sum(self.token_emb[d](tokens_in[:, :, d]) for d in range(depth))
-        assert isinstance(embedded, torch.Tensor)
-        if fold > 1:
-            embedded = self.fold(embedded.reshape(batch, length // fold, fold * self.cfg.d_model))
+        batch, length, _ = tokens_in.shape
+        embedded = self._embed(tokens_in)
 
         prefix = self.conditioning(track_idx, style, drop_id, drop_style)
         hidden = torch.cat([prefix.to(embedded.dtype), embedded], dim=1)
 
         cos, sin = self._rope(hidden.shape[1], hidden.device, hidden.dtype)
-        for block in self.blocks:
-            hidden = block(hidden, cos, sin)
+        for index, block in enumerate(self.blocks):
+            hidden = block(hidden, cos, sin, None, index)
         hidden = self.norm_out(hidden)[:, PREFIX_POSITIONS:]
+        return self._project(hidden, batch, length)
 
+    def _embed(self, tokens_in: torch.Tensor) -> torch.Tensor:
+        """
+        Sum the per-depth token embeddings and fold frames into positions.
+
+        Args:
+          tokens_in (torch.Tensor): (B, L, R) int64 token grid.
+
+        Returns:
+          torch.Tensor: (B, L // frames_per_pos, d_model) embedded positions.
+        """
+        batch, length, depth = tokens_in.shape
+        fold = self.frames_per_pos
+        if length % fold:
+            raise ValueError(f"sequence {length} not divisible by frames_per_pos {fold}")
+        embedded = sum(self.token_emb[d](tokens_in[:, :, d]) for d in range(depth))
+        assert isinstance(embedded, torch.Tensor)
+        if fold > 1:
+            embedded = self.fold(
+                embedded.reshape(batch, length // fold, fold * self.cfg.d_model)
+            )
+        return embedded
+
+    def _project(
+        self, hidden: torch.Tensor, batch: int, length: int
+    ) -> torch.Tensor:
+        """
+        Run the per-depth output heads and unfold back to frame order.
+
+        Args:
+          hidden (torch.Tensor): (B, L // F, d_model) trunk output, prefix removed.
+          batch (int): batch size.
+          length (int): frame count L before folding.
+
+        Returns:
+          torch.Tensor: (B, L, R, num_tokens) logits.
+        """
+        fold = self.frames_per_pos
+        depth = self.num_rq
         logits = torch.stack([head(hidden) for head in self.heads], dim=2)
         if fold > 1:
             # (B, L/F, R, F*V) -> (B, L/F, F, R, V) so frames stay time-ordered
             logits = logits.view(batch, length // fold, depth, fold, self.num_tokens)
             logits = logits.permute(0, 1, 3, 2, 4)
         return logits.reshape(batch, length, depth, self.num_tokens)
+
+    @torch.no_grad()
+    def start_incremental(
+        self,
+        track_idx: torch.Tensor,
+        style: torch.Tensor,
+        drop_id: torch.Tensor,
+        drop_style: torch.Tensor,
+        max_length: int,
+        cache: KVCache | None = None,
+    ) -> KVCache:
+        """
+        Open a KV cache and consume the conditioning prefix into it.
+
+        The prefix is fixed for a whole clip, so it is run once here rather than
+        re-embedded every step. Callers then feed token rows to step_incremental.
+
+        Args:
+          track_idx (torch.Tensor): (B,) int64 track ids.
+          style (torch.Tensor): (B, style_dim) style descriptors.
+          drop_id (torch.Tensor): (B,) bool, True nulls the id stream.
+          drop_style (torch.Tensor): (B,) bool, True nulls the style stream.
+          max_length (int): longest total sequence, prefix included.
+          cache (KVCache | None): existing cache to reset and refill, so a
+            sliding-window sampler does not reallocate hundreds of MB per
+            re-prime. A fresh one is built when omitted.
+
+        Returns:
+          KVCache: cache holding the prefix, length == PREFIX_POSITIONS.
+        """
+        if self.frames_per_pos != 1:
+            raise NotImplementedError("incremental decoding assumes frames_per_pos == 1")
+        prefix = self.conditioning(track_idx, style, drop_id, drop_style)
+        if cache is None:
+            cache = KVCache(
+                n_layers=len(self.blocks),
+                batch=prefix.shape[0],
+                n_heads=self.cfg.n_heads,
+                head_dim=self.cfg.d_model // self.cfg.n_heads,
+                max_length=max_length,
+                device=prefix.device,
+                dtype=prefix.dtype,
+            )
+        else:
+            cache.reset()
+        cos, sin = self._rope(prefix.shape[1], prefix.device, prefix.dtype)
+        hidden = prefix
+        for index, block in enumerate(self.blocks):
+            hidden = block(hidden, cos, sin, cache, index)
+        return cache
+
+    @torch.no_grad()
+    def step_incremental(self, tokens_in: torch.Tensor, cache: KVCache) -> torch.Tensor:
+        """
+        Score new token rows against a cache, appending them to it.
+
+        Feed the BOS row first, then one sampled row per step; the returned
+        logits for the last position score what comes next, exactly as the
+        corresponding slice of forward() would.
+
+        Args:
+          tokens_in (torch.Tensor): (B, L, R) int64 rows to append.
+          cache (KVCache): cache from start_incremental, mutated in place.
+
+        Returns:
+          torch.Tensor: (B, L, R, num_tokens) logits for the appended rows.
+        """
+        batch, length, _ = tokens_in.shape
+        hidden = self._embed(tokens_in)
+        cos, sin = self._rope(length, hidden.device, hidden.dtype, offset=cache.length)
+        for index, block in enumerate(self.blocks):
+            hidden = block(hidden, cos, sin, cache, index)
+        return self._project(self.norm_out(hidden), batch, length)
 
     @torch.no_grad()
     def cfg_logits(
