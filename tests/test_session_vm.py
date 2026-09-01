@@ -182,3 +182,47 @@ def test_jumping_to_another_queue_entry_does_not_lose_the_current_pair(
     assert session.select(first.spec.pair_id)
     assert session.pair is not None and session.pair.spec.pair_id == first.spec.pair_id
     assert not fake_sink.rows, "switching entries logs nothing"
+
+
+def test_switching_checkpoints_drops_the_pair_and_tells_the_producer(
+    session: SessionViewModel,
+) -> None:
+    session.advance()
+    assert session.pair is not None
+
+    session.switch_checkpoint("other_ckpt")
+
+    # The pair on screen was drawn against the old model; logging it under the
+    # new one is exactly what this must not do.
+    assert session.pair is None
+    assert session.checkpoint == "other_ckpt"
+    assert session.pipeline.producer.switches == ["other_ckpt"]  # type: ignore[attr-defined]
+
+
+def test_switching_to_the_current_checkpoint_is_a_no_op(
+    session: SessionViewModel,
+) -> None:
+    session.advance()
+    pair = session.pair
+    session.switch_checkpoint(session.checkpoint)
+    assert session.pair is pair
+    assert session.pipeline.producer.switches == []  # type: ignore[attr-defined]
+
+
+def test_a_failed_switch_reports_and_follows_the_model_still_loaded(
+    qapp, sampler: PairSampler, bank: ClipBank, fake_sink: FakeSink
+) -> None:
+    producer = FakeProducer(store=bank, fail_switch="FileNotFoundError: nope")
+    pipeline = PairPipeline(sampler, producer, bank, depth=2, structure_live=True)
+    session = SessionViewModel(pipeline, fake_sink, session_id="sess1")
+    seen: list[tuple[str, str]] = []
+    session.checkpoint_changed.connect(lambda ckpt, err: seen.append((ckpt, err)))
+
+    session.advance()
+    session.switch_checkpoint("missing_ckpt")
+    session._pump()  # no Qt event loop under test, so the timer tick is manual
+
+    assert seen == [("ckpt_test", "FileNotFoundError: nope")]
+    # The worker never unloaded the old model, so the sampler must not claim
+    # otherwise -- pairs would be banked under a checkpoint that never ran.
+    assert session.checkpoint == "ckpt_test"

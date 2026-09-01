@@ -178,3 +178,51 @@ def test_the_play_button_tracks_the_transport(qapp) -> None:
     assert "Pause" in _buttons(view)
     view.set_playing(False)
     assert "Play" in _buttons(view)
+
+
+def test_checkpoint_selector_switches_the_session(
+    qapp, sampler: PairSampler, bank: ClipBank, fake_sink: FakeSink
+) -> None:
+    from PySide6.QtWidgets import QComboBox
+
+    from ab_harness.view.main_window import MainWindow
+    from ab_harness.viewmodel.player_vm import PlayerViewModel
+
+    pipeline = PairPipeline(
+        sampler, FakeProducer(store=bank), bank, depth=1, structure_live=True
+    )
+    session = SessionViewModel(pipeline, fake_sink)
+    window = MainWindow(
+        session,
+        PlayerViewModel(),
+        checkpoints=["ckpt_test", "saved_dpo_x/dpo_latest.ckpt"],
+    )
+    combo = window.findChild(QComboBox)
+    assert combo is not None and combo.count() == 2
+    # the run directory is what tells two models apart at a glance
+    assert combo.itemText(1) == "saved_dpo_x/dpo_latest"
+
+    combo.setCurrentIndex(1)
+    combo.activated.emit(1)
+
+    assert session.checkpoint == "saved_dpo_x/dpo_latest.ckpt"
+    assert pipeline.producer.switches == ["saved_dpo_x/dpo_latest.ckpt"]  # type: ignore[attr-defined]
+    # disabled until the worker answers: a second switch would drop a queue
+    # that is already being refilled
+    assert not combo.isEnabled()
+    session._pump()
+    assert combo.isEnabled()
+
+
+def test_checkpoint_selector_is_hidden_when_there_is_nothing_to_choose(
+    qapp, sampler: PairSampler, bank: ClipBank, fake_sink: FakeSink
+) -> None:
+    from PySide6.QtWidgets import QComboBox
+
+    from ab_harness.view.main_window import MainWindow
+    from ab_harness.viewmodel.player_vm import PlayerViewModel
+
+    pipeline = PairPipeline(sampler, FakeProducer(store=bank), bank, depth=1)
+    window = MainWindow(SessionViewModel(pipeline, fake_sink), PlayerViewModel())
+    combo = window.findChild(QComboBox)
+    assert combo is not None and combo.count() == 0

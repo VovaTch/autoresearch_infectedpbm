@@ -20,6 +20,7 @@ from typing import Any, TypeVar
 
 import yaml
 
+from ab_harness.checkpoints import discover_checkpoints, resolve_checkpoint
 from ab_harness.model.pair_sampler import SamplerCfg
 
 REPO = Path(__file__).resolve().parent.parent
@@ -63,10 +64,13 @@ class GeneratorCfg:
     The worker's model and decoding settings.
 
     Args:
-      checkpoint (str): AR checkpoint. Defaults to ar_latest rather than
-        ar_best: config_20260829_ar24h.yaml records that val/loss bottoms near
-        step 1500 and is a memorization thermometer, not a model selector, so
-        ar_best is pinned to a barely-trained model.
+      checkpoint (str): AR or DPO checkpoint to sample from, or "auto" for the
+        newest one ab_harness.checkpoints finds -- the last DPO run if there is
+        one. Resolved to a concrete path at load, and switchable in the app
+        without a restart. Prefer a *_latest over a *_best: val/loss bottoms
+        near step 1500 (config_20260829_ar24h.yaml) and DPO val/acc is a random
+        walk on 38 pairs, so "best" is a memorization thermometer pinned to a
+        barely-trained model, not a model selector.
       decoder_onnx (str): tokens-to-audio graph.
       device (str): torch device for sampling.
       window_frames (int): context retained by the sliding window; keep at the
@@ -81,7 +85,7 @@ class GeneratorCfg:
         sampling what it already has, so a lone request is not held up.
     """
 
-    checkpoint: str = "saved_ar_20260829_24h/ar_latest.ckpt"
+    checkpoint: str = "auto"
     decoder_onnx: str = "onnx/decoder.onnx"
     device: str = "cuda:0"
     window_frames: int = 4096
@@ -142,6 +146,21 @@ class AbConfig:
     generator: GeneratorCfg = field(default_factory=GeneratorCfg)
     sampler: SamplerCfg = field(default_factory=SamplerCfg)
     session: SessionCfg = field(default_factory=SessionCfg)
+
+    def __post_init__(self) -> None:
+        """Resolve an "auto" checkpoint once, so no caller sees the sentinel."""
+        self.generator.checkpoint = resolve_checkpoint(self.generator.checkpoint, REPO)
+
+    @property
+    def checkpoints(self) -> list[str]:
+        """
+        Returns:
+          list[str]: loadable checkpoints, newest first, with the configured one
+            in front so the selector opens on what is actually running.
+        """
+        found = discover_checkpoints(REPO)
+        current = self.generator.checkpoint
+        return [current] + [c for c in found if c != current]
 
     @property
     def bank_root(self) -> Path:

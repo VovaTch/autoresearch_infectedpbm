@@ -556,3 +556,86 @@ def test_a_banked_clip_known_to_be_dead_is_not_reserved(
     for spec in bank.specs():
         bank.set_fill(spec.item_id, 0.01)
     assert pipeline._banked_structure_spec() is None
+
+
+def test_switching_checkpoints_empties_the_queue(pipeline: PairPipeline) -> None:
+    pipeline.pump()
+    assert pipeline.ready + pipeline.inflight > 0
+
+    pipeline.set_checkpoint("other_ckpt")
+    assert pipeline.ready == 0
+    assert pipeline.inflight == 0
+    assert pipeline.backfilling == 0
+
+    pipeline.pump()
+    pair = pipeline.next_pair()
+    assert pair is not None
+    assert pair.spec.left.checkpoint == "other_ckpt"
+    assert pair.spec.right.checkpoint == "other_ckpt"
+
+
+def test_clips_from_the_old_checkpoint_are_dropped_on_arrival(
+    pipeline: PairPipeline,
+) -> None:
+    pipeline.request(Tier.BULK, 1)
+    stale = [
+        item
+        for spec in pipeline._inflight.values()
+        for item in (spec.left.item_id, spec.right.item_id)
+    ]
+    assert stale
+
+    pipeline.set_checkpoint("other_ckpt")
+    pipeline.pump()
+    # Nothing assembles them any more, so keeping their audio would be a leak
+    # that grows by ~8 MB per 90 s clip for the rest of the session.
+    assert not any(item in pipeline._clips for item in stale)
+    assert all(pair.spec.left.checkpoint == "other_ckpt" for pair in pipeline._ready)
+
+
+def test_banked_pairs_from_an_older_checkpoint_still_assemble(
+    pipeline: PairPipeline,
+) -> None:
+    # Repeats, anchors and banked structure pairs carry the checkpoint that
+    # produced them, which after a switch is not the current one. They must
+    # still be servable, or half the bank becomes unrateable.
+    pipeline.request(Tier.BULK, 1)
+    for spec in pipeline._inflight.values():
+        assert spec.left.checkpoint != "other_ckpt"
+    # sampler-only, not set_checkpoint: the point is that clips already in
+    # flight still land, which is what a mid-flight bank draw looks like
+    pipeline.sampler.checkpoint = "other_ckpt"
+
+    pipeline.pump()
+    assert pipeline.ready > 0
+
+
+def test_banked_structure_pairs_from_another_checkpoint_are_not_offered(
+    sampler: PairSampler, bank: ClipBank
+) -> None:
+    # The bank accumulates every model ever rated. Serving one model's banked
+    # pairs while the selector names another is the failure this prevents.
+    seeded = PairPipeline(sampler, FakeProducer(store=bank), bank, depth=2)
+    for _ in range(6):
+        seeded.request(Tier.STRUCTURE, 1)
+    seeded.pump()
+    assert seeded.banked_structure_pairs() > 0
+
+    seeded.set_checkpoint("other_ckpt")
+    assert seeded.banked_structure_pairs() == 0
+    assert seeded._banked_structure_spec() is None
+
+
+def test_repeats_do_not_survive_a_checkpoint_switch(sampler: PairSampler) -> None:
+    before = {sampler.next_spec().pair_id for _ in range(10)}
+    sampler.set_checkpoint("other_ckpt")
+
+    after = [sampler.next_spec() for _ in range(40)]
+    # A repeat of a pair the previous model generated measures neither the
+    # rater's self-agreement with this model nor this model.
+    assert not any(spec.pair_id in before for spec in after)
+    # anchors carry a reference side, which is tagged with no checkpoint at all
+    tags = {clip.checkpoint for spec in after for clip in (spec.left, spec.right)} - {
+        ""
+    }
+    assert tags == {"other_ckpt"}

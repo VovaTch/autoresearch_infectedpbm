@@ -21,6 +21,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from ab_harness.model.bank import ClipBank
 from ab_harness.model.pair_sampler import PairSampler, SamplerCfg, TrackInfo
 from ab_harness.model.types import Clip, ClipSpec, Judgement
+from ab_harness.worker.protocol import CheckpointChanged
 
 FPS = 172.265625
 WINDOW = int(10.0 * FPS)
@@ -94,16 +95,51 @@ class FakeProducer:
         failure.
       store (ClipBank | None): bank to record produced tokens into, so
         pipeline tests see the same reuse behaviour as the real service.
+      checkpoint (str): the model it claims to be serving.
+      fail_switch (str): error text to answer every switch with; empty means
+        switches succeed.
     """
 
     def __init__(
-        self, fail: set[str] | None = None, store: ClipBank | None = None
+        self,
+        fail: set[str] | None = None,
+        store: ClipBank | None = None,
+        checkpoint: str = "ckpt_test",
+        fail_switch: str = "",
     ) -> None:
         self.fail = fail or set()
         self.store = store
+        self.checkpoint = checkpoint
+        self.fail_switch = fail_switch
         self.requested: list[str] = []
+        self.switches: list[str] = []
         self._queue: list[Clip] = []
+        self._change: object | None = None
         self.closed = False
+
+    def switch_checkpoint(self, checkpoint: str) -> None:
+        """
+        Args:
+          checkpoint (str): the model to serve next. Applied immediately, the
+            way the in-process producer does.
+        """
+        self.switches.append(checkpoint)
+        if self.fail_switch:
+            # A worker that cannot load keeps the model it had.
+            self._change = CheckpointChanged(
+                checkpoint=self.checkpoint, error=self.fail_switch
+            )
+            return
+        self.checkpoint = checkpoint
+        self._change = CheckpointChanged(checkpoint=checkpoint)
+
+    def take_checkpoint_change(self) -> object | None:
+        """
+        Returns:
+          object | None: the outcome of a switch, once.
+        """
+        change, self._change = self._change, None
+        return change
 
     def submit(self, specs: Sequence[ClipSpec]) -> None:
         rng = np.random.default_rng(0)

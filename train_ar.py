@@ -959,6 +959,63 @@ def undelay_grid(grid: torch.Tensor, frames: int) -> torch.Tensor:
     return grid.gather(1, offsets.expand(grid.shape[0], frames, depth))
 
 
+def prepare_grid(
+    tokens: torch.Tensor,
+    pad_id: int,
+    frames_per_pos: int = 1,
+    score: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Delay, right-shift and mask one batch of aligned codes.
+
+    Module-level because both the training step and the preference trainer score
+    sequences the same way; a divergence between the two would silently compare
+    log-probabilities of differently-aligned grids.
+
+    Args:
+      tokens (torch.Tensor): (B, T, R) int64 aligned codes.
+      pad_id (int): shared PAD/BOS id, only ever an input.
+      frames_per_pos (int): frames folded into one transformer position.
+      score (torch.Tensor | None): (B, T) bool, which frames contribute to the
+        loss. None scores every frame.
+
+    Returns:
+      tuple[torch.Tensor, torch.Tensor, torch.Tensor]: input grid (B, L, R),
+        target grid (B, L, R) and a bool loss mask (B, L, R). Positions where
+        the delay ran off either end are PAD and are masked out.
+    """
+    grid = build_delay_grid(tokens, pad_id)
+    bos = torch.full(
+        (grid.shape[0], 1, grid.shape[2]), pad_id, dtype=grid.dtype, device=grid.device
+    )
+    inputs = torch.cat([bos, grid[:, :-1]], dim=1)
+
+    fold = frames_per_pos
+    if fold > 1 and grid.shape[1] % fold:
+        extra = fold - grid.shape[1] % fold
+        filler = torch.full(
+            (grid.shape[0], extra, grid.shape[2]),
+            pad_id,
+            dtype=grid.dtype,
+            device=grid.device,
+        )
+        inputs = torch.cat([inputs, filler], dim=1)
+        grid = torch.cat([grid, filler], dim=1)
+
+    mask = grid != pad_id
+    if score is not None:
+        # Delay the frame mask the same way the codes were delayed, so a scored
+        # frame lines up with the position that predicts it.
+        delayed = build_delay_grid(
+            score.long().unsqueeze(-1).expand(-1, -1, grid.shape[2]), 0
+        )
+        if delayed.shape[1] < grid.shape[1]:
+            pad_len = grid.shape[1] - delayed.shape[1]
+            delayed = F.pad(delayed, (0, 0, 0, pad_len))
+        mask = mask & delayed.bool()
+    return inputs, grid, mask
+
+
 # ===========================================================================
 # Transformer
 # ===========================================================================
@@ -1676,40 +1733,9 @@ class ArLightningModule(L.LightningModule):
 
         Returns:
           tuple[torch.Tensor, torch.Tensor, torch.Tensor]: input grid (B, L, R),
-            target grid (B, L, R) and a bool loss mask (B, L, R). Positions where
-            the delay ran off either end are PAD and are masked out.
+            target grid (B, L, R) and a bool loss mask (B, L, R).
         """
-        pad = self.model.pad_id
-        grid = build_delay_grid(tokens, pad)
-        bos = torch.full(
-            (grid.shape[0], 1, grid.shape[2]), pad, dtype=grid.dtype, device=grid.device
-        )
-        inputs = torch.cat([bos, grid[:, :-1]], dim=1)
-
-        fold = self.model.frames_per_pos
-        if fold > 1 and grid.shape[1] % fold:
-            extra = fold - grid.shape[1] % fold
-            filler = torch.full(
-                (grid.shape[0], extra, grid.shape[2]),
-                pad,
-                dtype=grid.dtype,
-                device=grid.device,
-            )
-            inputs = torch.cat([inputs, filler], dim=1)
-            grid = torch.cat([grid, filler], dim=1)
-
-        mask = grid != pad
-        if score is not None:
-            # Delay the frame mask the same way the codes were delayed, so a
-            # scored frame lines up with the position that predicts it.
-            delayed = build_delay_grid(
-                score.long().unsqueeze(-1).expand(-1, -1, grid.shape[2]), 0
-            )
-            if delayed.shape[1] < grid.shape[1]:
-                pad_len = grid.shape[1] - delayed.shape[1]
-                delayed = F.pad(delayed, (0, 0, 0, pad_len))
-            mask = mask & delayed.bool()
-        return inputs, grid, mask
+        return prepare_grid(tokens, self.model.pad_id, self.model.frames_per_pos, score)
 
     def _run(self, batch: dict[str, Any], stage: str) -> torch.Tensor:
         """

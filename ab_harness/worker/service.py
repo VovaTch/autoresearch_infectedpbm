@@ -29,9 +29,37 @@ from ab_harness.model.pair_sampler import TrackInfo, save_corpus
 from ab_harness.model.types import ClipSpec
 from ab_harness.worker.decoder import TokenDecoder
 from ab_harness.worker.generator import ArGenerator, SampleRequest
-from ab_harness.worker.protocol import ClipRequest, ClipResult, Shutdown
+from ab_harness.worker.protocol import (
+    CheckpointChanged,
+    ClipRequest,
+    ClipResult,
+    Shutdown,
+    SwitchCheckpoint,
+)
 from generate_ar import config_from_ckpt
 from train_ar import DataCfg, TrackTokens, build_model, load_token_cache
+
+
+def style_vector(track: TrackTokens, spec: ClipSpec) -> torch.Tensor:
+    """
+    Rebuild the style descriptor a ClipSpec was (or would be) generated with.
+
+    Module-level so anything scoring or regenerating a banked clip -- the
+    preference trainer included -- can reproduce the conditioning without
+    loading a GenerationService and its ONNX decoder.
+
+    Args:
+      track (TrackTokens): the cached track the clip was drawn from.
+      spec (ClipSpec): the clip being generated.
+
+    Returns:
+      torch.Tensor: (style_dim,) descriptor, zeros when the stream is nulled
+        (the model substitutes its learned null, so the value is inert).
+    """
+    window = spec.conditioning.style_window
+    if not spec.conditioning.use_style or window < 0:
+        return torch.zeros(track.style.shape[-1])
+    return track.style[min(window, track.style.shape[0] - 1)]
 
 
 class GenerationService:
@@ -45,7 +73,11 @@ class GenerationService:
     def __init__(self, cfg: AbConfig) -> None:
         self.cfg = cfg
         self.bank = ClipBank(cfg.bank_root)
+        self.checkpoint = cfg.generator.checkpoint
         self._tracks: dict[int, TrackTokens] = {}
+        self._ordered_tracks: list[TrackTokens] = []
+        self._manifest: dict[str, Any] = {}
+        self._cache_dir: Path | None = None
         self._generator: ArGenerator | None = None
         self._decoder: TokenDecoder | None = None
         self._meta: dict[str, Any] = {}
@@ -60,7 +92,34 @@ class GenerationService:
         if self._loaded:
             return
         gen_cfg = self.cfg.generator
-        ckpt_path = REPO / gen_cfg.checkpoint
+        self._load_checkpoint(gen_cfg.checkpoint)
+        self._decoder = TokenDecoder(
+            REPO / gen_cfg.decoder_onnx,
+            hop=int(self._meta["hop_length"]),
+            sample_rate=int(self._meta["sample_rate"]),
+            use_gpu=gen_cfg.use_gpu_decoder,
+        )
+        self._loaded = True
+
+    def _load_checkpoint(self, checkpoint: str) -> None:
+        """
+        Load one AR/DPO checkpoint and build the generator around it.
+
+        The corpus and the token cache belong to the tokenizer, not to the AR
+        model, so they are only reloaded when the checkpoint points at a
+        different cache -- which is what makes switching models mid-session cost
+        a few seconds rather than a minute. The decoder is untouched for the
+        same reason.
+
+        Args:
+          checkpoint (str): repo-relative checkpoint path.
+
+        Raises:
+          FileNotFoundError: when the checkpoint or its token cache is missing.
+        """
+        ckpt_path = REPO / checkpoint
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"no checkpoint at {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         ar_cfg = config_from_ckpt(ckpt)
 
@@ -69,18 +128,21 @@ class GenerationService:
         if not caches:
             raise FileNotFoundError(f"no token cache under {cache_root}")
         cache_dir = caches[-1]
-        # single_track would hide most of the corpus from the sampler
-        data_cfg = DataCfg(**{**vars(ar_cfg.data), "single_track": None})
-        tracks, manifest = load_token_cache(cache_dir, data_cfg)
-        self._tracks = {t.track_idx: t for t in tracks}
-        self._meta = manifest["tokenizer_meta"]
+        if cache_dir != self._cache_dir:
+            # single_track would hide most of the corpus from the sampler
+            data_cfg = DataCfg(**{**vars(ar_cfg.data), "single_track": None})
+            tracks, manifest = load_token_cache(cache_dir, data_cfg)
+            self._ordered_tracks = tracks
+            self._tracks = {t.track_idx: t for t in tracks}
+            self._manifest = manifest
+            self._meta = manifest["tokenizer_meta"]
+            self._cache_dir = cache_dir
+            # The UI process never imports torch, so the corpus it needs to draw
+            # spans from has to reach it through the bank.
+            save_corpus(self.corpus_path, self.tracks)
+        self.bank.init_manifest(cache_dir.name, self._meta, checkpoint)
 
-        self.bank.init_manifest(cache_dir.name, self._meta, gen_cfg.checkpoint)
-        # The UI process never imports torch, so the corpus it needs to draw
-        # spans from has to reach it through the bank.
-        save_corpus(self.corpus_path, self.tracks)
-
-        model = build_model(ar_cfg, tracks, manifest)
+        model = build_model(ar_cfg, self._ordered_tracks, self._manifest)
         state = {
             k[len("model.") :]: v
             for k, v in ckpt["state_dict"].items()
@@ -91,22 +153,34 @@ class GenerationService:
             print(
                 f"  WARN missing={list(missing)[:3]} unexpected={list(unexpected)[:3]}"
             )
-        device = torch.device(gen_cfg.device if torch.cuda.is_available() else "cpu")
+        device = torch.device(
+            self.cfg.generator.device if torch.cuda.is_available() else "cpu"
+        )
         model.to(device).eval()
-
         self._generator = ArGenerator(
             model,
             device,
-            window_frames=min(gen_cfg.window_frames, ar_cfg.data.crop_frames),
-            reprime_frac=gen_cfg.reprime_frac,
+            window_frames=min(
+                self.cfg.generator.window_frames, ar_cfg.data.crop_frames
+            ),
+            reprime_frac=self.cfg.generator.reprime_frac,
         )
-        self._decoder = TokenDecoder(
-            REPO / gen_cfg.decoder_onnx,
-            hop=int(self._meta["hop_length"]),
-            sample_rate=int(self._meta["sample_rate"]),
-            use_gpu=gen_cfg.use_gpu_decoder,
-        )
-        self._loaded = True
+        self.checkpoint = checkpoint
+
+    def switch_checkpoint(self, checkpoint: str) -> None:
+        """
+        Sample from a different model from here on.
+
+        The old generator stays in place until the new one is built, so a bad
+        path costs an error message rather than a dead session.
+
+        Args:
+          checkpoint (str): repo-relative checkpoint path.
+        """
+        if checkpoint == self.checkpoint and self._loaded:
+            return
+        self.load()
+        self._load_checkpoint(checkpoint)
 
     # -- corpus --------------------------------------------------------------
 
@@ -176,14 +250,9 @@ class GenerationService:
           spec (ClipSpec): the clip being generated.
 
         Returns:
-          torch.Tensor: (style_dim,) descriptor, zeros when the stream is nulled
-            (the model substitutes its learned null, so the value is inert).
+          torch.Tensor: (style_dim,) descriptor, zeros when the stream is nulled.
         """
-        track = self._tracks[spec.conditioning.track_idx]
-        window = spec.conditioning.style_window
-        if not spec.conditioning.use_style or window < 0:
-            return torch.zeros(track.style.shape[-1])
-        return track.style[min(window, track.style.shape[0] - 1)]
+        return style_vector(self._tracks[spec.conditioning.track_idx], spec)
 
     def _request(self, spec: ClipSpec) -> SampleRequest:
         """
@@ -350,6 +419,8 @@ class GenerationService:
         self._generator = None
         self._decoder = None
         self._tracks = {}
+        self._ordered_tracks = []
+        self._cache_dir = None
         self._loaded = False
 
 
@@ -361,8 +432,9 @@ def run_service(
 
     Args:
       cfg (AbConfig): harness config.
-      requests (mp.Queue[Any]): inbound ClipRequest / Shutdown messages.
-      results (mp.Queue[Any]): outbound ClipResult messages.
+      requests (mp.Queue[Any]): inbound ClipRequest / SwitchCheckpoint /
+        Shutdown messages.
+      results (mp.Queue[Any]): outbound ClipResult / CheckpointChanged messages.
     """
     service = GenerationService(cfg)
     try:
@@ -373,6 +445,26 @@ def run_service(
         return
     max_batch = max(1, cfg.generator.max_batch)
     wait = cfg.generator.batch_wait_s
+
+    def apply_switch(request: SwitchCheckpoint) -> None:
+        """
+        Args:
+          request (SwitchCheckpoint): the model the rater picked. A failure is
+            reported and the old model kept, so a typo in a path does not end
+            the session.
+        """
+        try:
+            service.switch_checkpoint(request.checkpoint)
+            results.put(CheckpointChanged(checkpoint=service.checkpoint))
+        except Exception as exc:  # noqa: BLE001 - report, keep serving
+            traceback.print_exc()
+            results.put(
+                CheckpointChanged(
+                    checkpoint=service.checkpoint,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            )
+
     while True:
         try:
             message = requests.get(timeout=1.0)
@@ -380,6 +472,9 @@ def run_service(
             continue
         if isinstance(message, Shutdown):
             break
+        if isinstance(message, SwitchCheckpoint):
+            apply_switch(message)
+            continue
         if not isinstance(message, ClipRequest):
             continue
         # Gather whatever else is already waiting: batching is close to free and
@@ -387,6 +482,9 @@ def run_service(
         # short wait covers the gap between a pair's two requests arriving.
         batch = [message.spec]
         stop = False
+        # A switch that lands mid-gather is applied after the batch: the clips
+        # already in it were drawn against the old model and must stay so.
+        switch: SwitchCheckpoint | None = None
         while len(batch) < max_batch:
             try:
                 extra = requests.get(timeout=wait)
@@ -395,10 +493,15 @@ def run_service(
             if isinstance(extra, Shutdown):
                 stop = True
                 break
+            if isinstance(extra, SwitchCheckpoint):
+                switch = extra
+                break
             if isinstance(extra, ClipRequest):
                 batch.append(extra.spec)
         for result in service.produce_many(batch):
             results.put(result)
+        if switch is not None:
+            apply_switch(switch)
         if stop:
             break
     service.close()

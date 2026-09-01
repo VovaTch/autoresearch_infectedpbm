@@ -404,6 +404,20 @@ class PairSampler:
             is_anchor=is_anchor,
         )
 
+    def set_checkpoint(self, checkpoint: str) -> None:
+        """
+        Draw against a different model from here on.
+
+        The repeat history goes with it. A repeat exists to measure whether the
+        rater agrees with themselves (section 7.6); replaying a pair generated
+        by the model they just switched away from measures nothing about either.
+
+        Args:
+          checkpoint (str): repo-relative checkpoint path tagged onto new clips.
+        """
+        self.checkpoint = checkpoint
+        self._history.clear()
+
     def next_spec(self, tier: Tier | None = None) -> PairSpec:
         """
         Draw the next comparison to show.

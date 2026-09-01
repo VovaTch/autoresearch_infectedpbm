@@ -35,6 +35,18 @@ class ClipRequest:
 
 
 @dataclass
+class SwitchCheckpoint:
+    """
+    Ask the worker to sample from a different model from here on.
+
+    Args:
+      checkpoint (str): repo-relative checkpoint path.
+    """
+
+    checkpoint: str
+
+
+@dataclass
 class Shutdown:
     """Sentinel telling the service loop to exit."""
 
@@ -71,3 +83,27 @@ class ClipResult:
           bool: True when both tokens and audio came back.
         """
         return not self.error and self.tokens is not None and self.pcm is not None
+
+
+@dataclass
+class CheckpointChanged:
+    """
+    Reply to SwitchCheckpoint, sent whether or not the load worked.
+
+    Args:
+      checkpoint (str): the checkpoint now in use. On failure this is the one
+        that was already loaded, since a failed switch leaves the worker
+        serving the old model rather than nothing.
+      error (str): empty on success, otherwise a short description.
+    """
+
+    checkpoint: str
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """
+        Returns:
+          bool: True when the requested model is the one now loaded.
+        """
+        return not self.error

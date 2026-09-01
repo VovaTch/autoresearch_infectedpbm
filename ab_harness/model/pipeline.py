@@ -173,8 +173,13 @@ class PairPipeline:
             many structure comparisons can currently be served.
         """
         self._refresh_store()
+        current = self.sampler.checkpoint
         groups: dict[str, int] = {}
         for spec in self.store.specs(Tier.STRUCTURE):
+            # Counted the way _banked_structure_spec draws, or the status bar
+            # would advertise material the selected model cannot serve.
+            if spec.checkpoint and spec.checkpoint != current:
+                continue
             groups[spec.group_id] = groups.get(spec.group_id, 0) + 1
         return sum(1 for count in groups.values() if count >= 2)
 
@@ -280,6 +285,28 @@ class PairPipeline:
             queued += 1
         return queued
 
+    def set_checkpoint(self, checkpoint: str) -> None:
+        """
+        Point the sampler at another model and throw the old queue away.
+
+        Everything queued was drawn against the previous checkpoint, and a pair
+        must compare two samples of the *same* model -- the sampler folds the
+        checkpoint into group_id for exactly that reason. Serving a stale pair
+        after a switch would silently log it under the new model's name.
+
+        Clips still in flight are dropped as they arrive; see _collect.
+
+        Args:
+          checkpoint (str): repo-relative checkpoint path.
+        """
+        if checkpoint == self.sampler.checkpoint:
+            return
+        self.sampler.set_checkpoint(checkpoint)
+        self._ready.clear()
+        self._inflight.clear()
+        self._backfill.clear()
+        self._clips.clear()
+
     def mark_rated(self, spec: PairSpec) -> None:
         """
         Record that a comparison has been judged.
@@ -359,8 +386,17 @@ class PairPipeline:
           PairSpec | None: a blinded pair from a banked group holding at least
             two clips, or None when there is no such group.
         """
+        # Only the model currently selected. The bank accumulates every
+        # checkpoint ever rated, and serving another one would make the
+        # selector a lie -- the rater would be told they are judging the model
+        # they picked while hearing an older one. The cost is that a freshly
+        # selected model has no banked structure material until the backfill
+        # lane makes some, which skipped_structure reports.
+        current = self.sampler.checkpoint
         groups: dict[str, list[ClipSpec]] = {}
         for spec in self.store.specs(Tier.STRUCTURE):
+            if spec.checkpoint and spec.checkpoint != current:
+                continue
             groups.setdefault(spec.group_id, []).append(spec)
         usable = [
             [
@@ -451,7 +487,20 @@ class PairPipeline:
         Args:
           timeout (float): seconds to wait for the first clip.
         """
+        expected = {
+            item
+            for spec in (*self._inflight.values(), *self._backfill.values())
+            for item in (spec.left.item_id, spec.right.item_id)
+        }
         for clip in self.producer.poll(timeout):
+            # A clip nobody is waiting for is one whose pair was thrown away --
+            # by a checkpoint switch, or by the quiet gate. Keeping it would
+            # grow the cache by ~8 MB per 90 s clip for the rest of the session.
+            # Filtering on the queue rather than on the checkpoint tag is what
+            # keeps banked pairs from an earlier model servable: they are still
+            # in flight, so they still land.
+            if clip.spec.item_id not in expected:
+                continue
             self._clips[clip.spec.item_id] = clip
 
     def _too_quiet(self, pair: Pair) -> bool:

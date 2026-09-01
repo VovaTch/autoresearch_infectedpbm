@@ -15,7 +15,13 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 from ab_harness.config import AbConfig
 from ab_harness.model.types import Clip, ClipSpec
-from ab_harness.worker.protocol import ClipRequest, ClipResult, Shutdown
+from ab_harness.worker.protocol import (
+    CheckpointChanged,
+    ClipRequest,
+    ClipResult,
+    Shutdown,
+    SwitchCheckpoint,
+)
 
 if TYPE_CHECKING:
     from ab_harness.worker.service import GenerationService
@@ -74,7 +80,38 @@ class InProcessClipProducer:
     def __init__(self, service: "GenerationService") -> None:
         self.service = service
         self._done: list[Clip] = []
+        self._change: CheckpointChanged | None = None
         self.errors: list[str] = []
+
+    @property
+    def checkpoint(self) -> str:
+        """
+        Returns:
+          str: the checkpoint currently being sampled from.
+        """
+        return self.service.checkpoint
+
+    def switch_checkpoint(self, checkpoint: str) -> None:
+        """
+        Args:
+          checkpoint (str): repo-relative checkpoint to sample from next.
+        """
+        try:
+            self.service.switch_checkpoint(checkpoint)
+            self._change = CheckpointChanged(checkpoint=self.service.checkpoint)
+        except Exception as exc:  # noqa: BLE001 - mirrors the subprocess path
+            self._change = CheckpointChanged(
+                checkpoint=self.service.checkpoint,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def take_checkpoint_change(self) -> CheckpointChanged | None:
+        """
+        Returns:
+          CheckpointChanged | None: the outcome of a switch, once.
+        """
+        change, self._change = self._change, None
+        return change
 
     def submit(self, specs: Sequence[ClipSpec]) -> None:
         """
@@ -126,6 +163,8 @@ class ProcessClipProducer:
             target=_child_entry, args=(cfg, self._requests, self._results), daemon=True
         )
         self._pending = 0
+        self._change: CheckpointChanged | None = None
+        self.checkpoint = cfg.generator.checkpoint
         self.errors: list[str] = []
 
     def start(self) -> None:
@@ -183,12 +222,40 @@ class ProcessClipProducer:
             except queue.Empty:
                 return out
             first = False
+            if isinstance(result, CheckpointChanged):
+                # Not a clip: it answers no request, so it owes no _pending.
+                self._change = result
+                self.checkpoint = result.checkpoint
+                if result.error:
+                    self.errors.append(result.error)
+                continue
             self._pending = max(0, self._pending - 1)
             clip = _to_clip(result)
             if clip is None:
                 self.errors.append(result.error)
             else:
                 out.append(clip)
+
+    def switch_checkpoint(self, checkpoint: str) -> None:
+        """
+        Ask the worker to sample from another model.
+
+        Queued behind whatever is already in flight, so clips drawn against the
+        old model still come back and can be discarded by the caller.
+
+        Args:
+          checkpoint (str): repo-relative checkpoint path.
+        """
+        self._requests.put(SwitchCheckpoint(checkpoint))
+
+    def take_checkpoint_change(self) -> CheckpointChanged | None:
+        """
+        Returns:
+          CheckpointChanged | None: the outcome of a switch collected by poll(),
+            once. None until the worker has finished loading.
+        """
+        change, self._change = self._change, None
+        return change
 
     def close(self) -> None:
         """Ask the worker to stop, then join it with a short grace period."""

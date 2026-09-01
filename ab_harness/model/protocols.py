@@ -44,6 +44,38 @@ class ClipProducer(Protocol):
         ...
 
 
+class CheckpointSwitchable(Protocol):
+    """
+    A producer whose model can be changed without restarting the session.
+
+    Kept apart from ClipProducer so the fakes in tests -- and bake_ab_bank.py,
+    which loads one model and exits -- stay complete without it.
+    """
+
+    @property
+    def checkpoint(self) -> str:
+        """
+        Returns:
+          str: the checkpoint currently being sampled from.
+        """
+        ...
+
+    def switch_checkpoint(self, checkpoint: str) -> None:
+        """
+        Args:
+          checkpoint (str): repo-relative checkpoint to sample from next.
+        """
+        ...
+
+    def take_checkpoint_change(self) -> object | None:
+        """
+        Returns:
+          object | None: a CheckpointChanged once the switch has resolved, then
+            None. Typed loosely so this module stays free of worker imports.
+        """
+        ...
+
+
 class TokenStore(Protocol):
     """Persistent store of generated token streams and their specs."""
 

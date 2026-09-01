@@ -1,0 +1,53 @@
+# First real DPO run: 6 wall-clock hours on the pairs banked up to 2026-08-30.
+# Derived from config_dpo.yaml; only the fields below differ.
+#
+#   uv run python train_dpo.py --config config_20260830_dpo6h.yaml --min-pairs 151
+#
+# Two documented caveats, both accepted deliberately for this run:
+#   * 151 usable pairs against section 7.5's 200-500, hence the --min-pairs
+#     override; min_pairs stays at 200 in the file so the default still refuses.
+#   * bulk self-agreement 0.786 over 14 repeats, just under section 7.6's ~0.80
+#     floor. Some of what this fits is rater noise. label_smoothing is the knob
+#     for that and stays at 0 here so the first run is the plain objective.
+
+pairs:
+  bank_root: ~/.cache/infected_pbm/ab
+  reference_checkpoint: saved_ar_20260829_24h/ar_frozen_0829.ckpt
+  restrict_to_reference_checkpoint: false
+  min_anchor_acc: 0.6
+  min_pairs: 200
+  val_frac: 0.25
+  tiers: null
+  split_seed: 1234
+
+dpo:
+  beta: 0.1
+  label_smoothing: 0.0
+  sft_weight: 0.0
+  length_normalize: false
+  trainable_blocks: 4
+  cache_ref: true
+
+train:
+  # -1 = unbounded; max_hours is the stopping rule. 113 train pairs at
+  # batch_pairs 2 is ~57 batches, ~14 optimizer steps per epoch, so six hours
+  # is hundreds of passes over the same pairs. What actually ends the run is
+  # whichever comes first: the clock, or the section 7.3 diversity gate.
+  epochs: -1
+  max_hours: 6.0
+  batch_pairs: 2
+  accumulate: 4
+  lr: 2.0e-6
+  weight_decay: 0.0
+  grad_clip: 1.0
+  precision: bf16-mixed
+  num_workers: 0
+  seed: 42
+  device: cuda:0
+  save_path: saved_dpo_20260830_6h/
+  # Probing every 25 optimizer steps is roughly every other epoch here, which
+  # is the resolution the gate needs to catch collapse before hours of it.
+  diversity_every: 25
+  diversity_clips: 6
+  diversity_seconds: 10.0
+  diversity_gate: 0.8

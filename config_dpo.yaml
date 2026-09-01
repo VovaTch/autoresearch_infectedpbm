@@ -1,0 +1,81 @@
+# DPO on the AR model from A/B judgements (PLAN_generative_stage.md section 7.4).
+#
+# This is rung 5 of the preference ladder and the one the plan warns about:
+# rung 4 (best-of-N) cannot collapse a policy it never updates, and this can.
+# The diversity gate below is not decoration -- pairwise data is structurally
+# blind to variety, so nothing else in the run would notice it going.
+#
+# Commands:
+#   uv run python train_dpo.py --config config_dpo.yaml --dry-run
+#   uv run python train_dpo.py --config config_dpo.yaml --smoke --min-pairs 1
+#   uv run python train_dpo.py --config config_dpo.yaml
+
+pairs:
+  bank_root: ~/.cache/infected_pbm/ab
+  # Both the policy initialization and the frozen reference. ar_frozen_0829 for
+  # the same reason config_ab.yaml points at it: val/loss bottoms near step 1500
+  # and is a memorization thermometer, so ar_best is a barely-trained model.
+  reference_checkpoint: saved_ar_20260829_24h/ar_frozen_0829.ckpt
+  # 61 of the banked pairs were sampled from ar_frozen_0829 and 31 from
+  # ar_latest. DPO is fine on off-policy pairs and this would throw away a
+  # third of the data, so it stays off until there is data to spare.
+  restrict_to_reference_checkpoint: false
+  # Section 7.6: a session that misses anchors was a fatigued session and its
+  # other rows are suspect too. Sessions with no anchors cannot be judged and
+  # are kept.
+  min_anchor_acc: 0.6
+  # Section 7.5 puts DPO signal at 200-500 pairs. The bank held 82 usable
+  # comparisons on 2026-08-29, so the first real run waits; --min-pairs is the
+  # deliberate override for smoke runs.
+  min_pairs: 200
+  # Held out by SESSION, not by row: both showings of a repeat, and every pair
+  # from one sitting, share the rater's state at that moment.
+  val_frac: 0.25
+  tiers: null              # null = both; ["bulk"] to train the fidelity axis alone
+  split_seed: 1234
+
+dpo:
+  beta: 0.1                # section 7.4
+  # Non-zero assumes that share of labels are flipped. Raise it only against a
+  # measured self-agreement rate -- section 7.6 calls below ~0.80 the point
+  # where label noise dominates and no capacity helps.
+  label_smoothing: 0.0
+  # NLL on the winner, the standard guard against DPO walking away from both
+  # sides of every pair. Costs some of the preference signal; off by default.
+  sft_weight: 0.0
+  # Both sides of a pair are the same length by construction, so summed
+  # log-probabilities are already comparable.
+  length_normalize: false
+  # Top blocks only. At a few hundred pairs the overfitting risk is the whole
+  # trunk moving; 12 (== n_layers) is the full-model recipe.
+  trainable_blocks: 4
+  # The bulk tier fits in one window, so its reference log-probabilities are
+  # deterministic and computed once for the whole run.
+  cache_ref: true
+
+train:
+  epochs: 8
+  # Each pair costs four forwards -- two sides, policy and reference -- so this
+  # is four times an AR batch of the same number. Long-clip batches dominate
+  # peak VRAM; accumulate rather than raising it.
+  batch_pairs: 2
+  accumulate: 4
+  # DPO over a few hundred pairs is a nudge, not a training run. No one-cycle.
+  lr: 2.0e-6
+  weight_decay: 0.0
+  grad_clip: 1.0
+  # Margins are differences of large sums, so log-probabilities are summed in
+  # float32 regardless of what this says.
+  precision: bf16-mixed
+  num_workers: 0           # the token corpus lives in RAM; workers would fork a copy
+  seed: 42
+  device: cuda:0
+  save_path: saved_dpo_<date>/
+  # Section 7.3. Every probe draws diversity_clips candidates from ONE fixed
+  # conditioning and measures how much they still differ; the run halts when
+  # that falls below diversity_gate x its step-0 value. 0 disables the gate,
+  # which the plan advises against.
+  diversity_every: 25
+  diversity_clips: 6
+  diversity_seconds: 10.0
+  diversity_gate: 0.8

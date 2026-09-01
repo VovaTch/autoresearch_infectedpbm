@@ -144,7 +144,12 @@ def main() -> int:
     )
     player = PlayerViewModel(sample_rate, cfg.session.crossfade_ms)
     session = SessionViewModel(pipeline, log, cfg.session.target_lufs, session_id)
-    window = MainWindow(session, player, quiet_fill=cfg.session.quiet_fill)
+    window = MainWindow(
+        session,
+        player,
+        quiet_fill=cfg.session.quiet_fill,
+        checkpoints=cfg.checkpoints,
+    )
     window.show()
     session.start()
 

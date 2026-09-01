@@ -15,10 +15,21 @@ bank:
   root: ~/.cache/infected_pbm/ab   # beside tracks/ and tokens_*/, which it points into
 
 generator:
-  # ar_latest, not ar_best: config_20260829_ar24h.yaml records val/loss bottoming
-  # near step 1500 and rising after, so ar_best is pinned to a barely-trained
-  # model. At this corpus size val CE is a memorization thermometer.
-  checkpoint: saved_ar_20260829_24h/ar_frozen_0829.ckpt
+  # auto = the newest checkpoint ab_harness.checkpoints finds, which is the last
+  # DPO run's dpo_latest.ckpt while one exists and an AR checkpoint otherwise.
+  # Preference fine-tuning is meant to replace the model being rated, so a fresh
+  # DPO run becomes what the harness serves without a config edit -- ratings
+  # collected against a superseded generator are listening spent on nothing.
+  #
+  # The selector in the status bar switches this mid-session; the queue is
+  # dropped on the switch, because a pair has to compare two samples of one
+  # model (the sampler folds the checkpoint into group_id). Every clip is tagged
+  # with the checkpoint that produced it, so pairs stay separable afterwards.
+  #
+  # Pin a path here to override. Prefer a *_latest over a *_best: val/loss
+  # bottoms near step 1500 (config_20260829_ar24h.yaml) and DPO val/acc is a
+  # random walk on 38 pairs, so "best" selects a barely-trained model.
+  checkpoint: auto
   decoder_onnx: onnx/decoder.onnx
   device: cuda:0
   window_frames: 4096       # == crop_frames; sampling stays inside trained geometry

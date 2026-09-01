@@ -44,6 +44,7 @@ class SessionViewModel(QObject):
     rejected_changed = Signal(int)
     counts_changed = Signal(int)
     worklist_changed = Signal(list)
+    checkpoint_changed = Signal(str, str)
 
     def __init__(
         self,
@@ -117,11 +118,62 @@ class SessionViewModel(QObject):
 
     def _pump(self) -> None:
         """Keep the queue moving, and pick up a pair if one was being waited on."""
+        self._poll_checkpoint()
         if self._pair is None or self._waiting:
             self.advance()
             return
         self.pipeline.pump()
         self._emit_queue()
+
+    # -- checkpoint ----------------------------------------------------------
+
+    @property
+    def checkpoint(self) -> str:
+        """
+        Returns:
+          str: the checkpoint new pairs are being drawn against.
+        """
+        return self.pipeline.sampler.checkpoint
+
+    def switch_checkpoint(self, checkpoint: str) -> None:
+        """
+        Rate a different model from here on.
+
+        The queue is dropped before the worker is told, in that order: the
+        sampler must be tagging draws with the new checkpoint before any new
+        spec is submitted, and the request queue is FIFO, so the switch lands
+        ahead of them at the worker.
+
+        The pair on screen is dropped unrated. It was drawn against the old
+        model, and logging it under the new one is the failure this exists to
+        prevent.
+
+        Args:
+          checkpoint (str): repo-relative checkpoint path.
+        """
+        producer = getattr(self.pipeline, "producer", None)
+        switch = getattr(producer, "switch_checkpoint", None)
+        if switch is None or checkpoint == self.checkpoint:
+            return
+        self._pair = None
+        self.pipeline.set_checkpoint(checkpoint)
+        switch(checkpoint)
+        self._set_waiting(True)
+        self._emit_queue()
+
+    def _poll_checkpoint(self) -> None:
+        """Report a finished switch, so a failed load is visible rather than mute."""
+        producer = self.pipeline.producer
+        take = getattr(producer, "take_checkpoint_change", None)
+        change = take() if take is not None else None
+        if change is None:
+            return
+        loaded = getattr(change, "checkpoint", "")
+        error = getattr(change, "error", "")
+        if error:
+            # The worker kept the model it had; follow it rather than pretending.
+            self.pipeline.set_checkpoint(loaded)
+        self.checkpoint_changed.emit(loaded, error)
 
     def _set_waiting(self, value: bool) -> None:
         """
