@@ -47,7 +47,11 @@ from prepare import (
     chroma_cosine_distance,
     make_cdpam_evaluator,
     multi_res_stft_distance,
+    envelope_distance,
+    frame_periodicity,
     phase_distance,
+    spectral_frame_mean,
+    stft_consistency,
 )
 
 # ===========================================================================
@@ -705,6 +709,111 @@ class PhaseLoss:
 
 
 @dataclass
+class STFTConsistencyLoss:
+    """Penalizes a predicted spectrogram that is not the STFT of any real signal.
+
+    The decoder head emits a free complex STFT at 4x overlap and hands it to a
+    plain weighted overlap-add, so most of what it predicts is unrealizable and
+    is destroyed on synthesis (measured 0.51 relative L1 vs a 0.0005 real-audio
+    floor). Unlike PhaseLoss this needs no target and is shift-equivariant, so
+    it is well-posed as a loss rather than only as a diagnostic.
+
+    Reads the decoder's stashed pre-synthesis pair, not `slice`: the final output
+    passes through _end_conv, which the consistency identity does not cover.
+    """
+
+    name: str
+    weight: float
+    pred_key: str = "dec_spec"
+    ref_key: str = "dec_istft"
+    n_fft: int = 1024
+    hop: int = 256
+    differentiable: bool = True
+
+    def __call__(self, estimation, _target):
+        spec = estimation.get(self.pred_key)
+        wav = estimation.get(self.ref_key)
+        if spec is None or wav is None:  # non-STFT decoder: inert
+            return torch.zeros((), device=estimation["slice"].device)
+        return stft_consistency(spec, wav, n_fft=self.n_fft, hop=self.hop)
+
+
+@dataclass
+class EnvelopeLoss:
+    """Multi-scale log fine-envelope L1 -- direct handle on the crest excess.
+
+    Every magnitude term (mel/mrstft/chroma) fixes per-frame energy and is blind
+    to how it sits inside the frame; rec_l2 sees it but is dominated by absolute
+    alignment. This compares the rectified waveform smoothed at 1.5-23 ms, so
+    inter-harmonic phase that beats (thin, peaky, +2.5 dB crest) is penalized
+    while a sample-level offset is not. No target phase needed. Differentiable.
+    """
+
+    name: str
+    weight: float
+    pred_key: str = "slice"
+    ref_key: str = "slice"
+    windows: tuple[int, ...] = (64, 256, 1024)
+    differentiable: bool = True
+
+    def __call__(self, estimation, target):
+        return envelope_distance(
+            estimation[self.pred_key], target[self.ref_key], windows=self.windows
+        )
+
+
+@dataclass
+class FramePeriodicityLoss:
+    """Excess hop-periodic content in the output -- the BUZZ term, end to end.
+
+    relu(coherence(pred) - coherence(target)) so legitimately periodic material
+    (a tone at a multiple of the frame rate) is not punished. See
+    prepare.frame_periodicity. Differentiable.
+    """
+
+    name: str
+    weight: float
+    pred_key: str = "slice"
+    ref_key: str = "slice"
+    period: int = 256
+    differentiable: bool = True
+
+    def __call__(self, estimation, target):
+        excess = frame_periodicity(estimation[self.pred_key], self.period) - frame_periodicity(
+            target[self.ref_key], self.period
+        )
+        return F.relu(excess).mean()
+
+
+@dataclass
+class SpectralFrameMeanLoss:
+    """Constant-over-time complex offset in the decoder's predicted STFT -- the
+    buzz at its source (see prepare.spectral_frame_mean). Excess over the same
+    statistic of the target's STFT, since the finite-frame floor scales with
+    1/sqrt(T) (~0.12 at 128 frames). Reads `dec_spec`; inert on a non-STFT decoder.
+    """
+
+    name: str
+    weight: float
+    pred_key: str = "dec_spec"
+    ref_key: str = "slice"
+    n_fft: int = 1024
+    hop: int = 256
+    differentiable: bool = True
+
+    def __call__(self, estimation, target):
+        spec = estimation.get(self.pred_key)
+        if spec is None:
+            return torch.zeros((), device=estimation["slice"].device)
+        ref = target[self.ref_key].float().squeeze(1)
+        window = torch.hann_window(self.n_fft, device=ref.device)
+        ref_spec = torch.stft(
+            ref, n_fft=self.n_fft, hop_length=self.hop, window=window, return_complex=True
+        )
+        return F.relu(spectral_frame_mean(spec) - spectral_frame_mean(ref_spec))
+
+
+@dataclass
 class DiscriminatorHingeLoss:
     name: str
     weight: float
@@ -1345,6 +1454,10 @@ class TemporalDecoder(DecoderBase):
         )
         self._proj_spec = nn.Conv1d(hidden, out_dim, kernel_size=7, padding=3)
         self._istft = ISTFT(n_fft, hop_length, win_length, padding="same")
+        self._stft_n_fft = n_fft
+        self._stft_hop = hop_length
+        self.last_spec: torch.Tensor | None = None
+        self.last_istft: torch.Tensor | None = None
         self._end_conv = nn.Sequential(
             nn.Conv1d(1, output_conv_hidden_dim, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2),
@@ -1369,6 +1482,11 @@ class TemporalDecoder(DecoderBase):
         b = self._spec_bins
         complex_spec = torch.complex(spec[:, :b], spec[:, b:])
         y = self._istft(complex_spec).unsqueeze(1)  # (B, 1, L)
+        # Kept for STFTConsistencyLoss: the (B,F,T) spectrogram this head asked
+        # for, and the waveform overlap-add actually produced from it. The pair
+        # is only comparable through the SAME operator, so both are stashed.
+        self.last_spec = complex_spec
+        self.last_istft = y
         # fp32 output: the loss stack (mrstft/chroma/melspec) runs torch.stft on it.
         return self._end_conv(y.to(self._end_conv[0].weight.dtype)).float()
 
@@ -1456,6 +1574,10 @@ class MultiLvlVQVariationalAutoEncoder(Tokenizer):
             origin_shape = (int(z_e.shape[0]), self.input_channels, -1)
         x_out = x_out.permute((0, 2, 1)).contiguous().reshape(origin_shape)
         total_output = {**vq_block_output, "slice": x_out}
+        spec = getattr(self.decoder, "last_spec", None)
+        if spec is not None:
+            total_output["dec_spec"] = spec
+            total_output["dec_istft"] = self.decoder.last_istft
         return x_out, total_output
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -1619,6 +1741,156 @@ class WaveformDiscriminator(DiscriminatorBase):
         return self._last_conv
 
 
+class PeriodDiscriminator(DiscriminatorBase):
+    """
+    One HiFi-GAN period critic: folds the waveform into (L / period, period) and
+    runs 2D convs that stride only along the fold axis, so every column of the
+    kernel sees samples exactly `period` apart. Phase between harmonics shows up
+    directly as the pattern across the period axis -- the thing the mel critics
+    (magnitude only) and the pooled waveform critic (1024x time collapse) miss.
+
+    Args:
+      period (int): fold length in samples.
+      channel_list (list[int]): output channels per strided conv layer.
+      kernel_size (int): kernel extent along the fold axis (width is 1).
+      stride (int): stride along the fold axis.
+      activation_fn (nn.Module): activation between conv layers.
+    """
+
+    def __init__(
+        self,
+        period: int,
+        channel_list: list[int],
+        kernel_size: int = 5,
+        stride: int = 3,
+        activation_fn: nn.Module = nn.GELU(),
+    ) -> None:
+        super().__init__()
+        self.period = period
+        layers: list[nn.Module] = []
+        chans = [1] + list(channel_list)
+        for idx in range(len(channel_list)):
+            layers.append(
+                nn.Conv2d(
+                    chans[idx],
+                    chans[idx + 1],
+                    kernel_size=(kernel_size, 1),
+                    stride=(stride, 1),
+                    padding=(kernel_size // 2, 0),
+                )
+            )
+            layers.append(activation_fn)
+        self.model = nn.Sequential(*layers)
+        self._last_conv = nn.Conv2d(
+            channel_list[-1], 1, kernel_size=(3, 1), padding=(1, 0)
+        )
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = x.to(self._last_conv.weight.dtype)
+        batch, chans, length = x.shape
+        pad = (-length) % self.period
+        if pad:
+            x = F.pad(x, (0, pad), mode="reflect")
+        x = x.view(batch, chans, -1, self.period)
+        x = self._last_conv(self.model(x))
+        return {"logits": x.permute(0, 2, 3, 1).flatten(1, 2).contiguous()}
+
+    @property
+    def last_layer(self) -> nn.Module:
+        return self._last_conv
+
+
+class StftDiscriminator(DiscriminatorBase):
+    """
+    One multi-resolution complex-STFT critic (EnCodec MS-STFT / Vocos MRD style).
+
+    Sees the raw linear-frequency STFT at FULL bin resolution as three channels --
+    log-magnitude, cos(phase), sin(phase) -- so fine per-bin structure between
+    harmonics and the phase of every partial are visible directly. The mel critics
+    pool 128-512 bands and see no phase; the waveform critic collapses time 1024x.
+    The first conv works at full bin resolution; later layers stride 2 in both axes
+    (full-res everywhere measured 4x slower training, 2026-09-13).
+
+    Args:
+      n_fft (int): FFT size of the analysis STFT.
+      hop_length (int): STFT hop.
+      channels (int): conv channels (constant through the stack).
+      kernel_size (tuple[int, int]): (freq, time) kernel extent.
+      strides (Sequence[tuple[int, int]]): (freq, time) stride per conv layer.
+      time_dilations (Sequence[int]): time dilation per conv layer.
+      freq_pool (int): average-pool the logit map over this many bins so one
+        critic emits a few hundred logits, not thousands -- keeps the hinge mean
+        balanced against the ~640 legacy logits.
+      activation_fn (nn.Module): activation between conv layers.
+    """
+
+    def __init__(
+        self,
+        n_fft: int,
+        hop_length: int,
+        channels: int,
+        kernel_size: tuple[int, int] = (3, 5),
+        strides: Sequence[tuple[int, int]] = ((1, 1), (2, 2), (2, 2), (1, 2)),
+        time_dilations: Sequence[int] = (1, 1, 2, 4),
+        freq_pool: int = 8,
+        activation_fn: nn.Module = nn.GELU(),
+    ) -> None:
+        super().__init__()
+        if len(strides) != len(time_dilations):
+            raise ValueError("strides and time_dilations must have one entry per layer")
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self._freq_pool = freq_pool
+        self.register_buffer("window", torch.hann_window(n_fft))
+        layers: list[nn.Module] = []
+        in_ch = 3
+        kf, kt = kernel_size
+        for stride, dil in zip(strides, time_dilations):
+            layers.append(
+                nn.Conv2d(
+                    in_ch,
+                    channels,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    dilation=(1, dil),
+                    padding=(kf // 2, (kt // 2) * dil),
+                )
+            )
+            layers.append(activation_fn)
+            in_ch = channels
+        self.model = nn.Sequential(*layers)
+        self._last_conv = nn.Conv2d(channels, 1, kernel_size=(3, 3), padding=1)
+
+    def _features(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+          x (torch.Tensor): (B, 1, L) waveform.
+
+        Returns:
+          torch.Tensor: (B, 3, F, T) log-magnitude, cos(phase), sin(phase).
+        """
+        spec = torch.stft(
+            x.squeeze(1).float(),
+            self.n_fft,
+            self.hop_length,
+            window=self.window,  # type: ignore
+            return_complex=True,
+        )
+        mag = spec.abs()
+        unit = spec / (mag + 1e-6)
+        return torch.stack([torch.log(mag + 1e-4), unit.real, unit.imag], dim=1)
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        feats = self._features(x).to(self._last_conv.weight.dtype)
+        logits = self._last_conv(self.model(feats))
+        logits = F.avg_pool2d(logits, (self._freq_pool, 1), ceil_mode=True)
+        return {"logits": logits.permute(0, 2, 3, 1).flatten(1, 2).contiguous()}
+
+    @property
+    def last_layer(self) -> nn.Module:
+        return self._last_conv
+
+
 class EnsembleDiscriminator(DiscriminatorBase):
     def __init__(self, discriminators: list) -> None:
         super().__init__()
@@ -1626,6 +1898,7 @@ class EnsembleDiscriminator(DiscriminatorBase):
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         discriminator_output = [d.forward(x)["logits"] for d in self._discriminators]
+        self.logit_counts = [o.shape[1] for o in discriminator_output]
         concatenated_output = torch.cat(discriminator_output, dim=1)
         return {"logits": concatenated_output}
 
@@ -1847,6 +2120,10 @@ class VqganMusicLightningModule(MusicLightningModule):
         generator_loss,
         generator_start_step: int = 10000,
         disc_warmup: int = 0,
+        disc_only_steps: int = 0,
+        disc_clip: str = "global",
+        disc_lr_mult: float = 1.0,
+        disc_steps: int = 1,
         d_weight_cap: float = 1e4,
         transforms: nn.Sequential | None = None,
         loss_aggregator=None,
@@ -1866,6 +2143,25 @@ class VqganMusicLightningModule(MusicLightningModule):
         # Disc trains alone for `disc_warmup` steps before generator gets the adversarial
         # gradient — gives the cold discriminator a head start vs the converged generator.
         self._disc_warmup = disc_warmup
+        # Critic-only phase at the start of THIS run (counted from the restored step):
+        # generator frozen while fresh / re-shaped critics catch up. Without it a
+        # warm start with new critics trains the generator adversary-free for hours
+        # (GAN-off artefact: metrics improve, sound degrades).
+        self._disc_only_steps = disc_only_steps
+        self._disc_only_until = 0
+        # "global": one norm-1 clip over the whole ensemble (legacy) -- the critic
+        # with the largest gradient owns the budget and starves the rest (fresh STFT
+        # critics stuck at AUC 0.55 while learnable offline, 2026-09-13).
+        # "per_critic": clip each sub-discriminator to norm 1 on its own.
+        if disc_clip not in ("global", "per_critic"):
+            raise ValueError("disc_clip must be 'global' or 'per_critic'")
+        self._disc_clip = disc_clip
+        # TTUR: critic LR = generator LR x this (peak and schedule alike). Small fresh
+        # critics separate at LR 1e-4 with G frozen, then collapse to a constant
+        # output within ~300 joint steps at d_weight 5 (2026-09-13 mrd smoke).
+        self._disc_lr_mult = disc_lr_mult
+        # critic optimizer steps per generator step (same batch, G frozen in between)
+        self._disc_steps = max(1, int(disc_steps))
         # Upper clamp on the adaptive adversarial weight. The raw ratio
         # ‖∇rec‖/‖∇gen‖ runs away to a huge ceiling once gen grads shrink, which
         # dumps an overwhelming adversarial gradient that wrecks reconstruction
@@ -1892,6 +2188,11 @@ class VqganMusicLightningModule(MusicLightningModule):
     def generator(self) -> MultiLvlVQVariationalAutoEncoder:
         return self.model  # type: ignore
 
+    def on_train_start(self) -> None:
+        self._disc_only_until = int(self._current_step) + self._disc_only_steps
+        if self._disc_only_steps:
+            print(f"  critic-only phase until step {self._disc_only_until}", flush=True)
+
     def _build_optimizer_gan(
         self, optimizer_cfg, model_part: ModelPart
     ) -> torch.optim.Optimizer:
@@ -1904,6 +2205,8 @@ class VqganMusicLightningModule(MusicLightningModule):
 
         if optimizer_cfg is not None and optimizer_cfg["target"] != "none":
             filtered = {k: v for k, v in optimizer_cfg.items() if k != "target"}
+            if model_part == ModelPart.DISCRIMINATOR and "lr" in filtered:
+                filtered["lr"] = filtered["lr"] * self._disc_lr_mult
             target = optimizer_cfg["target"]
             optimizer = getattr(
                 importlib.import_module(".".join(target.split(".")[:-1])),
@@ -1933,6 +2236,8 @@ class VqganMusicLightningModule(MusicLightningModule):
             for k, v in scheduler_cfg.items()
             if k not in ["target", "module_params"]
         }
+        if model_part == ModelPart.DISCRIMINATOR and "max_lr" in filtered:
+            filtered["max_lr"] = filtered["max_lr"] * self._disc_lr_mult
         target = scheduler_cfg["target"]
         return getattr(
             importlib.import_module(".".join(target.split(".")[:-1])),
@@ -1981,7 +2286,19 @@ class VqganMusicLightningModule(MusicLightningModule):
             scheduler_d, scheduler_g = scheduler_list  # type: ignore
 
         if self._current_step >= self._generator_start_step or phase != "training":
-            self._discriminator_step(batch, phase, optimizer_d, scheduler_d)
+            for _ in range(self._disc_steps if phase == "training" else 1):
+                self._discriminator_step(batch, phase, optimizer_d, scheduler_d)
+        if phase == "training" and self._current_step < self._disc_only_until:
+            self.log("d_weight", -1.0, sync_dist=True)  # marker: generator frozen
+            return None
+        if (
+            phase == "training"
+            and self._disc_only_steps
+            and self._current_step == self._disc_only_until
+            and isinstance(scheduler_g, TimeOneCycleLR)
+        ):
+            scheduler_g.restart()  # generator warm-up begins now, not at t=0
+            print(f"  joint training from step {int(self._current_step)}", flush=True)
         return self._generator_step(batch, phase, optimizer_g, scheduler_g)
 
     def _close_generator_phase(
@@ -2009,11 +2326,19 @@ class VqganMusicLightningModule(MusicLightningModule):
         }
         disc_outputs.update(restructured_outputs_frozen)
         disc_loss = self._discriminator_loss(disc_outputs, {})
+        if phase == "training":
+            self._log_per_critic_hinge(
+                disc_outputs_real["logits"][..., 0], disc_outputs_fake["logits"][..., 0]
+            )
         if phase == "training" and self._current_step >= self._generator_start_step:
             self.manual_backward(disc_loss * self._discriminator_loss.weight)
-            self.clip_gradients(
-                optimizer_d, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
-            )
+            if self._disc_clip == "per_critic":
+                for critic in self.discriminator._discriminators:
+                    torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+            else:
+                self.clip_gradients(
+                    optimizer_d, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+                )
             optimizer_d.step()
             optimizer_d.zero_grad()
         self.log(
@@ -2025,6 +2350,24 @@ class VqganMusicLightningModule(MusicLightningModule):
         if scheduler_d is not None and phase == "training":
             scheduler_d.step()  # type: ignore
         self.untoggle_optimizer(optimizer_d)
+
+    def _log_per_critic_hinge(self, real: torch.Tensor, fake: torch.Tensor) -> None:
+        """
+        Log each sub-critic's own hinge loss (1.0 = blind / constant output).
+
+        Args:
+          real (torch.Tensor): (B, N) concatenated real logits.
+          fake (torch.Tensor): (B, N) concatenated fake logits.
+        """
+        counts = getattr(self.discriminator, "logit_counts", None)
+        if counts is None or len(counts) < 2:
+            return
+        start = 0
+        for idx, n in enumerate(counts):
+            r, f = real[:, start : start + n], fake[:, start : start + n]
+            hinge = 0.5 * (F.relu(1 - r).mean() + F.relu(1 + f).mean())
+            self.log(f"critic_hinge/d{idx}", hinge.detach(), sync_dist=True)
+            start += n
 
     def _generator_step(
         self, batch, phase, optimizer_g, scheduler_g
@@ -2180,6 +2523,22 @@ class TimeOneCycleLR(torch.optim.lr_scheduler.LRScheduler):
         self._start: float | None = None
         super().__init__(optimizer, last_epoch)
 
+    def restart(self) -> None:
+        """
+        Restart the cycle now over the time that is left: the warm-up ramp runs
+        again from initial_lr. Used when the generator starts stepping after a
+        critic-only phase, so its fresh Adam state does not meet peak LR.
+        """
+        import time
+
+        if self._start is not None:
+            self.total_seconds = max(
+                self.total_seconds - (time.monotonic() - self._start), 1e-8
+            )
+        self._start = None
+        for group, lr in zip(self.optimizer.param_groups, self.get_lr()):
+            group["lr"] = lr
+
     def get_lr(self):
         import math
         import time
@@ -2226,7 +2585,27 @@ def build_scheduler_cfg(
     }
 
 
-def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
+def build_loss_aggregator(
+    commit_weight: float = 0.75,
+    consistency_weight: float = 0.0,
+    envelope_weight: float = 0.0,
+    periodicity_weight: float = 0.0,
+    spec_mean_weight: float = 0.0,
+) -> WeightedSumAggregator:
+    """
+    Assemble the weighted-sum reconstruction loss.
+
+    Args:
+      commit_weight (float): VQ commitment weight (anchors z_e to the codebook).
+      consistency_weight (float): STFT-consistency weight. 0 logs it as a
+        diagnostic without steering training.
+      envelope_weight (float): fine-envelope (crest) weight. 0 logs only.
+      periodicity_weight (float): hop-periodic (buzz) excess on the output. 0 logs only.
+      spec_mean_weight (float): constant complex offset in the predicted STFT. 0 logs only.
+
+    Returns:
+      WeightedSumAggregator: the loss stack.
+    """
     def make_mel_converter(
         n_fft, hop_length, n_mels, power, norm="slaney", mel_scale="htk"
     ) -> SimpleMelSpecConverter:
@@ -2356,6 +2735,30 @@ def build_loss_aggregator(commit_weight: float = 0.75) -> WeightedSumAggregator:
             pred_key="slice",
             ref_key="slice",
         ),
+        # STFT CONSISTENCY -- the well-posed version of the phase constraint the
+        # weight-0 PhaseLoss above was reaching for. Registered at weight 0 so it
+        # logs as a diagnostic on every run; raise it from a config to test.
+        STFTConsistencyLoss(
+            name="consistency",
+            weight=consistency_weight,
+        ),
+        # FINE ENVELOPE -- sub-frame body/crest term (see EnvelopeLoss). Weight 0
+        # logs it as a diagnostic; raise from a config (loss.envelope_weight).
+        EnvelopeLoss(
+            name="envelope",
+            weight=envelope_weight,
+        ),
+        # BUZZ -- hop-periodic template the STFT head emits (2026-09-12 root
+        # cause of the 172 Hz-harmonic buzz). End-to-end term on the output and
+        # source term on the head; both logged at weight 0.
+        FramePeriodicityLoss(
+            name="periodicity",
+            weight=periodicity_weight,
+        ),
+        SpectralFrameMeanLoss(
+            name="spec_mean",
+            weight=spec_mean_weight,
+        ),
     ]
     return WeightedSumAggregator(components)
 
@@ -2424,14 +2827,44 @@ def _spectralize_disc(module: nn.Module) -> nn.Module:
     return module
 
 
+def _weight_norm_disc(module: nn.Module) -> nn.Module:
+    """HiFi-GAN-style hygiene for the period critics: weight_norm on every conv,
+    no Lipschitz cap. Spectral norm starves a plain conv stack (no residual path)
+    of gain -- measured 2026-09-12: 5 period critics at AUC 0.52-0.62 after 9.5 h
+    with logit gaps of 0.01-0.05, i.e. dead. Recurses, mutates in place."""
+    from torch.nn.utils.parametrizations import weight_norm
+
+    for name, child in list(module.named_children()):
+        if isinstance(child, (nn.Conv1d, nn.Conv2d)):
+            setattr(module, name, weight_norm(child))
+        else:
+            _weight_norm_disc(child)
+    return module
+
+
 def build_discriminator(
-    disc_width: int = 1, disc_freq_pool: int = 5
+    disc_width: int = 1,
+    disc_freq_pool: int = 5,
+    disc_periods: Sequence[int] = (),
+    period_norm: str = "spectral",
+    disc_stft_resolutions: Sequence[Sequence[int]] = (),
 ) -> EnsembleDiscriminator:
     """
-    Build the 4-way critic ensemble (3 mel scales + 1 raw waveform).
+    Build the critic ensemble: 3 mel scales + 1 raw waveform, plus one
+    HiFi-GAN period critic per entry of `disc_periods`, plus one complex-STFT
+    critic per (n_fft, hop) in `disc_stft_resolutions`.
 
     Args:
       disc_width (int): channel multiplier for every sub-discriminator.
+      disc_periods (Sequence[int]): fold lengths for PeriodDiscriminators
+        (HiFi-GAN default (2, 3, 5, 7, 11)). Empty = legacy 4-way ensemble.
+        Appended AFTER disc4 so a warm start from a period-less checkpoint
+        keeps the mel/waveform critics and inits only the new ones.
+      period_norm (str): conv normalisation for the period critics only:
+        "spectral" (legacy, gain-starved -- see _weight_norm_disc), "weight"
+        (HiFi-GAN recipe) or "none". The four legacy critics always get SN.
+      disc_stft_resolutions (Sequence[Sequence[int]]): (n_fft, hop) pairs for
+        StftDiscriminators (weight-normed, appended last). Empty = none.
       disc_freq_pool (int): how many of the 5 mel conv layers stride in the
         FREQUENCY axis. The remaining layers stride in time only, so the mel
         critics keep frequency resolution and emit a per-band verdict. At the
@@ -2496,8 +2929,29 @@ def build_discriminator(
         input_channels=1,
         activation_fn=nn.GELU(),
     )
+    period_discs = [
+        PeriodDiscriminator(
+            period=p,
+            channel_list=[8 * w, 32 * w, 128 * w, 256 * w, 256 * w],
+            activation_fn=nn.GELU(),
+        )
+        for p in disc_periods
+    ]
+    stft_discs = [
+        StftDiscriminator(n_fft=n_fft, hop_length=hop, channels=32 * w)
+        for n_fft, hop in disc_stft_resolutions
+    ]
+    norm_fn = {
+        "spectral": _spectralize_disc,
+        "weight": _weight_norm_disc,
+        "none": lambda d: d,
+    }
+    if period_norm not in norm_fn:
+        raise ValueError(f"period_norm must be one of {sorted(norm_fn)}")
     return EnsembleDiscriminator(
         [_spectralize_disc(d) for d in (disc1, disc2, disc3, disc4)]
+        + [norm_fn[period_norm](d) for d in period_discs]
+        + [_weight_norm_disc(d) for d in stft_discs]
     )
 
 
@@ -2513,8 +2967,15 @@ def build_module(
     time_downsample: int = 1,
     disc_width: int = 1,
     disc_freq_pool: int = 5,
+    disc_periods: Sequence[int] = (),
+    period_norm: str = "spectral",
+    disc_stft_resolutions: Sequence[Sequence[int]] = (),
     d_weight_cap: float = 1.0,
     disc_warmup: int = 0,
+    disc_only_steps: int = 0,
+    disc_clip: str = "global",
+    disc_lr_mult: float = 1.0,
+    disc_steps: int = 1,
     hidden: int = 1024,
     ze_norm: str = "none",
     per_level_codebooks: bool = False,
@@ -2530,7 +2991,11 @@ def build_module(
         per_level_codebooks=per_level_codebooks,
     )
     discriminator = build_discriminator(
-        disc_width=disc_width, disc_freq_pool=disc_freq_pool
+        disc_width=disc_width,
+        disc_freq_pool=disc_freq_pool,
+        disc_periods=disc_periods,
+        period_norm=period_norm,
+        disc_stft_resolutions=disc_stft_resolutions,
     )
 
     discriminator_loss = DiscriminatorHingeLoss(
@@ -2553,6 +3018,10 @@ def build_module(
         generator_loss=generator_loss,
         generator_start_step=gss,
         disc_warmup=disc_warmup,
+        disc_only_steps=disc_only_steps,
+        disc_clip=disc_clip,
+        disc_lr_mult=disc_lr_mult,
+        disc_steps=disc_steps,
         d_weight_cap=d_weight_cap,
         loss_aggregator=loss_aggregator,
         optimizer_cfg=optimizer_cfg,
@@ -2604,7 +3073,13 @@ def main() -> None:
         pct_start=tr["lr_pct_start"],
         div_factor=tr.get("lr_div_factor", 25.0),
     )
-    loss_aggregator = build_loss_aggregator(commit_weight=vq["commit_weight"])
+    loss_aggregator = build_loss_aggregator(
+        commit_weight=vq["commit_weight"],
+        consistency_weight=cfg.get("loss", {}).get("consistency_weight", 0.0),
+        envelope_weight=cfg.get("loss", {}).get("envelope_weight", 0.0),
+        periodicity_weight=cfg.get("loss", {}).get("periodicity_weight", 0.0),
+        spec_mean_weight=cfg.get("loss", {}).get("spec_mean_weight", 0.0),
+    )
 
     print("Initializing data...")
     data_module = build_data_module(learning_params)
@@ -2639,8 +3114,23 @@ def main() -> None:
         disc_width=gan["disc_width"],
         # 5 = legacy (freq axis collapses 32x); lower keeps mel resolution.
         disc_freq_pool=gan.get("disc_freq_pool", 5),
+        # HiFi-GAN period critics (phase-aware); empty = legacy 4-way ensemble.
+        disc_periods=tuple(gan.get("disc_periods", ())),
+        period_norm=gan.get("period_norm", "spectral"),
+        # complex-STFT critics, [[n_fft, hop], ...]; empty = none.
+        disc_stft_resolutions=tuple(
+            tuple(r) for r in gan.get("disc_stft_resolutions", ())
+        ),
         d_weight_cap=gan["d_weight_cap"],
         disc_warmup=gan.get("disc_warmup", 0),
+        # critic-only steps at the start of this run (fresh critics catch up first)
+        disc_only_steps=gan.get("disc_only_steps", 0),
+        # "global" (legacy, one clip over the ensemble) or "per_critic"
+        disc_clip=gan.get("disc_clip", "global"),
+        # TTUR: critic LR multiplier (peak + schedule)
+        disc_lr_mult=gan.get("disc_lr_mult", 1.0),
+        # critic steps per generator step
+        disc_steps=gan.get("disc_steps", 1),
         hidden=m["hidden"],
         per_level_codebooks=m.get("per_level_codebooks", False),
         # DEFAULT none since 2026-07-15: from-scratch race (fixed codebook,
@@ -2682,6 +3172,17 @@ def main() -> None:
                 f"{tuple(state_dict[cb_key].shape)}"
             )
         # strict=False so the generator can resume into a fresh discriminator.
+        # A critic whose SHAPE changed (disc_width, disc_freq_pool) would still
+        # error on copy, so drop those keys: that critic re-inits, the rest load.
+        own = module.state_dict()
+        mismatched = [
+            k
+            for k, v in state_dict.items()
+            if k.startswith("discriminator") and k in own and own[k].shape != v.shape
+        ]
+        if mismatched:
+            state_dict = {k: v for k, v in state_dict.items() if k not in mismatched}
+            print(f"  dropped {len(mismatched)} shape-mismatched critic keys (critic re-inits)")
         result = module.load_state_dict(state_dict, strict=False)
         miss = [k for k in result.missing_keys if not k.startswith("discriminator")]
         unexp = [k for k in result.unexpected_keys if not k.startswith("discriminator")]

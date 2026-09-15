@@ -118,12 +118,15 @@ def test_cache_overflow_raises_rather_than_corrupting(
 # -- sampler parity ----------------------------------------------------------
 
 
-def _style() -> torch.Tensor:
+def _style(seed: int = 1) -> torch.Tensor:
     """
+    Args:
+      seed (int): which fixed descriptor.
+
     Returns:
       torch.Tensor: (STYLE_DIM,) a fixed style descriptor.
     """
-    torch.manual_seed(1)
+    torch.manual_seed(seed)
     return torch.randn(1, STYLE_DIM)[0]
 
 
@@ -413,3 +416,170 @@ def test_prompts_shorter_than_the_rvq_depth_are_still_clean(
     )
     assert int(out.max()) < VOCAB
     assert torch.equal(out[:prompt_frames], prompt)
+
+
+# -- coexisting track ids ------------------------------------------------------
+
+
+def _prefix_kv(
+    model: ArTransformer, ids: list[int], extra: list[int]
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Args:
+      model (ArTransformer): the network.
+      ids (list[int]): primary id per row.
+      extra (list[int]): extra id per row (one slot).
+
+    Returns:
+      list[tuple[torch.Tensor, torch.Tensor]]: per-layer (keys, values) over the
+        prefix slots only.
+    """
+    rows = len(ids)
+    cache = model.start_incremental(
+        torch.tensor(ids),
+        torch.zeros(rows, STYLE_DIM),
+        torch.zeros(rows, dtype=torch.bool),
+        torch.zeros(rows, dtype=torch.bool),
+        16,
+        extra_ids=torch.tensor(extra)[:, None] if extra else None,
+    )
+    return [
+        (k[:, :, : cache.length], v[:, :, : cache.length])
+        for k, v in zip(cache.keys, cache.values)
+    ]
+
+
+def test_extra_id_slots_keep_each_ids_keys_and_values(model: ArTransformer) -> None:
+    """
+    An id slot attends only to itself, so its K/V at every layer must equal the
+    K/V that id has as the sole id token. That is the property that makes
+    "3 and 14 coexist" mean the model's own view of 3 next to its own view of 14,
+    rather than some third thing.
+    """
+    both = _prefix_kv(model, [1], [3])
+    alone_1 = _prefix_kv(model, [1], [])
+    alone_3 = _prefix_kv(model, [3], [])
+    for (k, v), (k1, v1), (k3, v3) in zip(both, alone_1, alone_3):
+        assert torch.allclose(k[:, :, 0], k1[:, :, 0], atol=1e-6)
+        assert torch.allclose(v[:, :, 0], v1[:, :, 0], atol=1e-6)
+        assert torch.allclose(k[:, :, 1], k3[:, :, 0], atol=1e-6)
+        assert torch.allclose(v[:, :, 1], v3[:, :, 0], atol=1e-6)
+
+
+def test_extra_ids_share_rotary_position_zero(model: ArTransformer) -> None:
+    """Swapping the two ids reorders the slots but leaves the style slot untouched."""
+    a = _prefix_kv(model, [1], [3])
+    b = _prefix_kv(model, [3], [1])
+    for (ka, va), (kb, vb) in zip(a, b):
+        assert torch.allclose(ka[:, :, 0], kb[:, :, 1], atol=1e-6)
+        assert torch.allclose(ka[:, :, 2], kb[:, :, 2], atol=1e-6)
+        assert torch.allclose(va[:, :, 2], vb[:, :, 2], atol=1e-6)
+
+
+def test_co_tracks_change_the_clip_and_batch_with_plain_lanes(
+    model: ArTransformer,
+) -> None:
+    from ab_harness.worker.generator import SampleRequest
+
+    gen = ArGenerator(model, torch.device("cpu"), window_frames=64)
+    style = _style()
+    requests = [
+        SampleRequest(track_idx=1, style=style, frames=20, temperature=0.0),
+        SampleRequest(track_idx=1, style=style, frames=20, temperature=0.0, co_tracks=(3,)),
+        SampleRequest(
+            track_idx=1,
+            style=style,
+            frames=20,
+            temperature=0.0,
+            co_tracks=(3, 4),
+            cfg_strength=2.0,
+        ),
+    ]
+    batched = gen.sample_batch(requests)
+    alone = [gen.sample_batch([request])[0] for request in requests]
+    assert all(torch.equal(a, b) for a, b in zip(batched, alone))
+    assert not torch.equal(batched[0], batched[1])
+    assert not torch.equal(batched[1], batched[2])
+
+
+def test_co_tracks_survive_a_reprime(model: ArTransformer) -> None:
+    from ab_harness.worker.generator import SampleRequest
+
+    request = SampleRequest(track_idx=1, style=_style(), frames=40, temperature=0.0, co_tracks=(3,))
+    wide = ArGenerator(model, torch.device("cpu"), window_frames=64).sample_batch([request])[0]
+    narrow = ArGenerator(model, torch.device("cpu"), window_frames=16).sample_batch([request])[0]
+    assert wide.shape == narrow.shape == (40, DEPTH)
+    assert torch.equal(wide[:16], narrow[:16])
+
+
+# -- style schedule ----------------------------------------------------------
+
+
+def test_a_style_schedule_changes_only_the_later_segments(model: ArTransformer) -> None:
+    from ab_harness.worker.generator import SampleRequest
+
+    gen = ArGenerator(model, torch.device("cpu"), window_frames=64)
+    first, second = _style(1), _style(2)
+    fixed = gen.sample_batch(
+        [SampleRequest(track_idx=1, style=first, frames=30, temperature=0.0)]
+    )[0]
+    walked = gen.sample_batch(
+        [
+            SampleRequest(
+                track_idx=1,
+                style=first,
+                frames=30,
+                temperature=0.0,
+                style_schedule=(second,),
+                style_period=12,
+            )
+        ]
+    )[0]
+    # grid step 12 is the first scored under `second`; deeper levels of the
+    # aligned frames just before it live on later grid rows, so the clean
+    # region is the period minus the delay pattern
+    clean = 12 - DEPTH + 1
+    assert torch.equal(fixed[:clean], walked[:clean])
+    assert not torch.equal(fixed, walked)
+
+
+def test_a_period_past_the_clip_never_switches(model: ArTransformer) -> None:
+    from ab_harness.worker.generator import SampleRequest
+
+    gen = ArGenerator(model, torch.device("cpu"), window_frames=64)
+    first, second = _style(1), _style(2)
+    fixed = gen.sample_batch(
+        [SampleRequest(track_idx=1, style=first, frames=20, temperature=0.0)]
+    )[0]
+    walked = gen.sample_batch(
+        [
+            SampleRequest(
+                track_idx=1,
+                style=first,
+                frames=20,
+                temperature=0.0,
+                style_schedule=(second,),
+                style_period=100,
+            )
+        ]
+    )[0]
+    assert torch.equal(fixed, walked)
+
+
+def test_a_scheduled_lane_leaves_its_batchmates_alone(model: ArTransformer) -> None:
+    from ab_harness.worker.generator import SampleRequest
+
+    gen = ArGenerator(model, torch.device("cpu"), window_frames=64)
+    plain = SampleRequest(track_idx=2, style=_style(), frames=30, temperature=0.0)
+    walked = SampleRequest(
+        track_idx=1,
+        style=_style(),
+        frames=30,
+        temperature=0.0,
+        style_schedule=(_style(2), _style(3)),
+        style_period=8,
+        cfg_strength=2.0,
+    )
+    batched = gen.sample_batch([plain, walked])
+    assert torch.equal(batched[0], gen.sample_batch([plain])[0])
+    assert torch.equal(batched[1], gen.sample_batch([walked])[0])

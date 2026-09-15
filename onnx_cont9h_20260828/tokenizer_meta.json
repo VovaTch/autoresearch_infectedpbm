@@ -1,0 +1,15 @@
+{
+  "checkpoint": "saved_20260827_cont9h/lvl1_vqgan_last.ckpt",
+  "sample_rate": 44100,
+  "n_fft": 1024,
+  "hop_length": 256,
+  "win_length": 1024,
+  "frames_per_second": 172.265625,
+  "token_dim": 1024,
+  "num_rq": 3,
+  "num_tokens": 2048,
+  "per_level_codebooks": true,
+  "indices_layout": "(batch, frames, num_rq) int64",
+  "waveform_layout": "(batch, 1, frames * hop_length) float32",
+  "samples_must_be_multiple_of": 256
+}

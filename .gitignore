@@ -224,6 +224,7 @@ results.tsv
 weights/
 renders/
 renders_ar/
+renders_synth/
 saved_*/
 FINDINGS_jul2_15min_loop.md
 onnx/

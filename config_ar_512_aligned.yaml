@@ -1,0 +1,71 @@
+# AR stage at 512-frame context (2.97 s @ 172.27 fps), FROM SCRATCH, on the
+# dsteps2_24h tokenizer (onnx/ re-exported 2026-09-15; old graphs kept in
+# onnx_cont9h_20260828/). ALIGNED style conditioning (user spec 2026-09-15):
+# the corpus is cut on a 512-frame grid; each slice's descriptor = mean z_q over
+# 256 frames before + the 512 + 256 after (clamped at track edges, fewer frames
+# averaged there). A training crop IS a grid slice and is conditioned on its own
+# descriptor -- the coarse-to-fine setting where a style-level model supplies
+# the descriptors at inference (project_style_ar_plan). Val = every grid slice
+# fully inside a held-out window, scored end to end. The token cache is keyed
+# on encoder graph + style geometry, so it rebuilds on first run.
+#
+# Sample accounting: batch 64 x 512 frames = 32768 frames per optimiser step, the
+# same frames/step as the 16384 x 2 runs, but 4x more optimiser steps per epoch
+# (accumulate 1). dropout 0.15 kept from the 16k-scratch lesson (val CE 29 -> 8.4
+# came from 16k context + dropout; 512 context is the user's explicit ask here,
+# so expect a higher val CE than 16k and judge on renders + A/B, not CE alone).
+#
+# Command (detached):
+#   CUDA_VISIBLE_DEVICES=0 setsid nohup uv run python train_ar.py \
+#     --config config_ar_512_aligned.yaml > logs/train_ar_512_aligned.log 2>&1 &
+
+tokenizer:
+  encoder_onnx: onnx/encoder.onnx
+  meta: onnx/tokenizer_meta.json
+  checkpoint: saved_20260914_dsteps2_24h/last.ckpt  # codebook source (style windows)
+  tracks_dir: ~/.cache/infected_pbm/tracks
+  slices_dir: ~/.cache/infected_pbm/slices  # fallback for 7 mp3s torchcodec rejects
+  cache_root: ~/.cache/infected_pbm
+  chunk_frames: 4096    # frames emitted per encoder window
+  margin: 256           # context frames discarded per side; trunk RF is ~120
+  verify_tolerance: 0.005  # argmax near-tie floor; level 0 must still be exact
+
+data:
+  crop_frames: 512      # 2.97 s @ 172.27 fps -- the requested context window
+  frames_per_pos: 1
+  style_slice_frames: 512    # grid slice = crop
+  style_context_frames: 256  # +256 each side in the descriptor average
+  style_mode: aligned        # crop conditioned on its own slice descriptor
+  val_frac: 0.04
+  val_windows_per_track: 2
+  min_val_window: 512
+  split_seed: 1234
+  track_weighting: length
+  steps_per_epoch: 500  # x batch_size 64 = 32000 crops per epoch
+  single_track: null
+
+model:
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  dropout: 0.15
+  style_bottleneck: 128
+  p_drop_cond: 0.5      # 25/25/25/25 both / id / style / neither
+  rope_theta: 10000.0
+
+train:
+  devices: 1
+  minutes: 1440         # 24 h
+  lr: 3.0e-4
+  lr_pct_start: 0.05
+  lr_div_factor: 25
+  batch_size: 64        # 64 x 512 = 32768 frames/step, same as 2 x 16384
+  accumulate_grad_batches: 1
+  precision: bf16-mixed
+  weight_decay: 0.01
+  grad_clip: 1.0
+  num_workers: 4
+  ema_decay: null
+  seed: 42
+  save_path: saved_ar_20260915_512_aligned/
+  checkpoint: null

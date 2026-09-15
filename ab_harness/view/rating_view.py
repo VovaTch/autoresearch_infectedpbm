@@ -18,6 +18,11 @@ showing up; picking from a list is how the rater takes that back. Each side also
 carries its waveform, which is what makes a mostly-silent generation visible
 without listening to it.
 
+Clicking either waveform jumps the shared playhead there, which is what makes
+a 90 s pair rateable without sitting through its quiet opening. Both sides move
+together: they are the same span of the same conditioning, and comparing them at
+different offsets is not the comparison being asked for.
+
 Key map, chosen so the whole loop is reachable without moving a hand:
 
   space   play / pause              1  A is better
@@ -71,6 +76,8 @@ class SidePanel(QFrame):
       parent (QWidget | None): Qt parent.
     """
 
+    scrubbed = Signal(float)
+
     def __init__(self, letter: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("sidePanel")
@@ -80,6 +87,7 @@ class SidePanel(QFrame):
         self._letter.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._letter.setStyleSheet("font-size: 64px; font-weight: 600; border: none;")
         self._wave = WaveformView(parent=self)
+        self._wave.scrubbed.connect(self.scrubbed)
         self._state = QLabel("", self)
         self._state.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._state.setFixedHeight(24)
@@ -140,6 +148,7 @@ class RatingView(QWidget):
     listen_from_start = Signal(int)
     picked = Signal(str)
     generate = Signal(str, int)
+    scrubbed = Signal(float)
 
     def __init__(
         self,
@@ -158,6 +167,8 @@ class RatingView(QWidget):
         self._hint.setStyleSheet(f"color: {MUTED};")
 
         self._panels = (SidePanel("A", self), SidePanel("B", self))
+        for panel in self._panels:
+            panel.scrubbed.connect(self.scrubbed)
         panels = QHBoxLayout()
         panels.addWidget(self._panels[0])
         panels.addWidget(self._panels[1])
@@ -169,7 +180,7 @@ class RatingView(QWidget):
         self._time.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self._legend = QLabel(
-            "space play   a/d listen   s flip   r restart   "
+            "space play   a/d listen   s flip   r restart   click wave to seek   "
             "1 A better   2 tie   3 B better   x skip",
             self,
         )

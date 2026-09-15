@@ -32,7 +32,7 @@ generator:
   checkpoint: auto
   decoder_onnx: onnx/decoder.onnx
   device: cuda:0
-  window_frames: 4096       # == crop_frames; sampling stays inside trained geometry
+  window_frames: 16384      # clamped to the checkpoint's crop_frames by service.py
   reprime_frac: 0.25        # drop a quarter of the window per re-prime
   use_gpu_decoder: true
   # Sampling is bound by kernel launch latency, not arithmetic: a step costs
@@ -52,22 +52,41 @@ sampler:
   prompt_seconds: 3.0
   p_track_id: 0.5           # each stream nulled independently, so all 8 combos occur
   p_style: 0.5
-  p_prompt: 0.8             # Cold starts are off-distribution: training crops always
-                            # begin mid-track, so the model has never seen "start
-                            # from nothing". Measured over 200 clips, near-silence
-                            # runs 18.8% of a cold start against 12.0% prompted.
+  # 1.0 as of 2026-09-05: cold starts are not merely off-distribution, they are
+  # the single measured cause of the "sounds like a mess" complaint. Conditioning
+  # ladder, 8 seeds x 8 cells at a fixed track/span/seed (probe_conditioning.py),
+  # beat strength measured on the GENERATED region only:
+  #
+  #   prompted  0.548 +/- 0.120, tempo on-grid 32/32
+  #   cold      0.409 +/- 0.183, tempo on-grid 13/32 (72..207 BPM, no grid at all)
+  #   Welch t = 3.54, p = 0.00083
+  #
+  # Training crops always begin mid-track, so "start from nothing" is genuinely
+  # unseen; that is a training gap, and no sampler setting repairs it. Rating
+  # cold starts spent 24.2% of the listening budget on the worst clips in the
+  # bank. Restore < 1.0 only if cold generation becomes a product goal, in which
+  # case fix it in training first.
+  p_prompt: 1.0
   # 8 conditioning combos x 4 strengths + 1 unconditional = 29 cells, and 49
-  # judgements put ~1.7 in each -- too few to compare anything. Two strengths
-  # cut that to 15.
+  # judgements put ~1.7 in each -- too few to compare anything.
   #
   # Corrected 2026-08-29: 1.0 IS plain conditional, not mild guidance --
   # l(null) + 1.0*(l(cond) - l(null)) reduces to l(cond), and cfg 0 and cfg 1
-  # were verified to give bit-identical tokens from the same seed. So [1.0, 2.0]
-  # was guidance-vs-none, and half the draws were the unguided case it meant to
-  # drop. [2.0, 3.0] is the two-cell version that actually compares strengths,
-  # and 3.0 is the single biggest lever against dead air: on the 90 s tier,
-  # near-silence runs 30-36% at cfg 0-2 and 12.9% at cfg 3.
-  cfg_strengths: [2.0, 3.0]
+  # were verified to give bit-identical tokens from the same seed.
+  #
+  # Cut to a single strength 2026-09-05. Guidance measured INERT across cfg
+  # 0/2/3 on crest, spectral centroid, HF energy, spectral flux and token
+  # entropy (L0 H 0.872 vs 0.876 for cfg 2 vs 3), and it is a mathematical
+  # no-op whenever BOTH streams are nulled -- l(null) + s*(l(cond) - l(null))
+  # collapses to l(null) when cond == null, verified as outputs identical to
+  # four decimals across all three strengths. At p_track_id/p_style 0.5 that
+  # was a quarter of all pairs varying a dimension that does nothing. One
+  # strength halves the cell count for nothing lost.
+  #
+  # The earlier "3.0 is the biggest lever against dead air" reading came from
+  # the 90 s tier; on the 10 s ladder the dead-air axis is prompting, not
+  # guidance -- every prompted cell measured fill 1.000 at any cfg.
+  cfg_strengths: [2.0]
   temperature: 1.0
   top_k: 250
   top_p: 0.0

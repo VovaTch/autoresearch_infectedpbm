@@ -535,6 +535,133 @@ def phase_distance(
     return total / len(ffts)
 
 
+def stft_consistency(
+    spec: torch.Tensor,
+    wav: torch.Tensor,
+    n_fft: int = 1024,
+    hop: int = 256,
+    shift: int = 128,
+) -> torch.Tensor:
+    """Relative L1 gap between a spectrogram and the STFT of its own ISTFT.
+
+    Zero means `spec` lies in the range of the STFT operator, i.e. it IS the
+    transform of a real signal. The decoder's head predicts 2*(n_fft//2+1)
+    free numbers per hop -- 4x more than the waveform it produces has samples --
+    so nothing makes its prediction realizable, and whatever is unrealizable is
+    destroyed by the overlap-add. Measured 0.51 on the cont9h decoder against a
+    real-audio floor of 0.0005 (probe_consistency.py).
+
+    Well-posed where absolute-phase cos-distance (`phase_distance`) is not: no
+    target is involved and the quantity is shift-equivariant, so it cannot be
+    gamed by a time offset.
+
+    Args:
+      spec (torch.Tensor): (B, F, T) complex spectrogram the decoder predicted.
+      wav (torch.Tensor): (B, 1, L) waveform its ISTFT produced from `spec`.
+      n_fft (int): analysis FFT size; must match the decoder's synthesis size.
+      hop (int): analysis hop; must match the decoder's synthesis hop.
+      shift (int): sample lag of ISTFT(padding="same") vs torch.stft(center=True).
+        Half a hop at the default geometry; getting it wrong reads as ~1.24
+        inconsistency on real audio.
+
+    Returns:
+      torch.Tensor: () scalar relative L1 error, differentiable in both args.
+    """
+    x = wav.squeeze(1).float()[:, shift:]
+    window = torch.hann_window(n_fft, device=x.device, dtype=torch.float32)
+    back = torch.stft(
+        x, n_fft=n_fft, hop_length=hop, window=window, return_complex=True
+    )
+    t = min(back.shape[-1], spec.shape[-1])
+    a, b = back[..., :t], spec[..., :t]
+    return (a - b).abs().sum() / (b.abs().sum() + 1e-7)
+
+
+def envelope_distance(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    windows: tuple[int, ...] = (64, 256, 1024),
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """Multi-scale log fine-envelope L1 -- the sub-frame body/crest term.
+
+    Per-frame STFT magnitude fixes per-frame ENERGY (Parseval) but says nothing
+    about how that energy sits inside the frame: phase-locked harmonics give a
+    flat envelope and a dense, low-crest waveform; the same magnitudes with
+    random inter-bin phase beat against each other, the envelope wobbles and
+    crest climbs toward Gaussian (measured +2.5 dB on every round trip). This
+    compares the rectified waveform smoothed at 1.5 / 6 / 23 ms, in the log
+    domain, so it sees that wobble without needing a target phase and is
+    tolerant to alignment error well below the smallest window.
+
+    Args:
+      pred (torch.Tensor): (B, 1, L) predicted waveform.
+      target (torch.Tensor): (B, 1, L) reference waveform.
+      windows (tuple[int, ...]): smoothing lengths in samples; stride is window // 4.
+      eps (float): log floor; audio scale is ~0.1-1 so 1e-4 is -80 dB.
+
+    Returns:
+      torch.Tensor: () mean absolute log-envelope gap, differentiable in `pred`.
+    """
+    p = pred.float().abs()
+    t = target.float().abs()
+    total = torch.zeros((), device=pred.device)
+    for win in windows:
+        stride = max(win // 4, 1)
+        env_p = F.avg_pool1d(p, win, stride=stride, padding=win // 2)
+        env_t = F.avg_pool1d(t, win, stride=stride, padding=win // 2)
+        total = total + (torch.log(env_p + eps) - torch.log(env_t + eps)).abs().mean()
+    return total / len(windows)
+
+
+
+def frame_periodicity(x: torch.Tensor, period: int = 256, hp_taps: int = 64) -> torch.Tensor:
+    """Fraction of a waveform's RMS that repeats exactly every `period` samples.
+
+    Fold the signal into (L // period, period), average over rows: whatever
+    survives is a template repeated every frame. Real music at hop 256 scores
+    0.007-0.011 over 12 s; the STFT decoder's output scored 0.054-0.115 and its
+    pre-`_end_conv` ISTFT 0.35-0.54 (2026-09-12) -- a fixed high-frequency
+    pattern emitted every hop, i.e. the 172 Hz-harmonic "buzz" on drum tails.
+    Scale-invariant, target-free, differentiable. A moving-average high-pass
+    keeps DC / sub-40 Hz content from reading as periodic.
+
+    Args:
+      x (torch.Tensor): (B, 1, L) waveform.
+      period (int): fold length in samples; the decoder hop.
+      hp_taps (int): moving-average length subtracted as a crude high-pass.
+
+    Returns:
+      torch.Tensor: (B,) coherence ratio in [0, 1].
+    """
+    sig = x.float()
+    sig = sig - F.avg_pool1d(sig, hp_taps, stride=1, padding=hp_taps // 2)[..., : sig.shape[-1]]
+    n = sig.shape[-1] // period * period
+    frames = sig[..., :n].reshape(sig.shape[0], -1, period)
+    template = frames.mean(dim=1)
+    return template.pow(2).mean(-1).sqrt() / (frames.pow(2).mean((1, 2)).sqrt() + 1e-8)
+
+
+def spectral_frame_mean(spec: torch.Tensor, min_bin: int = 1) -> torch.Tensor:
+    """Per-bin |time-mean of a complex STFT| relative to its mean magnitude.
+
+    A real STFT's frame-mean is ~0 above DC (phase rotates every hop); a
+    constant complex offset per bin is exactly what synthesises to a
+    hop-periodic template. Measured 0.23-0.50 on the decoder head's output for
+    bins >= 1.4 kHz vs 0.01-0.02 for real audio (2026-09-12). Target-free.
+
+    Args:
+      spec (torch.Tensor): (B, F, T) complex spectrogram.
+      min_bin (int): first bin included (skip DC).
+
+    Returns:
+      torch.Tensor: () mean ratio over batch and bins.
+    """
+    s = spec[:, min_bin:]
+    ratio = s.mean(-1).abs() / (s.abs().mean(-1) + 1e-8)
+    return ratio.mean()
+
+
 # Composite headline weights. cdpam ~0.1-0.3, mrstft ~2.2, chroma ~0.04, phase
 # ~0.5-1.5. chroma weighted up (tiny scale); phase added so the metric can see
 # the melody/pitch coherence the magnitude terms miss. Heuristic — tune by ear.

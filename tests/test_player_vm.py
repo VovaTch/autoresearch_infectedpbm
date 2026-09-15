@@ -84,3 +84,18 @@ def test_restart_rewinds(player: PlayerViewModel) -> None:
     player.source.seek_seconds(0.7)
     player.restart()
     assert player.source.position == 0
+
+
+def test_seeking_by_fraction_lands_at_that_share_of_the_clip(
+    player: PlayerViewModel,
+) -> None:
+    """
+    The waveform knows where in its own width a click landed and nothing about
+    seconds, so the conversion has to live here.
+    """
+    player.load(
+        np.zeros(88200, dtype=np.int16), np.zeros(88200, dtype=np.int16), autoplay=False
+    )
+    player.seek_fraction(0.25)
+    assert player.source.seconds == pytest.approx(0.5)
+    assert player.source.active == 0

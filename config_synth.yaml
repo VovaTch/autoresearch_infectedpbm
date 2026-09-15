@@ -1,0 +1,51 @@
+# Slice synthesizer.
+#
+#   uv run python -m slice_synth.app --config config_synth.yaml
+#   uv run python -m slice_synth.render --tracks 3 7 --styles window random
+#
+# The generator block is ab_harness's GeneratorCfg verbatim, so a clip made here
+# and a clip made by the rating harness from the same checkpoint are the same
+# clip. Only output/ and ui/ belong to this app.
+
+generator:
+  # auto = the newest checkpoint ab_harness.checkpoints finds: the last DPO run
+  # while one exists, an AR run otherwise. Prefer a *_latest over a *_best --
+  # val/loss bottoms near step 1500, so "best" is a memorization thermometer.
+  checkpoint: auto
+  decoder_onnx: onnx/decoder.onnx
+  encoder_onnx: onnx/encoder.onnx    # only opened when a prompt comes from a file
+  device: cuda:0
+  # 4096, not the harness's 16384. A guided lane occupies TWO KV rows, so a
+  # sixteen-variant batch at cfg > 0 is a 32-row cache, and window 16384 has been
+  # measured to OOM on the 16k-crop checkpoints. Raise it if the batches are
+  # small and the checkpoint's crop_frames is larger; it is clamped to that
+  # anyway, so a value above the crop buys nothing.
+  window_frames: 4096
+  reprime_frac: 0.25
+  use_gpu_decoder: true
+  # Sampling is bound by kernel launch latency, not arithmetic: a step costs
+  # 7.4 ms at batch 1 and 7.6 ms at batch 16. The whole cross-product idea rests
+  # on that -- sixteen variants cost what one does.
+  max_batch: 16
+  batch_wait_s: 0.5
+
+output:
+  root: renders_synth
+  target_lufs: -23.0
+
+ui:
+  seconds: 10.0
+  # 3 s of real audio. Cold starts are not merely off-distribution, they are the
+  # measured cause of the "sounds like a mess" complaint: beat strength 0.409
+  # against 0.548 prompted, and a tempo on the grid 13/32 times against 32/32.
+  prompt_seconds: 3.0
+  temperature: 1.0
+  top_k: 250
+  top_p: 0.0
+  cfg_strength: 2.0
+  # Identity is at chance at cfg 1 and only appears near 8, so the slider has to
+  # reach that far even though image diffusion never goes there.
+  max_cfg: 8.0
+  crossfade_ms: 5.0
+  mel_columns: 1024
+  seeds: 1

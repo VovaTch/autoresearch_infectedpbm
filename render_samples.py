@@ -109,7 +109,17 @@ def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 1024, num_rq: i
     )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
-    module.load_state_dict(sd, strict=True)
+    # rendering needs the generator only; the critic ensemble may differ from the
+    # default build (disc_periods / disc_freq_pool), so load it non-strictly and
+    # insist only that every generator key is present.
+    gen_sd = {k: v for k, v in sd.items() if not k.startswith("discriminator.")}
+    result = module.load_state_dict(gen_sd, strict=False)
+    missing_gen = [k for k in result.missing_keys if not k.startswith("discriminator.")]
+    if missing_gen or result.unexpected_keys:
+        raise RuntimeError(
+            f"generator load mismatch: missing={missing_gen[:5]} "
+            f"unexpected={result.unexpected_keys[:5]}"
+        )
     if isinstance(ckpt, dict):
         print("  EMA weights applied" if _apply_ema(module, ckpt) else "  (raw weights, no EMA found)")
     module.eval()

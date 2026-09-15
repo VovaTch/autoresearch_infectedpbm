@@ -138,6 +138,15 @@ class PlayerViewModel(QObject):
         if was_playing:
             self.play()
 
+    def seek_fraction(self, fraction: float) -> None:
+        """
+        Args:
+          fraction (float): new playhead position in [0, 1] of the clip. Kept
+            here rather than in the view so nothing on screen has to know the
+            clip length to point at a moment in it.
+        """
+        self.seek(fraction * self.source.duration)
+
     # -- internals -----------------------------------------------------------
 
     def _tick(self) -> None:

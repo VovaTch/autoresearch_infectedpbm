@@ -1,0 +1,52 @@
+# lvl1_vqgan tokenizer -- 2026-09-14 24 H run on the dsteps2 recipe.
+#
+# Lineage: cont9h -> fp2+consistency -> buzz losses (172/344 Hz template REMOVED, ear-
+# confirmed 2026-09-13) -> 3 complex-STFT critics kept alive by critic-only warm-up,
+# per-critic clip, TTUR x4, d_weight_cap 1.0, 2 critic steps per G step. Ear ranking
+# 2026-09-13: dsteps2 ~ dcap1 > buzz7h > onnx; 7 h leg == 3 h leg by ear and metrics
+# (cdpam 0.0957 / mrstft 1.132, s* AUC 0.87-0.91) -> time lever at 24 h.
+# Warm start = dsteps2_7h last.ckpt (critics trained, no critic-only phase). One-cycle.
+#
+# Judge on: probe_critics s* AUC held > 0.85; ear on Savant 0-20 s / Merlin 2:37 / drums
+# vs dsteps2_7h. cdpam/mrstft secondary (GAN legs: ear beats mrstft).
+
+model:
+  hidden: 1024
+  token_dim: 1024
+  num_rq: 3
+  num_tokens: 2048
+  time_downsample: 1
+  ze_norm: none
+  per_level_codebooks: true
+
+vq:
+  commit_weight: 0.75
+
+loss:
+  consistency_weight: 2.0
+  periodicity_weight: 10.0  # BUZZ: hop-periodic excess on output
+  spec_mean_weight: 5.0     # BUZZ: constant complex offset in the STFT head
+
+gan:
+  gan_start_step: 1000  # inert on a warm start
+  disc_warmup: 3000     # inert on a warm start
+  disc_only_steps: 0    # critics already trained in the 3 h leg
+  disc_clip: per_critic # global norm-1 clip let the wave critic starve the others
+  disc_lr_mult: 4.0     # TTUR: v3 smoke showed STFT critics separate with G frozen, then
+                        # collapse to constant output within 300 joint steps at D lr = G lr
+  disc_steps: 2         # LEVER: two critic updates per generator update
+  d_weight_cap: 1.0     # cap 5 let G out-run the fresh STFT critics within 60 joint steps (ttur2)
+  disc_width: 1
+  disc_freq_pool: 2
+  disc_stft_resolutions: [[1024, 256], [2048, 512], [512, 128]]  # LEVER D
+
+train:
+  devices: 1
+  minutes: 1440
+  lr: 1.0e-4
+  lr_pct_start: 0.05
+  lr_div_factor: 50
+  batch_size: 48
+  single_song: null
+  save_path: saved_20260914_dsteps2_24h/
+  checkpoint: saved_20260913_mrd_dsteps2_7h/last.ckpt

@@ -226,3 +226,44 @@ def test_checkpoint_selector_is_hidden_when_there_is_nothing_to_choose(
     window = MainWindow(SessionViewModel(pipeline, fake_sink), PlayerViewModel())
     combo = window.findChild(QComboBox)
     assert combo is not None and combo.count() == 0
+
+
+def test_clicking_a_waveform_moves_the_playhead(
+    qapp, sampler: PairSampler, bank: ClipBank, fake_sink: FakeSink
+) -> None:
+    """
+    End of the chain: strip -> panel -> rating view -> player. Both sides share
+    one playhead, so a click on either seeks the comparison, not one candidate.
+    """
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    from ab_harness.view.main_window import MainWindow
+    from ab_harness.view.waveform import WaveformView
+    from ab_harness.viewmodel.player_vm import PlayerViewModel
+
+    pipeline = PairPipeline(
+        sampler, FakeProducer(store=bank), bank, depth=1, structure_live=True
+    )
+    session = SessionViewModel(pipeline, fake_sink)
+    player = PlayerViewModel()
+    window = MainWindow(session, player)
+    assert session.advance()
+    player.stop()
+
+    duration = player.source.duration
+    assert duration > 0.0
+    for strip in window.findChildren(WaveformView):
+        strip.resize(200, 64)
+        strip.mousePressEvent(
+            QMouseEvent(
+                QEvent.Type.MouseButtonPress,
+                QPointF(100.0, 8.0),
+                QPointF(100.0, 8.0),
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+        assert player.source.seconds == pytest.approx(duration / 2, abs=1e-3)
+        player.source.restart()

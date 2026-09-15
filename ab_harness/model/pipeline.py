@@ -176,7 +176,7 @@ class PairPipeline:
         current = self.sampler.checkpoint
         groups: dict[str, int] = {}
         for spec in self.store.specs(Tier.STRUCTURE):
-            # Counted the way _banked_structure_spec draws, or the status bar
+            # Counted the way _banked_spec draws, or the status bar
             # would advertise material the selected model cannot serve.
             if spec.checkpoint and spec.checkpoint != current:
                 continue
@@ -274,10 +274,8 @@ class PairPipeline:
         """
         queued = 0
         for _ in range(max(0, count)):
-            spec: PairSpec | None = None
-            if tier is Tier.STRUCTURE:
-                self._refresh_store()
-                spec = self._banked_structure_spec(fresh_only=True)
+            self._refresh_store()
+            spec = self._banked_spec(tier, fresh_only=True)
             if spec is None:
                 spec = self.sampler.next_spec(tier=tier)
             self._inflight[spec.pair_id] = spec
@@ -355,30 +353,43 @@ class PairPipeline:
         self._refresh_store()
         for _ in range(MAX_REDRAWS):
             spec = self.sampler.next_spec()
+            # A freshly drawn spec is a fresh random recipe -- two 2**31 seeds
+            # over a random span and conditioning -- so it is never what a bake
+            # or the backfill happened to bank. Substituting a banked comparison
+            # is the only route by which banked material is served at all; this
+            # used to run for structure only, which left every baked bulk clip
+            # servable by coincidence and no other way.
+            #
+            # Repeats and anchors are exempt: a repeat has to be the same
+            # comparison again and an anchor has to keep its known-correct side,
+            # and both carry the section 7.6 measurements.
+            if not (spec.is_repeat or spec.is_anchor):
+                # Bulk regenerates in seconds, so once the unrated bank is used
+                # up a fresh draw beats replaying it; structure costs two
+                # minutes, where a replay still beats declining the tier.
+                banked = self._banked_spec(
+                    spec.tier, fresh_only=spec.tier is not Tier.STRUCTURE
+                )
+                if banked is not None:
+                    return banked
             if (
                 spec.tier is not Tier.STRUCTURE
                 or self.structure_live
                 or self._is_banked(spec)
             ):
                 return spec
-            # A freshly drawn structure spec is a fresh random recipe, so it is
-            # never what the backfill happened to bank. Substitute a banked
-            # comparison instead, or the tier could only ever appear by
-            # coincidence.
-            banked = self._banked_structure_spec()
-            if banked is not None:
-                return banked
             self.skipped_structure += 1
         return None
 
-    def _banked_structure_spec(self, fresh_only: bool = False) -> PairSpec | None:
+    def _banked_spec(self, tier: Tier, fresh_only: bool = False) -> PairSpec | None:
         """
-        Assemble a structure comparison out of clips already in the bank.
+        Assemble a comparison out of clips already in the bank.
 
         Groups holding nothing the rater has judged are preferred, so a bank
         that keeps growing is worked through rather than replayed.
 
         Args:
+          tier (Tier): tier to draw from.
           fresh_only (bool): return None instead of falling back to a group
             whose clips have already been rated.
 
@@ -394,7 +405,7 @@ class PairPipeline:
         # lane makes some, which skipped_structure reports.
         current = self.sampler.checkpoint
         groups: dict[str, list[ClipSpec]] = {}
-        for spec in self.store.specs(Tier.STRUCTURE):
+        for spec in self.store.specs(tier):
             if spec.checkpoint and spec.checkpoint != current:
                 continue
             groups.setdefault(spec.group_id, []).append(spec)
@@ -417,7 +428,7 @@ class PairPipeline:
             return None
         members = self.sampler.rng.choice(pool)
         left, right = self.sampler.rng.sample(members, 2)
-        spec = self.sampler.blind(Tier.STRUCTURE, left, right)
+        spec = self.sampler.blind(tier, left, right)
         self.sampler.register(spec)
         return spec
 

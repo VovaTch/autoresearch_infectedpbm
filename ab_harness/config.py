@@ -72,6 +72,9 @@ class GeneratorCfg:
         walk on 38 pairs, so "best" is a memorization thermometer pinned to a
         barely-trained model, not a model selector.
       decoder_onnx (str): tokens-to-audio graph.
+      encoder_onnx (str): audio-to-tokens graph. Unused by the rating harness,
+        which only ever decodes cached tokens; the slice synthesizer needs it to
+        prime a generation from an audio file that is not in the corpus.
       device (str): torch device for sampling.
       window_frames (int): context retained by the sliding window; keep at the
         checkpoint's crop_frames so sampling stays in-distribution.
@@ -87,6 +90,7 @@ class GeneratorCfg:
 
     checkpoint: str = "auto"
     decoder_onnx: str = "onnx/decoder.onnx"
+    encoder_onnx: str = "onnx/encoder.onnx"
     device: str = "cuda:0"
     window_frames: int = 4096
     reprime_frac: float = 0.25

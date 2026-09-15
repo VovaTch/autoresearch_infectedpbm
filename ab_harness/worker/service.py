@@ -29,6 +29,7 @@ from ab_harness.model.pair_sampler import TrackInfo, save_corpus
 from ab_harness.model.types import ClipSpec
 from ab_harness.worker.decoder import TokenDecoder
 from ab_harness.worker.generator import ArGenerator, SampleRequest
+from ab_harness.worker.loading import LoadedModel, load_ar_checkpoint
 from ab_harness.worker.protocol import (
     CheckpointChanged,
     ClipRequest,
@@ -36,8 +37,7 @@ from ab_harness.worker.protocol import (
     Shutdown,
     SwitchCheckpoint,
 )
-from generate_ar import config_from_ckpt
-from train_ar import DataCfg, TrackTokens, build_model, load_token_cache
+from train_ar import TrackTokens
 
 
 def style_vector(track: TrackTokens, spec: ClipSpec) -> torch.Tensor:
@@ -78,6 +78,7 @@ class GenerationService:
         self._ordered_tracks: list[TrackTokens] = []
         self._manifest: dict[str, Any] = {}
         self._cache_dir: Path | None = None
+        self._loaded_model: LoadedModel | None = None
         self._generator: ArGenerator | None = None
         self._decoder: TokenDecoder | None = None
         self._meta: dict[str, Any] = {}
@@ -105,11 +106,16 @@ class GenerationService:
         """
         Load one AR/DPO checkpoint and build the generator around it.
 
+        The model half is ab_harness.worker.loading, shared with the slice
+        synthesizer so the two apps cannot drift into loading a checkpoint
+        differently. What stays here is the bank bookkeeping only the rating
+        harness needs.
+
         The corpus and the token cache belong to the tokenizer, not to the AR
-        model, so they are only reloaded when the checkpoint points at a
+        model, so they are only republished when the checkpoint points at a
         different cache -- which is what makes switching models mid-session cost
-        a few seconds rather than a minute. The decoder is untouched for the
-        same reason.
+        a few seconds rather than a minute. The decoder is untouched for the same
+        reason.
 
         Args:
           checkpoint (str): repo-relative checkpoint path.
@@ -117,54 +123,19 @@ class GenerationService:
         Raises:
           FileNotFoundError: when the checkpoint or its token cache is missing.
         """
-        ckpt_path = REPO / checkpoint
-        if not ckpt_path.exists():
-            raise FileNotFoundError(f"no checkpoint at {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        ar_cfg = config_from_ckpt(ckpt)
-
-        cache_root = Path(ar_cfg.tokenizer.cache_root).expanduser()
-        caches = sorted(cache_root.glob("tokens_*"))
-        if not caches:
-            raise FileNotFoundError(f"no token cache under {cache_root}")
-        cache_dir = caches[-1]
-        if cache_dir != self._cache_dir:
-            # single_track would hide most of the corpus from the sampler
-            data_cfg = DataCfg(**{**vars(ar_cfg.data), "single_track": None})
-            tracks, manifest = load_token_cache(cache_dir, data_cfg)
-            self._ordered_tracks = tracks
-            self._tracks = {t.track_idx: t for t in tracks}
-            self._manifest = manifest
-            self._meta = manifest["tokenizer_meta"]
-            self._cache_dir = cache_dir
+        loaded = load_ar_checkpoint(checkpoint, self.cfg.generator, self._loaded_model)
+        if loaded.cache_dir != self._cache_dir:
+            self._ordered_tracks = loaded.tracks
+            self._tracks = loaded.by_idx
+            self._manifest = loaded.manifest
+            self._meta = loaded.meta
+            self._cache_dir = loaded.cache_dir
             # The UI process never imports torch, so the corpus it needs to draw
             # spans from has to reach it through the bank.
             save_corpus(self.corpus_path, self.tracks)
-        self.bank.init_manifest(cache_dir.name, self._meta, checkpoint)
-
-        model = build_model(ar_cfg, self._ordered_tracks, self._manifest)
-        state = {
-            k[len("model.") :]: v
-            for k, v in ckpt["state_dict"].items()
-            if k.startswith("model.")
-        }
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing or unexpected:
-            print(
-                f"  WARN missing={list(missing)[:3]} unexpected={list(unexpected)[:3]}"
-            )
-        device = torch.device(
-            self.cfg.generator.device if torch.cuda.is_available() else "cpu"
-        )
-        model.to(device).eval()
-        self._generator = ArGenerator(
-            model,
-            device,
-            window_frames=min(
-                self.cfg.generator.window_frames, ar_cfg.data.crop_frames
-            ),
-            reprime_frac=self.cfg.generator.reprime_frac,
-        )
+        self.bank.init_manifest(loaded.cache_dir.name, self._meta, checkpoint)
+        self._loaded_model = loaded
+        self._generator = loaded.generator
         self.checkpoint = checkpoint
 
     def switch_checkpoint(self, checkpoint: str) -> None:
@@ -417,6 +388,7 @@ class GenerationService:
     def close(self) -> None:
         """Release the model and decoder."""
         self._generator = None
+        self._loaded_model = None
         self._decoder = None
         self._tracks = {}
         self._ordered_tracks = []

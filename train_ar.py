@@ -72,6 +72,16 @@ class DataCfg:
     crop_frames: int = 4096
     frames_per_pos: int = 1
     style_window_sec: float = 10.0
+    # Grid style windows: one descriptor per `style_slice_frames` slice, averaged
+    # over the slice plus `style_context_frames` on each side (clamped at track
+    # edges). None = legacy non-overlapping style_window_sec tiling.
+    style_slice_frames: int | None = None
+    style_context_frames: int = 256
+    # "disjoint": style drawn from a window away from the crop (legacy, section
+    # 11.3). "aligned": the crop IS a grid slice and gets that slice's own
+    # descriptor -- the coarse-to-fine setting where a style-level model will
+    # supply the descriptor at inference. Requires crop_frames == style_slice_frames.
+    style_mode: str = "disjoint"
     val_frac: float = 0.04
     val_windows_per_track: int = 2
     min_val_window: int = 512
@@ -96,7 +106,13 @@ class ModelCfg:
 
 @dataclass
 class TrainCfg:
-    """Optimiser, schedule and checkpointing."""
+    """
+    Optimiser, schedule and checkpointing.
+
+    accumulate_grad_batches keeps the optimiser's effective batch fixed when
+    VRAM caps the micro-batch: a 16384-frame crop fits 2 per card where a 4096
+    one fits 8, so 2 x 4 restores the same 8 crops per step.
+    """
 
     devices: int = 1
     minutes: float = 360.0
@@ -104,6 +120,7 @@ class TrainCfg:
     lr_pct_start: float = 0.05
     lr_div_factor: float = 25.0
     batch_size: int = 8
+    accumulate_grad_batches: int = 1
     precision: str = "bf16-mixed"
     weight_decay: float = 0.01
     grad_clip: float = 1.0
@@ -228,7 +245,7 @@ def make_session(path: Path, num_rq: int):
     return ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
 
 
-def cache_tag(meta_path: Path, encoder_path: Path) -> str:
+def cache_tag(meta_path: Path, encoder_path: Path, style_key: str = "") -> str:
     """
     Content-address the cache directory to the exact tokenizer that filled it.
 
@@ -238,12 +255,14 @@ def cache_tag(meta_path: Path, encoder_path: Path) -> str:
     Args:
       meta_path (Path): tokenizer_meta.json.
       encoder_path (Path): encoder.onnx.
+      style_key (str): style-window geometry; "" keeps legacy tags unchanged.
 
     Returns:
       str: a 12-character hex tag.
     """
     digest = hashlib.sha256()
     digest.update(meta_path.read_bytes())
+    digest.update(style_key.encode())
     digest.update(str(encoder_path.stat().st_size).encode())
     with open(encoder_path, "rb") as handle:
         digest.update(handle.read(4 << 20))
@@ -458,7 +477,11 @@ def extract_codebooks(ckpt_path: Path) -> torch.Tensor:
 
 
 def compute_style_windows(
-    tokens: torch.Tensor, codebooks: torch.Tensor, window_frames: int
+    tokens: torch.Tensor,
+    codebooks: torch.Tensor,
+    window_frames: int,
+    context_frames: int = 0,
+    grid: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Average the quantized latent over fixed windows to get style descriptors.
@@ -468,15 +491,22 @@ def compute_style_windows(
     than per crop keeps the whole corpus's conditioning at ~10 MB and makes
     __getitem__ a single row lookup.
 
+    Legacy mode tiles non-overlapping windows; the final one absorbs the
+    remainder. Grid mode emits one descriptor per full `window_frames` slice,
+    averaged over the slice plus `context_frames` on each side, clamped at the
+    track edges (an edge slice simply averages fewer frames). Bounds always
+    describe the SLICE, not the averaging span.
+
     Args:
       tokens (torch.Tensor): (T, R) int64 indices for one track.
       codebooks (torch.Tensor): (R, N, C) per-level codebooks.
-      window_frames (int): frames averaged per descriptor.
+      window_frames (int): slice length in frames.
+      context_frames (int): extra frames averaged on each side (grid mode).
+      grid (bool): grid mode (overlapping context, full slices only).
 
     Returns:
       tuple[torch.Tensor, torch.Tensor]: (W, C) float32 L2-normalized descriptors
-        and (W, 2) int64 [start, end) frame bounds. The final window absorbs any
-        remainder.
+        and (W, 2) int64 [start, end) slice bounds.
     """
     total, num_rq = tokens.shape
     num_win = max(1, total // window_frames)
@@ -484,14 +514,34 @@ def compute_style_windows(
     vectors = torch.zeros((num_win, codebooks.shape[-1]), dtype=torch.float32)
     for w in range(num_win):
         start = w * window_frames
-        end = total if w == num_win - 1 else (w + 1) * window_frames
-        chunk = tokens[start:end]
-        z_q = torch.zeros((end - start, codebooks.shape[-1]), dtype=torch.float32)
+        end = min(total, (w + 1) * window_frames)
+        if not grid and w == num_win - 1:
+            end = total
+        lo, hi = (max(0, start - context_frames), min(total, end + context_frames)) if grid else (start, end)
+        chunk = tokens[lo:hi]
+        z_q = torch.zeros((hi - lo, codebooks.shape[-1]), dtype=torch.float32)
         for level in range(num_rq):
             z_q += codebooks[level][chunk[:, level]]
         vectors[w] = F.normalize(z_q.mean(dim=0), dim=-1)
         bounds[w] = torch.tensor([start, end])
     return vectors, bounds
+
+
+def style_geometry(cfg: DataCfg, fps: float) -> tuple[int, int, bool, str]:
+    """
+    Resolve the style-window geometry from config.
+
+    Args:
+      cfg (DataCfg): data settings.
+      fps (float): tokenizer frame rate.
+
+    Returns:
+      tuple[int, int, bool, str]: (window_frames, context_frames, grid, cache_key).
+    """
+    if cfg.style_slice_frames:
+        key = f"style{cfg.style_slice_frames}ctx{cfg.style_context_frames}"
+        return cfg.style_slice_frames, cfg.style_context_frames, True, key
+    return max(1, int(round(cfg.style_window_sec * fps))), 0, False, ""
 
 
 def plan_val_windows(
@@ -569,9 +619,12 @@ def build_token_cache(cfg: ArConfig, force: bool = False) -> Path:
     meta: dict[str, Any] = json.loads(meta_path.read_text())
     hop, rate = meta["hop_length"], meta["sample_rate"]
 
+    window_frames, context_frames, grid, style_key = style_geometry(
+        cfg.data, meta["frames_per_second"]
+    )
     cache_dir = (
         Path(os.path.expanduser(tok.cache_root))
-        / f"tokens_{cache_tag(meta_path, enc_path)}"
+        / f"tokens_{cache_tag(meta_path, enc_path, style_key)}"
     )
     manifest_path = cache_dir / "_manifest.json"
     if manifest_path.exists() and not force:
@@ -608,7 +661,6 @@ def build_token_cache(cfg: ArConfig, force: bool = False) -> Path:
             f"tokenizer.margin above {tok.margin} and rebuild"
         )
 
-    window_frames = max(1, int(round(cfg.data.style_window_sec * meta["frames_per_second"])))
     codebooks = extract_codebooks(REPO / tok.checkpoint)
     torch.save(codebooks, cache_dir / "codebooks.pt")
 
@@ -620,7 +672,9 @@ def build_token_cache(cfg: ArConfig, force: bool = False) -> Path:
         ).long()
         if int(tokens.max()) >= torch.iinfo(torch.int16).max:
             raise ValueError("token ids exceed int16 range")
-        style, bounds = compute_style_windows(tokens, codebooks, window_frames)
+        style, bounds = compute_style_windows(
+            tokens, codebooks, window_frames, context_frames, grid
+        )
 
         name = path.stem
         rel = f"{track_idx:03d}_{name.replace(' ', '_')}.pt"
@@ -640,6 +694,8 @@ def build_token_cache(cfg: ArConfig, force: bool = False) -> Path:
                 "num_rq": meta["num_rq"],
                 "num_tokens": meta["num_tokens"],
                 "style_window_frames": window_frames,
+                "style_context_frames": context_frames,
+                "style_grid": grid,
             },
             cache_dir / rel,
         )
@@ -665,6 +721,8 @@ def build_token_cache(cfg: ArConfig, force: bool = False) -> Path:
         "margin": tok.margin,
         "verify": report,
         "style_window_frames": window_frames,
+        "style_context_frames": context_frames,
+        "style_grid": grid,
         "split_params": asdict(cfg.data),
         "tracks": entries,
     }
@@ -783,6 +841,21 @@ def _pick_style(track: TrackTokens, start: int, end: int, rng: random.Random) ->
     return int((centres - centre).abs().argmax())
 
 
+def _check_aligned(cfg: DataCfg) -> bool:
+    """
+    Args:
+      cfg (DataCfg): data settings.
+
+    Returns:
+      bool: True for aligned style conditioning; validates the geometry.
+    """
+    if cfg.style_mode not in ("disjoint", "aligned"):
+        raise ValueError("style_mode must be 'disjoint' or 'aligned'")
+    if cfg.style_mode == "aligned" and cfg.crop_frames != cfg.style_slice_frames:
+        raise ValueError("aligned style_mode requires crop_frames == style_slice_frames")
+    return cfg.style_mode == "aligned"
+
+
 _WORKER_RNG: random.Random | None = None
 
 
@@ -819,6 +892,7 @@ class TokenCropDataset(Dataset):
             raise ValueError(f"no track longer than crop_frames={cfg.crop_frames}")
         self._cfg = cfg
         self._length = length
+        self._aligned = _check_aligned(cfg)
         if cfg.track_weighting == "length":
             self._weights = [float(t.num_frames) for t in self._tracks]
         elif cfg.track_weighting == "uniform":
@@ -834,13 +908,19 @@ class TokenCropDataset(Dataset):
         crop = self._cfg.crop_frames
         for _ in range(64):
             track = rng.choices(self._tracks, weights=self._weights, k=1)[0]
-            start = rng.randrange(0, track.num_frames - crop)
+            if self._aligned:
+                # the crop is one grid slice; its own descriptor conditions it
+                style_idx = rng.randrange(0, track.style_bounds.shape[0])
+                start = int(track.style_bounds[style_idx, 0])
+            else:
+                start = rng.randrange(0, track.num_frames - crop)
             if not _overlaps(start, start + crop, track.val_windows):
                 break
         else:
             raise RuntimeError("could not draw a crop clear of the val windows")
 
-        style_idx = _pick_style(track, start, start + crop, rng)
+        if not self._aligned:
+            style_idx = _pick_style(track, start, start + crop, rng)
         return {
             "tokens": track.tokens[start : start + crop],
             "score_mask": torch.ones(crop, dtype=torch.bool),
@@ -871,13 +951,26 @@ class ValCropDataset(Dataset):
         if not spans:
             raise ValueError("no validation windows; check val_frac")
         self._length = cfg.crop_frames
+        self._aligned = _check_aligned(cfg)
+        if self._aligned:
+            # every grid slice fully inside a held-out window, scored end to end,
+            # conditioned on its own descriptor -- the training condition exactly
+            self._items = [
+                (t, int(t.style_bounds[k, 0]), int(t.style_bounds[k, 0]), int(t.style_bounds[k, 1]), k)
+                for t, lo, hi in spans
+                for k in range(t.style_bounds.shape[0])
+                if int(t.style_bounds[k, 0]) >= lo and int(t.style_bounds[k, 1]) <= hi
+            ]
+            if not self._items:
+                raise ValueError("no grid slice fits inside a validation window")
+            return
         # Each item is a full-length crop ENDING at the held-out window, so the
         # model gets the same 23.8 s of context it trains with; only the held-out
         # frames are scored. Without this, val CE would sit above train CE purely
         # because the window is shorter than a training crop, and the gap would
         # not mean overfitting.
         self._items = [
-            (t, max(0, hi - self._length), lo, hi)
+            (t, max(0, hi - self._length), lo, hi, -1)
             for t, lo, hi in spans
             if t.num_frames >= self._length
         ]
@@ -891,11 +984,12 @@ class ValCropDataset(Dataset):
         return len(self._items)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        track, start, lo, hi = self._items[index]
+        track, start, lo, hi, style_idx = self._items[index]
         end = start + self._length
         score = torch.zeros(self._length, dtype=torch.bool)
         score[max(0, lo - start) : max(0, hi - start)] = True
-        style_idx = _pick_style(track, lo, hi, random.Random(index))
+        if style_idx < 0:
+            style_idx = _pick_style(track, lo, hi, random.Random(index))
         return {
             "tokens": track.tokens[start:end],
             "score_mask": score,
@@ -1124,10 +1218,56 @@ class KVCache:
         self.values = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(n_layers)]
         self.max_length = max_length
         self.length = 0
+        # (B, max_length) bool of slots any later query may attend; None means
+        # every slot. Set by start_incremental when the prefix has padded slots.
+        self.valid: torch.Tensor | None = None
+        # Extra prefix slots sharing rotary position 0, so rotary offsets are
+        # cache.length - rope_shift rather than cache.length.
+        self.rope_shift = 0
+        # (B, 1, P, P) bool prefill mask for the prefix rows, consumed once.
+        self.prefix_mask: torch.Tensor | None = None
 
     def reset(self) -> None:
         """Drop everything stored without freeing the buffers."""
         self.length = 0
+        self.valid = None
+        self.rope_shift = 0
+        self.prefix_mask = None
+
+    @property
+    def rope_offset(self) -> int:
+        """
+        Returns:
+          int: rotary position of the next appended row.
+        """
+        return self.length - self.rope_shift
+
+    def mask(self, length: int, device: torch.device) -> torch.Tensor | None:
+        """
+        Attention mask for `length` new query rows against the stored history.
+
+        Args:
+          length (int): rows about to be appended.
+          device (torch.device): target device.
+
+        Returns:
+          torch.Tensor | None: (B, 1, length, offset + length) bool, or None when
+            plain causal attention is exact -- no padded slots and either a single
+            query or an empty cache.
+        """
+        offset, end = self.length, self.length + length
+        if self.prefix_mask is not None and offset == 0:
+            return self.prefix_mask
+        if self.valid is None:
+            if length == 1 or offset == 0:
+                return None
+            causal = torch.ones(length, end, dtype=torch.bool, device=device)
+            return causal.tril(diagonal=offset)[None, None]
+        valid = self.valid[:, None, None, :end]
+        if length == 1:
+            return valid
+        causal = torch.ones(length, end, dtype=torch.bool, device=device)
+        return valid & causal.tril(diagonal=offset)
 
     def append(
         self, layer: int, key: torch.Tensor, value: torch.Tensor
@@ -1217,18 +1357,9 @@ class CausalSelfAttention(nn.Module):
             )
             return self.proj(out.transpose(1, 2).reshape(batch, length, -1))
 
-        offset = cache.length
+        # row i may see keys up to i + offset, minus any padded prefix slots
+        mask = cache.mask(length, x.device)
         key, value = cache.append(layer, key, value)
-        if length == 1:
-            # one query against the whole history: nothing to mask out
-            mask = None
-        elif offset == 0:
-            mask = None
-        else:
-            # row i may see keys up to i + offset
-            mask = torch.ones(
-                length, offset + length, dtype=torch.bool, device=x.device
-            ).tril(diagonal=offset)
         out = F.scaled_dot_product_attention(
             query,
             key,
@@ -1442,6 +1573,7 @@ class ArTransformer(nn.Module):
         style: torch.Tensor,
         drop_id: torch.Tensor,
         drop_style: torch.Tensor,
+        extra_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Build the conditioning prefix, replacing dropped streams with their nulls.
@@ -1451,16 +1583,21 @@ class ArTransformer(nn.Module):
           style (torch.Tensor): (B, style_dim) float style descriptors.
           drop_id (torch.Tensor): (B,) bool, True where the id is nulled.
           drop_style (torch.Tensor): (B,) bool, True where the style is nulled.
+          extra_ids (torch.Tensor | None): (B, E) int64 further track ids that
+            coexist with the first as id tokens; sampling-only, never trained.
+            Padded entries are masked by the caller, so any id will do there.
 
         Returns:
-          torch.Tensor: (B, 2, d_model) prefix tokens.
+          torch.Tensor: (B, 2 + E, d_model) prefix tokens: id, extras, style.
         """
         ids = torch.where(drop_id, torch.full_like(track_idx, self.num_tracks), track_idx)
-        id_vec = self.track_emb(ids)
+        id_vec = self.track_emb(ids)[:, None]
+        if extra_ids is not None and extra_ids.shape[1]:
+            id_vec = torch.cat([id_vec, self.track_emb(extra_ids)], dim=1)
         style_vec = torch.where(
             drop_style[:, None], self.style_null.to(style.dtype)[None, :], self.style_proj(style)
         )
-        return torch.stack([id_vec, style_vec], dim=1)
+        return torch.cat([id_vec, style_vec[:, None]], dim=1)
 
     def forward(
         self,
@@ -1550,12 +1687,20 @@ class ArTransformer(nn.Module):
         drop_style: torch.Tensor,
         max_length: int,
         cache: KVCache | None = None,
+        extra_ids: torch.Tensor | None = None,
+        extra_valid: torch.Tensor | None = None,
     ) -> KVCache:
         """
         Open a KV cache and consume the conditioning prefix into it.
 
         The prefix is fixed for a whole clip, so it is run once here rather than
         re-embedded every step. Callers then feed token rows to step_incremental.
+
+        Extra ids are a sampling-time construct: several tracks coexisting as id
+        tokens, all at rotary position 0 so the rest of the sequence sits exactly
+        where training put it. Each id slot attends only to itself, which keeps
+        its keys and values identical to the single-track case; only the style
+        slot and the frames that follow ever see more than one id.
 
         Args:
           track_idx (torch.Tensor): (B,) int64 track ids.
@@ -1566,13 +1711,18 @@ class ArTransformer(nn.Module):
           cache (KVCache | None): existing cache to reset and refill, so a
             sliding-window sampler does not reallocate hundreds of MB per
             re-prime. A fresh one is built when omitted.
+          extra_ids (torch.Tensor | None): (B, E) int64 further track ids.
+          extra_valid (torch.Tensor | None): (B, E) bool, False for padded slots
+            a row does not use. Defaults to all True.
 
         Returns:
-          KVCache: cache holding the prefix, length == PREFIX_POSITIONS.
+          KVCache: cache holding the prefix, length == 2 + E.
         """
         if self.frames_per_pos != 1:
             raise NotImplementedError("incremental decoding assumes frames_per_pos == 1")
-        prefix = self.conditioning(track_idx, style, drop_id, drop_style)
+        prefix = self.conditioning(track_idx, style, drop_id, drop_style, extra_ids)
+        batch, width, _ = prefix.shape
+        extra = width - PREFIX_POSITIONS
         if cache is None:
             cache = KVCache(
                 n_layers=len(self.blocks),
@@ -1585,10 +1735,31 @@ class ArTransformer(nn.Module):
             )
         else:
             cache.reset()
-        cos, sin = self._rope(prefix.shape[1], prefix.device, prefix.dtype)
+        if extra:
+            device = prefix.device
+            if extra_valid is None:
+                extra_valid = torch.ones(batch, extra, dtype=torch.bool, device=device)
+            slot_valid = torch.cat(
+                [torch.ones(batch, 1, dtype=torch.bool, device=device), extra_valid], dim=1
+            )  # (B, 1 + E): which id slots are real
+            valid = torch.ones(batch, max_length, dtype=torch.bool, device=device)
+            valid[:, 1 : 1 + extra] = extra_valid
+            # id slots see only themselves; the style slot sees every real id
+            eye = torch.eye(width, dtype=torch.bool, device=device)
+            prefix_mask = eye[None, None].expand(batch, 1, -1, -1).clone()
+            prefix_mask[:, 0, -1, :-1] = slot_valid
+            cache.prefix_mask = prefix_mask
+            cache.valid = valid
+            cache.rope_shift = extra
+            positions = torch.tensor([0] * (1 + extra) + [1], device=device)
+            cos, sin = self._rope(PREFIX_POSITIONS, device, prefix.dtype)
+            cos, sin = cos[positions], sin[positions]
+        else:
+            cos, sin = self._rope(width, prefix.device, prefix.dtype)
         hidden = prefix
         for index, block in enumerate(self.blocks):
             hidden = block(hidden, cos, sin, cache, index)
+        cache.prefix_mask = None
         return cache
 
     @torch.no_grad()
@@ -1609,7 +1780,7 @@ class ArTransformer(nn.Module):
         """
         batch, length, _ = tokens_in.shape
         hidden = self._embed(tokens_in)
-        cos, sin = self._rope(length, hidden.device, hidden.dtype, offset=cache.length)
+        cos, sin = self._rope(length, hidden.device, hidden.dtype, offset=cache.rope_offset)
         for index, block in enumerate(self.blocks):
             hidden = block(hidden, cos, sin, cache, index)
         return self._project(self.norm_out(hidden), batch, length)
@@ -1989,6 +2160,7 @@ def build_trainer(cfg: ArConfig) -> L.Trainer:
         devices=cfg.train.devices,
         precision=cfg.train.precision,
         max_epochs=-1,
+        accumulate_grad_batches=cfg.train.accumulate_grad_batches,
         gradient_clip_val=cfg.train.grad_clip,
         callbacks=callbacks,
         logger=L.pytorch.loggers.TensorBoardLogger(str(save_path), name="ar"),

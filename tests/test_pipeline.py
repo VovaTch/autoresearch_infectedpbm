@@ -555,7 +555,7 @@ def test_a_banked_clip_known_to_be_dead_is_not_reserved(
         pipeline.pump()
     for spec in bank.specs():
         bank.set_fill(spec.item_id, 0.01)
-    assert pipeline._banked_structure_spec() is None
+    assert pipeline._banked_spec(Tier.STRUCTURE) is None
 
 
 def test_switching_checkpoints_empties_the_queue(pipeline: PairPipeline) -> None:
@@ -570,8 +570,13 @@ def test_switching_checkpoints_empties_the_queue(pipeline: PairPipeline) -> None
     pipeline.pump()
     pair = pipeline.next_pair()
     assert pair is not None
-    assert pair.spec.left.checkpoint == "other_ckpt"
-    assert pair.spec.right.checkpoint == "other_ckpt"
+    # Only generated sides carry a checkpoint. An anchor's reference side is
+    # real tokens and is tagged "", so asserting it equals the new checkpoint
+    # fails whenever the draw happens to land on an anchor.
+    for clip in (pair.spec.left, pair.spec.right):
+        if clip.is_reference:
+            continue
+        assert clip.checkpoint == "other_ckpt"
 
 
 def test_clips_from_the_old_checkpoint_are_dropped_on_arrival(
@@ -623,7 +628,7 @@ def test_banked_structure_pairs_from_another_checkpoint_are_not_offered(
 
     seeded.set_checkpoint("other_ckpt")
     assert seeded.banked_structure_pairs() == 0
-    assert seeded._banked_structure_spec() is None
+    assert seeded._banked_spec(Tier.STRUCTURE) is None
 
 
 def test_repeats_do_not_survive_a_checkpoint_switch(sampler: PairSampler) -> None:
@@ -639,3 +644,60 @@ def test_repeats_do_not_survive_a_checkpoint_switch(sampler: PairSampler) -> Non
         ""
     }
     assert tags == {"other_ckpt"}
+
+
+def test_banked_bulk_pairs_are_served_instead_of_regenerating(
+    sampler: PairSampler, bank: ClipBank
+) -> None:
+    # A freshly drawn bulk spec is a fresh random recipe -- two 2**31 seeds over
+    # a random span -- so it never matches what a bake put in the bank. Before
+    # the banked substitution ran for bulk as well as structure, bake_ab_bank's
+    # whole bulk output sat unservable and every draw regenerated from scratch.
+    banker = PairPipeline(sampler, FakeProducer(store=bank), bank, depth=2)
+    for _ in range(6):
+        banker.request(Tier.BULK, 1)
+    banker.pump()
+    assert bank.specs(Tier.BULK)
+
+    pipeline = PairPipeline(
+        sampler, FakeProducer(store=bank), bank, depth=2, structure_live=True
+    )
+    drawn = [pipeline._draw() for _ in range(20)]
+    # Repeats replay an earlier pair and anchors carry a banked reference, so
+    # both are banked whatever the draw path does; only an ordinary gen-vs-gen
+    # draw shows whether banked material is reached at all.
+    bulk = [
+        s
+        for s in drawn
+        if s is not None
+        and s.tier is Tier.BULK
+        and not s.is_repeat
+        and not s.is_anchor
+    ]
+    assert bulk, "no ordinary bulk drawn"
+    assert any(pipeline._is_banked(spec) for spec in bulk)
+
+
+def test_banked_substitution_never_swallows_an_anchor(
+    sampler: PairSampler, bank: ClipBank
+) -> None:
+    # Anchors carry the section 7.6 fatigue check and repeats the self-agreement
+    # statistic. Substituting banked material over either would silently drop
+    # both measurements while the bank looked healthy.
+    banker = PairPipeline(sampler, FakeProducer(store=bank), bank, depth=2)
+    for _ in range(8):
+        banker.request(Tier.BULK, 1)
+    banker.pump()
+
+    pipeline = PairPipeline(
+        sampler, FakeProducer(store=bank), bank, depth=2, structure_live=True
+    )
+    for _ in range(60):
+        spec = pipeline._draw()
+        if spec is None:
+            continue
+        if spec.is_anchor:
+            # A substituted pair is gen-vs-gen and would have lost the reference.
+            assert any(
+                clip.is_reference for clip in (spec.left, spec.right)
+            ), "anchor lost its reference side to a banked substitution"

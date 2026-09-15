@@ -8,13 +8,18 @@ defect that costs a full listen to find by ear and none at all to find by eye.
 It shows the audio the rater is about to hear and nothing else -- no id, no
 seed, no checkpoint -- so it cannot break the blind. Both sides are drawn with
 the same scale and the same colour for the same reason.
+
+Clicking or dragging on the strip moves the playhead there. On the 90 s
+structure tier the interesting part is rarely at the top, and the alternative is
+sitting through the dead air the model is prone to (measured at 30% of a 90 s
+clip) before the passage being judged even starts.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QColor, QPainter, QPaintEvent, QResizeEvent
+from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPaintEvent, QResizeEvent
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from ab_harness.model.audio import envelope
@@ -28,17 +33,20 @@ MIN_BAR_PX = 2
 
 class WaveformView(QWidget):
     """
-    A fixed-height envelope strip with a playhead.
+    A fixed-height envelope strip with a playhead, scrubbable by mouse.
 
     Args:
       height (int): widget height in pixels.
       parent (QWidget | None): Qt parent.
     """
 
+    scrubbed = Signal(float)
+
     def __init__(self, height: int = 64, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setFixedHeight(height)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._pcm: np.ndarray = np.zeros(0, dtype=np.int16)
         self._peaks: np.ndarray = np.zeros(0, dtype=np.float32)
         self._position = 0.0
@@ -71,6 +79,39 @@ class WaveformView(QWidget):
         if active != self._active:
             self._active = active
             self.update()
+
+    # -- input ---------------------------------------------------------------
+
+    def _emit_scrub(self, event: QMouseEvent) -> None:
+        """
+        Args:
+          event (QMouseEvent): press or drag whose x maps to a position.
+        """
+        if self._pcm.size == 0 or self.width() <= 0:
+            return
+        self.scrubbed.emit(min(1.0, max(0.0, event.position().x() / self.width())))
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        """
+        Args:
+          event (QMouseEvent): the click. Left button only; the strip has no
+            context menu, and a middle-click paste on X11 would seek blindly.
+        """
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._emit_scrub(event)
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        """
+        Args:
+          event (QMouseEvent): the drag. Held-button scrubbing is how a rater
+            finds a moment they heard once and want again.
+        """
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self._emit_scrub(event)
+        else:
+            super().mouseMoveEvent(event)
 
     # -- painting ------------------------------------------------------------
 

@@ -1,0 +1,84 @@
+# AR stage at 16384-frame context, trained FROM SCRATCH with dropout.
+#
+# Supersedes the warm-started config_ar_16k.yaml run, which was stopped at 7.3 h.
+# eval_val.py scored the old base weights on identical held-out windows and
+# settled what was and was not to blame:
+#
+#     crop   theta   val CE
+#     4096   10000   29.22   <- the base model's OWN trained geometry
+#     4096   40000   29.67
+#    16384   10000   22.82
+#    16384   40000   23.99
+#    uniform random over 2048 codes = 7.62
+#
+# So 16384 context is a 6.4-CE IMPROVEMENT on identical weights and was never
+# the problem; rope_theta 40000 costs ~1.2 and is reverted to 10000 here.
+#
+# The problem is overfitting. Val CE ~29 against a 7.62 random baseline means
+# p(correct) ~ 1e-13 on unseen frames while train CE sits at 0.002. 6.25 h of
+# corpus and ~946 distinct crops seen ~1000 times each, with dropout: 0.0 and
+# nothing else regularising. Warm-starting cannot undo that, so this run starts
+# from random init with dropout 0.15.
+#
+# p_drop_cond 0.5 keeps the requested 25/25/25/25 split over both / id only /
+# style only / neither -- the coins are independent per stream (section 11.2).
+#
+# Sample accounting matches the 4096 runs: steps_per_epoch 2000 x batch_size 2
+# = 4000 crops per epoch, and accumulate_grad_batches 4 makes those 500
+# optimiser steps. Crops are drawn at random offsets, which overlaps more finely
+# than a fixed 4096 stride and beats the 236 windows a non-overlapping 16384
+# grid would allow. Measured cost: 1055 ms/step at batch 2 against 703 ms for
+# batch 8 at 4096 -- same frames per step, same 19.2 GiB. batch 4 OOMs.
+#
+# Command (detached, per the power-loss finding):
+#   CUDA_VISIBLE_DEVICES=0 setsid nohup uv run python train_ar.py \
+#     --config config_ar_16k_scratch.yaml > logs/train_ar_16k_scratch.log 2>&1 &
+
+tokenizer:
+  encoder_onnx: onnx/encoder.onnx
+  meta: onnx/tokenizer_meta.json
+  checkpoint: saved_20260827_cont9h/lvl1_vqgan_last.ckpt  # codebook source
+  tracks_dir: ~/.cache/infected_pbm/tracks
+  slices_dir: ~/.cache/infected_pbm/slices  # fallback for 7 mp3s torchcodec rejects
+  cache_root: ~/.cache/infected_pbm
+  chunk_frames: 4096    # frames emitted per encoder window
+  margin: 256           # context frames discarded per side; trunk RF is ~120
+  verify_tolerance: 0.005  # argmax near-tie floor; level 0 must still be exact
+
+data:
+  crop_frames: 16384    # 95.1 s @ 172.27 fps
+  frames_per_pos: 1     # >1 folds F frames into one position; F=1 is the tested path
+  style_window_sec: 10.0
+  val_frac: 0.04        # held-out share per track
+  val_windows_per_track: 2
+  min_val_window: 512
+  split_seed: 1234      # split depends on data only, never on the model
+  track_weighting: length
+  steps_per_epoch: 2000 # x batch_size 2 = 4000 crops, as the 4096 run had
+  single_track: null    # substring filter, for the one-track overfit check
+
+model:
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  dropout: 0.15         # was 0.0: no regularisation at all on a 6.25 h corpus
+  style_bottleneck: 128 # keeps the style stream low-bandwidth (section 11.3)
+  p_drop_cond: 0.5      # 25/25/25/25 both / id / style / neither
+  rope_theta: 10000.0   # 40000 measured 1.2 CE worse; reverted
+
+train:
+  devices: 1
+  minutes: 1440         # 24 h
+  lr: 3.0e-4            # from-scratch default
+  lr_pct_start: 0.05
+  lr_div_factor: 25
+  batch_size: 2         # VRAM ceiling at 16384; batch 4 OOMs
+  accumulate_grad_batches: 4  # effective batch 8 crops, as before
+  precision: bf16-mixed
+  weight_decay: 0.01
+  grad_clip: 1.0
+  num_workers: 4
+  ema_decay: null
+  seed: 42
+  save_path: saved_ar_20260906_16k_scratch/
+  checkpoint: null      # from scratch; warm starts inherit the memorisation

@@ -94,6 +94,7 @@ class MainWindow(QMainWindow):
         self.view.play_pause.connect(player.toggle_play)
         self.view.restart.connect(player.restart)
         self.view.listen_from_start.connect(self._listen_from_start)
+        self.view.scrubbed.connect(player.seek_fraction)
         self.view.picked.connect(self._on_picked)
         self.view.generate.connect(self._on_generate)
 

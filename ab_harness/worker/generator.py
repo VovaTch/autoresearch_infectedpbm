@@ -53,7 +53,7 @@ class SampleRequest:
 
     Args:
       track_idx (int): conditioning track id.
-      style (torch.Tensor): (style_dim,) descriptor.
+      style (torch.Tensor): (style_dim,) descriptor for the first segment.
       use_track_id (bool): False nulls the id stream.
       use_style (bool): False nulls the style stream.
       frames (int): aligned frames T to produce.
@@ -65,6 +65,14 @@ class SampleRequest:
         logits directly, which is what generate_ar.generate does. A guided lane
         occupies two rows of the batch, one of them the unconditional pass.
       seed (int | None): per-lane RNG seed.
+      co_tracks (tuple[int, ...]): further track ids that coexist with
+        track_idx as id tokens at the same rotary position. Ignored when the id
+        stream is nulled.
+      style_schedule (tuple[torch.Tensor, ...]): descriptors for segments
+        1, 2, ... ; segment k takes over at position k * style_period, the last
+        one holding to the end. A precomputed tuple today; a model that predicts
+        the next style would replace it with something called at each boundary.
+      style_period (int): positions per style segment; 0 keeps `style` fixed.
     """
 
     track_idx: int
@@ -78,6 +86,25 @@ class SampleRequest:
     top_p: float = 0.0
     cfg_strength: float = 0.0
     seed: int | None = None
+    co_tracks: tuple[int, ...] = ()
+    style_schedule: tuple[torch.Tensor, ...] = ()
+    style_period: int = 0
+
+    def style_at(self, step: int) -> torch.Tensor | None:
+        """
+        Args:
+          step (int): position about to be sampled.
+
+        Returns:
+          torch.Tensor | None: the descriptor that takes over at exactly this
+            step, or None when nothing changes here.
+        """
+        if not self.style_schedule or self.style_period <= 0 or step <= 0:
+            return None
+        if step % self.style_period:
+            return None
+        segment = min(step // self.style_period, len(self.style_schedule))
+        return self.style_schedule[segment - 1]
 
     @property
     def guided(self) -> bool:
@@ -125,33 +152,78 @@ class ArGenerator:
 
     # -- cache plumbing ------------------------------------------------------
 
+    def _start(self, cache: KVCache | None) -> KVCache:
+        """
+        Args:
+          cache (KVCache | None): buffers to refill, or None for fresh ones.
+
+        Returns:
+          KVCache: a cache holding the current prefix.
+        """
+        assert self._prefix is not None
+        ids, styles, drop_id, drop_style, extra_ids, extra_valid = self._prefix
+        return self.model.start_incremental(
+            ids,
+            styles,
+            drop_id,
+            drop_style,
+            self.max_length + extra_ids.shape[1],
+            cache,
+            extra_ids=extra_ids,
+            extra_valid=extra_valid,
+        )
+
     def _open(self, prefix: tuple[torch.Tensor, ...]) -> None:
         """
         Start a batch: build or reset the cache and load the conditioning prefix.
 
         Args:
-          prefix (tuple[torch.Tensor, ...]): (ids, styles, drop_id, drop_style).
+          prefix (tuple[torch.Tensor, ...]): (ids, styles, drop_id, drop_style,
+            extra_ids, extra_valid).
         """
         self._prefix = prefix
         rows = prefix[0].shape[0]
+        length = self.max_length + prefix[4].shape[1]
         reuse = (
             self._cache
-            if self._cache is not None and self._cache.keys[0].shape[0] == rows
+            if self._cache is not None
+            and self._cache.keys[0].shape[0] == rows
+            and self._cache.max_length == length
             else None
         )
-        self._cache = self.model.start_incremental(*prefix, self.max_length, reuse)
+        self._cache = self._start(reuse)
         self._fed = []
 
-    def _reprime(self) -> None:
-        """Rebuild the cache from the tail of what has been fed so far."""
+    def _reprime(self, keep_rows: int | None = None) -> None:
+        """
+        Rebuild the cache from the tail of what has been fed so far.
+
+        Args:
+          keep_rows (int | None): rows of context to re-feed; the sliding-window
+            default drops a fraction, while a conditioning change mid-clip keeps
+            everything that still fits so no context is lost to it.
+        """
         assert self._cache is not None and self._prefix is not None
-        keep = self._fed[-self.keep_rows :]
-        self._cache = self.model.start_incremental(
-            *self._prefix, self.max_length, self._cache
-        )
+        keep = self._fed[-(self.keep_rows if keep_rows is None else keep_rows) :]
+        self._cache = self._start(self._cache)
         self._fed = keep
         if keep:
             self.model.step_incremental(torch.cat(keep, dim=1), self._cache)
+
+    def _restyle(self, rows: Sequence[int], styles: Sequence[torch.Tensor]) -> None:
+        """
+        Swap the style token of some rows and re-prime so the change takes.
+
+        Args:
+          rows (Sequence[int]): batch rows whose style changes.
+          styles (Sequence[torch.Tensor]): (style_dim,) descriptor per row.
+        """
+        assert self._prefix is not None
+        updated = self._prefix[1].clone()
+        for row, style in zip(rows, styles):
+            updated[row] = style.to(updated.device, updated.dtype)
+        self._prefix = (self._prefix[0], updated) + tuple(self._prefix[2:])
+        self._reprime(keep_rows=min(len(self._fed), self.window - 1))
 
     def _feed(self, rows: torch.Tensor) -> torch.Tensor:
         """
@@ -181,8 +253,13 @@ class ArGenerator:
         Args:
           requests (Sequence[SampleRequest]): the lanes to sample.
 
+        Extra ids are padded to the widest lane in the batch; a row's unused
+        slots are marked invalid and never attended, so a single-track lane in a
+        multi-track batch samples exactly as it would alone.
+
         Returns:
-          tuple: the prefix tensors, the conditional row index per lane, and the
+          tuple: the prefix tensors (ids, styles, drop_id, drop_style,
+            extra_ids, extra_valid), the conditional row index per lane, and the
             unconditional row index per lane (-1 when the lane is unguided).
         """
         null_id = self.model.num_tracks
@@ -190,6 +267,7 @@ class ArGenerator:
         styles: list[torch.Tensor] = []
         drop_id: list[bool] = []
         drop_style: list[bool] = []
+        extras: list[tuple[int, ...]] = []
         cond_row: list[int] = []
         null_row: list[int] = []
 
@@ -201,6 +279,7 @@ class ArGenerator:
                 styles.append(torch.zeros_like(style))
                 drop_id.append(True)
                 drop_style.append(True)
+                extras.append(())
             else:
                 null_row.append(-1)
             cond_row.append(len(ids))
@@ -208,12 +287,22 @@ class ArGenerator:
             styles.append(style)
             drop_id.append(not request.use_track_id)
             drop_style.append(not request.use_style)
+            extras.append(tuple(request.co_tracks) if request.use_track_id else ())
+
+        width = max((len(e) for e in extras), default=0)
+        extra_ids = torch.full((len(ids), width), null_id, dtype=torch.long)
+        extra_valid = torch.zeros((len(ids), width), dtype=torch.bool)
+        for row, extra in enumerate(extras):
+            extra_ids[row, : len(extra)] = torch.tensor(extra, dtype=torch.long)
+            extra_valid[row, : len(extra)] = True
 
         prefix = (
             torch.tensor(ids, device=self.device, dtype=torch.long),
             torch.stack(styles).to(self.device),
             torch.tensor(drop_id, device=self.device),
             torch.tensor(drop_style, device=self.device),
+            extra_ids.to(self.device),
+            extra_valid.to(self.device),
         )
         return prefix, cond_row, null_row
 
@@ -297,6 +386,13 @@ class ArGenerator:
         )
 
         for step in range(total):
+            changes = [
+                (cond_row[lane], style)
+                for lane, request in enumerate(requests)
+                if (style := request.style_at(step)) is not None
+            ]
+            if changes:
+                self._restyle([row for row, _ in changes], [s for _, s in changes])
             logits = self._feed(current).float()
             picks = []
             for lane, request in enumerate(requests):

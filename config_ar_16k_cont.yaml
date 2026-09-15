@@ -1,0 +1,73 @@
+# Second 24 h at 16384 context, continuing the from-scratch run.
+#
+# Warm-starts from saved_ar_20260906_16k_scratch/ar_latest.ckpt -- the END state
+# of run 1, not its val-selected ar_best. That is deliberate: checkpoint
+# discovery in ab_harness/checkpoints.py sorts by mtime, so *_latest is what the
+# rating harness serves, and the run that produces it is the run that matters.
+#
+# Run 1 result, for reference (uniform-random CE over 2048 codes = 7.62):
+#
+#     val 7.67 at ~1.6 h (ar_best), then a plateau at 8.37 through epoch 36
+#     train 0.143 at epoch 36
+#
+# Dropout 0.15 took val from the old model's 29.2 down to 8.4, so the
+# catastrophic overfit is gone, but train 0.143 against val 8.37 says the model
+# still memorises and the val minimum still arrives early. lr is therefore
+# dropped from the from-scratch 3.0e-4 to 1.0e-4: TimeOneCycleLR restarts its
+# cycle on every run, and re-warming to 3.0e-4 on an already-converged model is
+# the fastest way to spend 24 h making val worse.
+#
+# Everything else is unchanged from run 1 so the two are comparable.
+#
+# Command (detached, per the power-loss finding):
+#   CUDA_VISIBLE_DEVICES=0 setsid nohup uv run python train_ar.py \
+#     --config config_ar_16k_cont.yaml > logs/train_ar_16k_cont.log 2>&1 &
+
+tokenizer:
+  encoder_onnx: onnx/encoder.onnx
+  meta: onnx/tokenizer_meta.json
+  checkpoint: saved_20260827_cont9h/lvl1_vqgan_last.ckpt  # codebook source
+  tracks_dir: ~/.cache/infected_pbm/tracks
+  slices_dir: ~/.cache/infected_pbm/slices  # fallback for 7 mp3s torchcodec rejects
+  cache_root: ~/.cache/infected_pbm
+  chunk_frames: 4096    # frames emitted per encoder window
+  margin: 256           # context frames discarded per side; trunk RF is ~120
+  verify_tolerance: 0.005  # argmax near-tie floor; level 0 must still be exact
+
+data:
+  crop_frames: 16384    # 95.1 s @ 172.27 fps
+  frames_per_pos: 1     # >1 folds F frames into one position; F=1 is the tested path
+  style_window_sec: 10.0
+  val_frac: 0.04        # held-out share per track
+  val_windows_per_track: 2
+  min_val_window: 512
+  split_seed: 1234      # split depends on data only, never on the model
+  track_weighting: length
+  steps_per_epoch: 2000 # x batch_size 2 = 4000 crops, as the 4096 run had
+  single_track: null    # substring filter, for the one-track overfit check
+
+model:
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  dropout: 0.15         # was 0.0: no regularisation at all on a 6.25 h corpus
+  style_bottleneck: 128 # keeps the style stream low-bandwidth (section 11.3)
+  p_drop_cond: 0.5      # 25/25/25/25 both / id / style / neither
+  rope_theta: 10000.0   # 40000 measured 1.2 CE worse; reverted
+
+train:
+  devices: 1
+  minutes: 1440         # 24 h
+  lr: 1.0e-4            # continuation, not a fresh cycle; see header
+  lr_pct_start: 0.05
+  lr_div_factor: 25
+  batch_size: 2         # VRAM ceiling at 16384; batch 4 OOMs
+  accumulate_grad_batches: 4  # effective batch 8 crops, as before
+  precision: bf16-mixed
+  weight_decay: 0.01
+  grad_clip: 1.0
+  num_workers: 4
+  ema_decay: null
+  seed: 42
+  save_path: saved_ar_20260907_16k_cont/
+  checkpoint: saved_ar_20260906_16k_scratch/ar_latest.ckpt  # run 1 end state

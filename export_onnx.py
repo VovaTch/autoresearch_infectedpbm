@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from render_samples import _apply_ema
 from train import (
     build_learning_params,
     build_loss_aggregator,
@@ -427,8 +428,15 @@ def main() -> None:
         per_level_codebooks=args.per_level_codebooks,
     )
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    module.load_state_dict(ckpt["state_dict"] if "state_dict" in ckpt else ckpt,
-                           strict=True)
+    sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+    # generator only: the critic ensemble may differ from the default build
+    gen_sd = {k: v for k, v in sd.items() if not k.startswith("discriminator.")}
+    result = module.load_state_dict(gen_sd, strict=False)
+    bad = [k for k in result.missing_keys if not k.startswith("discriminator.")]
+    if bad or result.unexpected_keys:
+        raise RuntimeError(f"generator keys missing {bad} / unexpected {result.unexpected_keys}")
+    # test metrics and renders use the EMA weights; export those, not the raw ones
+    print(f"EMA weights applied: {_apply_ema(module, ckpt)}")
     module.eval()
     net = module.model
     for p in net.parameters():
