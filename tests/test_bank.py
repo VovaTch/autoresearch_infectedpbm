@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 from ab_harness.model.bank import ClipBank, TokenizerMismatch
-from ab_harness.model.types import ClipSpec, Conditioning, Sampling, Tier
+from ab_harness.model.types import (
+    WALK_FIELDS,
+    ClipSpec,
+    Conditioning,
+    Sampling,
+    Tier,
+)
 
 
 def _spec(item: str, group: str = "g0", tier: Tier = Tier.BULK) -> ClipSpec:
@@ -113,3 +121,25 @@ def test_fills_accumulate_rather_than_overwrite(bank: ClipBank) -> None:
     reopened = ClipBank(bank.root)
     assert reopened.fill("i0") == pytest.approx(0.3)
     assert reopened.fill("i1") == pytest.approx(0.7)
+
+
+def test_a_walking_spec_roundtrips_and_an_old_record_loads(bank: ClipBank) -> None:
+    spec = _spec("w0")
+    walking = replace(
+        spec,
+        conditioning=replace(
+            spec.conditioning,
+            style_walk="ar",
+            style_period=512,
+            style_ar_temperature=1.2,
+            style_seed=77,
+        ),
+    )
+    bank.add(walking, np.zeros((8, 3), dtype=np.int16))
+    assert ClipBank(bank.root).spec("w0") == walking
+    assert ClipBank(bank.root).spec("w0").conditioning.walking
+    # a record written before walks existed has no walk keys at all
+    raw = spec.to_json()
+    for key in WALK_FIELDS:
+        del raw["conditioning"][key]
+    assert ClipSpec.from_json(raw) == spec

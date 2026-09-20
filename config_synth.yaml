@@ -28,6 +28,11 @@ generator:
   # on that -- sixteen variants cost what one does.
   max_batch: 16
   batch_wait_s: 0.5
+  # Style-level model behind the "ar" style walk (train_style_ar.py); auto =
+  # the newest saved_style_ar_* run. Pinned to the all-tracks run: the ho5
+  # recipe run is newer but has no id rows for its 5 held-out tracks. Only
+  # loaded when such a walk is rendered.
+  style_ar_checkpoint: saved_style_ar_20260916_all/last.ckpt
 
 output:
   root: renders_synth
@@ -49,3 +54,9 @@ ui:
   crossfade_ms: 5.0
   mel_columns: 1024
   seeds: 1
+  # Every new style entry opens walking with the style model: the entry's
+  # window is heard first, then one sampled descriptor per 512 positions.
+  # Pick "none" in the entry to hold a single window instead.
+  style_walk: ar
+  style_ar_temperature: 1.2
+  style_ar_cfg: 1.0

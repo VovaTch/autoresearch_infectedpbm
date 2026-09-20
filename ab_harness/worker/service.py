@@ -22,6 +22,7 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 
+from ab_harness.checkpoints import AUTO
 from ab_harness.config import REPO, AbConfig
 from ab_harness.model.audio import fill_fraction, normalize_lufs, to_int16
 from ab_harness.model.bank import ClipBank
@@ -37,6 +38,7 @@ from ab_harness.worker.protocol import (
     Shutdown,
     SwitchCheckpoint,
 )
+from ab_harness.worker.style_ar import StyleArSampler, walk_from_window
 from train_ar import TrackTokens
 
 
@@ -49,7 +51,9 @@ def style_vector(track: TrackTokens, spec: ClipSpec) -> torch.Tensor:
     loading a GenerationService and its ONNX decoder.
 
     Args:
-      track (TrackTokens): the cached track the clip was drawn from.
+      track (TrackTokens): the cached track the style window comes from --
+        conditioning.style_track, which is the span's own track unless the
+        style stream crosses.
       spec (ClipSpec): the clip being generated.
 
     Returns:
@@ -75,6 +79,7 @@ class GenerationService:
         self.bank = ClipBank(cfg.bank_root)
         self.checkpoint = cfg.generator.checkpoint
         self._tracks: dict[int, TrackTokens] = {}
+        self._style_ar: StyleArSampler | None = None
         self._ordered_tracks: list[TrackTokens] = []
         self._manifest: dict[str, Any] = {}
         self._cache_dir: Path | None = None
@@ -223,7 +228,54 @@ class GenerationService:
         Returns:
           torch.Tensor: (style_dim,) descriptor, zeros when the stream is nulled.
         """
-        return style_vector(self._tracks[spec.conditioning.track_idx], spec)
+        return style_vector(self._tracks[spec.conditioning.style_track], spec)
+
+    def _style_ar_sampler(self) -> StyleArSampler:
+        """
+        Returns:
+          StyleArSampler: the style model, loaded on first use -- only a walking
+            clip needs it, so a session that never draws one never pays.
+
+        Raises:
+          FileNotFoundError: when no style-AR checkpoint exists.
+        """
+        if self._style_ar is None:
+            spec = self.cfg.generator.style_ar_checkpoint
+            if spec in AUTO:
+                raise FileNotFoundError(
+                    "no style-AR checkpoint (saved_style_ar_*); train one with "
+                    "train_style_ar.py or set generator.style_ar_checkpoint"
+                )
+            self._style_ar = StyleArSampler(spec)
+        return self._style_ar
+
+    def _style_schedule(self, spec: ClipSpec) -> tuple[torch.Tensor, ...]:
+        """
+        Args:
+          spec (ClipSpec): the clip being generated.
+
+        Returns:
+          tuple[torch.Tensor, ...]: descriptors for segments 1, 2, ...; empty
+            unless the style walks. Segment 0 stays the real window.
+        """
+        cond = spec.conditioning
+        if not cond.walking:
+            return ()
+        assert self._generator is not None, "load() first"
+        positions = spec.n_frames + self._generator.depth - 1
+        segments = -(-positions // cond.style_period)
+        rows = walk_from_window(
+            self._style_ar_sampler(),
+            self._tracks[cond.style_track].style,
+            cond.style_window,
+            cond.id_track if cond.use_track_id else None,
+            segments,
+            cond.style_ar_prefix,
+            cond.style_ar_temperature,
+            cond.style_ar_cfg,
+            cond.style_seed,
+        )
+        return tuple(rows[1:])
 
     def _request(self, spec: ClipSpec) -> SampleRequest:
         """
@@ -240,7 +292,7 @@ class GenerationService:
                 self._real_tokens(spec)[: cond.prompt_frames]
             ).long()
         return SampleRequest(
-            track_idx=cond.track_idx,
+            track_idx=cond.id_track,
             style=self._style_vector(spec),
             use_track_id=cond.use_track_id,
             use_style=cond.use_style,
@@ -251,6 +303,8 @@ class GenerationService:
             top_p=sampling.top_p,
             cfg_strength=cond.cfg_strength,
             seed=sampling.seed,
+            style_schedule=self._style_schedule(spec),
+            style_period=cond.style_period if cond.walking else 0,
         )
 
     def _audio_result(

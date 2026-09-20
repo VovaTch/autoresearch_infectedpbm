@@ -38,7 +38,7 @@ import torch
 import torchaudio
 
 from train_ar import (
-    _pick_style,
+    _check_aligned,
     ArConfig,
     ArTransformer,
     DataCfg,
@@ -49,6 +49,8 @@ from train_ar import (
     build_delay_grid,
     build_model,
     load_token_cache,
+    pick_style_for_span,
+    token_cache_dir,
     undelay_grid,
 )
 
@@ -322,7 +324,9 @@ def main() -> None:
     ap.add_argument("--track", default=None, help="substring; default = first loaded")
     ap.add_argument("--seconds", type=float, default=10.0)
     ap.add_argument("--prompt-sec", type=float, default=3.0, help="0 = cold start")
-    ap.add_argument("--start-frac", type=float, default=0.35, help="where to prompt from")
+    ap.add_argument(
+        "--start-frac", type=float, default=0.35, help="where to prompt from"
+    )
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=250)
     ap.add_argument("--top-p", type=float, default=0.0)
@@ -337,13 +341,14 @@ def main() -> None:
     ckpt = torch.load(REPO / args.ckpt, map_location="cpu", weights_only=False)
     cfg = config_from_ckpt(ckpt)
 
-    cache_root = Path(cfg.tokenizer.cache_root).expanduser()
-    caches = sorted(cache_root.glob("tokens_*"))
-    if not caches:
-        raise SystemExit(f"no token cache under {cache_root}")
+    cache_dir = token_cache_dir(cfg)
+    if not (cache_dir / "_manifest.json").exists():
+        raise SystemExit(f"token cache for this checkpoint missing: {cache_dir}")
     # Load the whole corpus: single_track would hide the track we want to name.
     data_cfg = DataCfg(**{**vars(cfg.data), "single_track": None})
-    tracks, manifest = load_token_cache(caches[-1], data_cfg)
+    tracks, manifest = load_token_cache(cache_dir, data_cfg)
+    aligned = _check_aligned(data_cfg)
+    print(f"token cache {cache_dir.name}  style_mode={cfg.data.style_mode}")
     meta = manifest["tokenizer_meta"]
     fps, hop = meta["frames_per_second"], meta["hop_length"]
     sr = int(meta["sample_rate"])
@@ -385,11 +390,11 @@ def main() -> None:
     start = max(0, min(start, track.num_frames - n_frames - 1))
     ref = track.tokens[start : start + n_frames].long()
 
-    # Section 11.3: training always draws the style descriptor from a window
-    # DISJOINT from the crop, so conditioning never carries the answer. Sampling
-    # has to honour the same rule or it is conditioned on out-of-distribution
-    # input -- and would flatter itself by echoing the target.
-    style_idx = _pick_style(track, start, start + n_frames, random.Random(args.seed))
+    # Match the training-time conditioning rule: disjoint models never see the
+    # target's own window (Section 11.3); aligned models always do.
+    style_idx = pick_style_for_span(
+        track, start, start + n_frames, aligned, random.Random(args.seed)
+    )
     bounds = track.style_bounds[style_idx]
     style = track.style[style_idx]
     print(
@@ -412,7 +417,9 @@ def main() -> None:
     if args.recon_only:
         return
 
-    print(f"\nsampling {n_frames} frames (T={args.temperature} k={args.top_k} p={args.top_p})")
+    print(
+        f"\nsampling {n_frames} frames (T={args.temperature} k={args.top_k} p={args.top_p})"
+    )
     gen = generate(
         model,
         track.track_idx,

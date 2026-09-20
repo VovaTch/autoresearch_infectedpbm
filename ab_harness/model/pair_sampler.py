@@ -67,6 +67,24 @@ class SamplerCfg:
       temperature (float): sampling temperature.
       top_k (int): top-k cutoff.
       top_p (float): nucleus cutoff.
+      p_style_walk (float): probability a styled structure-tier clip walks --
+        keeps its real window for the first segment and lets the style model
+        continue it. Draws only when the style stream is kept, so the walk cell
+        is a subset of the styled cell and the fixed-window baseline stays in
+        the same bank.
+      p_style_walk_bulk (float): the same for the bulk tier, whose 10 s hold
+        three or four segments; 0 keeps that tier fixed-style.
+      p_cross_track (float): probability, per kept stream, that the id or the
+        style comes from a random other track instead of the span's own. The
+        prompt always stays the span's real tokens, so a crossed stream is the
+        only way to ask it to do work the prompt does not already do
+        (probe_cross_track.py). Drawn independently for id and style, so
+        matched / xid / xstyle / xboth all occur; 0 keeps every stream matched.
+      style_period (int): positions per style segment; 512 is the style
+        model's own slice.
+      style_ar_prefix (int): real windows the style model is primed with.
+      style_ar_temperature (float): style-model sampling temperature.
+      style_ar_cfg (float): style-model guidance on the track id.
     """
 
     fps: float = 172.265625
@@ -83,6 +101,13 @@ class SamplerCfg:
     temperature: float = 1.0
     top_k: int = 250
     top_p: float = 0.0
+    p_style_walk: float = 0.0
+    p_style_walk_bulk: float = 0.0
+    p_cross_track: float = 0.0
+    style_period: int = 512
+    style_ar_prefix: int = 4
+    style_ar_temperature: float = 1.0
+    style_ar_cfg: float = 1.0
 
     def frames(self, tier: Tier) -> int:
         """
@@ -189,6 +214,8 @@ class PairSampler:
       cfg (SamplerCfg): tier mix and conditioning odds.
       checkpoint (str): tag of the checkpoint new clips come from.
       rng (random.Random | None): seeded sampler; a fresh one if omitted.
+      style_checkpoint (str): tag of the style model a walking clip's later
+        segments come from; folded into the group of walking clips only.
     """
 
     def __init__(
@@ -197,12 +224,14 @@ class PairSampler:
         cfg: SamplerCfg | None = None,
         checkpoint: str = "",
         rng: random.Random | None = None,
+        style_checkpoint: str = "",
     ) -> None:
         if not tracks:
             raise ValueError("sampler needs at least one track")
         self.tracks = list(tracks)
         self.cfg = cfg or SamplerCfg()
         self.checkpoint = checkpoint
+        self.style_checkpoint = style_checkpoint
         self.rng = rng or random.Random()
         self._history: list[PairSpec] = []
 
@@ -234,39 +263,83 @@ class PairSampler:
         start = self.rng.randrange(0, track.num_frames - frames)
         return track, start, frames
 
+    def _other_track(self, track: TrackInfo) -> TrackInfo:
+        """
+        Args:
+          track (TrackInfo): the span's track.
+
+        Returns:
+          TrackInfo: a uniformly drawn different track, or the same one when
+            the corpus holds nothing else.
+        """
+        others = [t for t in self.tracks if t.track_idx != track.track_idx]
+        return self.rng.choice(others) if others else track
+
     def _draw_conditioning(
-        self, track: TrackInfo, start: int, frames: int
+        self, track: TrackInfo, start: int, frames: int, tier: Tier
     ) -> Conditioning:
         """
         Draw one conditioning recipe; all eight stream combinations are reachable.
+
+        Every roll is drawn unconditionally, so a seeded session replays
+        identically whichever branches its earlier rolls took.
 
         Args:
           track (TrackInfo): the track the span comes from.
           start (int): span start frame.
           frames (int): span length.
+          tier (Tier): the rating tier, which sets the walk odds.
 
         Returns:
           Conditioning: the recipe shared by both clips of the pair.
         """
+        use_track_id = self.rng.random() < self.cfg.p_track_id
         use_style = self.rng.random() < self.cfg.p_style
-        window = (
-            pick_style_window(track.style_bounds, start, start + frames, self.rng)
-            if use_style
-            else -1
-        )
+        cross_id = self.rng.random() < self.cfg.p_cross_track
+        cross_style = self.rng.random() < self.cfg.p_cross_track
+        # A nulled stream never crosses: its track would be recorded but inert.
+        id_track = self._other_track(track) if cross_id and use_track_id else track
+        style_track = self._other_track(track) if cross_style and use_style else track
+        if style_track is track:
+            # Same track: the window must not overlap the span (train_ar rule).
+            window = pick_style_window(
+                track.style_bounds, start, start + frames, self.rng
+            )
+        else:
+            # Another track: nothing to leak from, any window will do.
+            window = (
+                self.rng.randrange(len(style_track.style_bounds))
+                if style_track.style_bounds
+                else -1
+            )
+        if not use_style:
+            window = -1
+        use_style = use_style and window >= 0
         prompt = (
             int(self.cfg.prompt_seconds * self.cfg.fps)
             if self.rng.random() < self.cfg.p_prompt
             else 0
         )
+        p_walk = (
+            self.cfg.p_style_walk_bulk if tier is Tier.BULK else self.cfg.p_style_walk
+        )
+        walk = self.rng.random() < p_walk and use_style
         return Conditioning(
             track_idx=track.track_idx,
             start_frame=start,
-            use_track_id=self.rng.random() < self.cfg.p_track_id,
-            use_style=use_style and window >= 0,
+            use_track_id=use_track_id,
+            use_style=use_style,
             style_window=window,
+            id_track_idx=id_track.track_idx if id_track is not track else -1,
+            style_track_idx=style_track.track_idx if style_track is not track else -1,
             prompt_frames=min(prompt, max(0, frames - 1)),
             cfg_strength=self.rng.choice(self.cfg.cfg_strengths),
+            style_walk="ar" if walk else "none",
+            style_period=self.cfg.style_period if walk else 0,
+            style_ar_prefix=self.cfg.style_ar_prefix,
+            style_ar_temperature=self.cfg.style_ar_temperature,
+            style_ar_cfg=self.cfg.style_ar_cfg,
+            style_seed=self.rng.randrange(2**31) if walk else 0,
         )
 
     def _clip(self, tier: Tier, frames: int, cond: Conditioning, seed: int) -> ClipSpec:
@@ -280,15 +353,15 @@ class PairSampler:
         Returns:
           ClipSpec: a content-addressed generated clip.
         """
-        group = _digest(
-            {
-                "tier": str(tier),
-                "frames": frames,
-                "cond": asdict(cond),
-                "ckpt": self.checkpoint,
-            },
-            "grp",
-        )
+        payload: dict[str, object] = {
+            "tier": str(tier),
+            "frames": frames,
+            "cond": cond.digest_payload(),
+            "ckpt": self.checkpoint,
+        }
+        if cond.walking:
+            payload["style_ckpt"] = self.style_checkpoint
+        group = _digest(payload, "grp")
         sampling = Sampling(
             seed=seed,
             temperature=self.cfg.temperature,
@@ -442,7 +515,7 @@ class PairSampler:
 
         tier = tier if tier is not None else self.pick_tier()
         track, start, frames = self._pick_span(tier)
-        cond = self._draw_conditioning(track, start, frames)
+        cond = self._draw_conditioning(track, start, frames, tier)
 
         if roll < self.cfg.repeat_rate + self.cfg.anchor_rate:
             spec = self._blind(

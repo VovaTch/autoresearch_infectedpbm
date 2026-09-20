@@ -25,28 +25,34 @@ from pathlib import Path
 AUTO = ("", "auto", "latest")
 # Ordered: the family the selector should offer first comes first.
 FAMILIES = ("saved_dpo_*", "saved_ar_*")
+# The style-level model (train_style_ar.py) is a different family: it is never
+# sampled for tokens, only asked for the next style descriptor.
+STYLE_AR_FAMILIES = ("saved_style_ar_*",)
 
 
-def discover_checkpoints(repo: Path) -> list[str]:
+def discover_checkpoints(repo: Path, families: tuple[str, ...] = FAMILIES) -> list[str]:
     """
     List the checkpoints the worker is willing to load, newest first.
 
     Args:
       repo (Path): repository root holding the saved_* run directories.
+      families (tuple[str, ...]): directory globs to search, in offer order.
 
     Returns:
       list[str]: repo-relative paths, DPO family before AR family and newest
         first inside each. Empty when nothing is trained yet.
     """
     found: list[str] = []
-    for family in FAMILIES:
+    for family in families:
         paths = [p for d in sorted(repo.glob(family)) for p in d.glob("*.ckpt")]
         paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         found += [str(p.relative_to(repo)) for p in paths]
     return found
 
 
-def resolve_checkpoint(spec: str, repo: Path) -> str:
+def resolve_checkpoint(
+    spec: str, repo: Path, families: tuple[str, ...] = FAMILIES
+) -> str:
     """
     Turn a config value into a concrete repo-relative checkpoint path.
 
@@ -57,6 +63,7 @@ def resolve_checkpoint(spec: str, repo: Path) -> str:
     Args:
       spec (str): config value; one of AUTO, or a path.
       repo (Path): repository root.
+      families (tuple[str, ...]): directory globs to search.
 
     Returns:
       str: the checkpoint to load. An unresolvable AUTO is returned unchanged so
@@ -65,5 +72,5 @@ def resolve_checkpoint(spec: str, repo: Path) -> str:
     """
     if spec not in AUTO:
         return spec
-    found = discover_checkpoints(repo)
+    found = discover_checkpoints(repo, families)
     return found[0] if found else spec

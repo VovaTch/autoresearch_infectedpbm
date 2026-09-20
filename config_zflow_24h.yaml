@@ -1,0 +1,98 @@
+# Latent flow-matching DiT over the tokenizer's z_q, for IM-flavored slices by
+# SDEdit (plan 2026-09-15). The tokenizer is near-identity on foreign audio, so
+# the style must come from a prior trained on the IM corpus; this is that prior.
+#
+# Latent: z_q per frame (sum of the 3 RVQ codebook vectors, from the AR token
+# cache of the dsteps2_24h tokenizer), PCA-whitened on the 48 training tracks.
+# z_q is steep: 90% variance in 6 dims, 99% in 23. pca_dims 128 keeps 99.97%
+# and 98.7% level-0 token agreement after whiten/unwhiten/requantize (beam 8);
+# --probe-pca prints that table per rank. Greedy requantisation of an EXACT z_q
+# flips 15% of level-0 tokens (the sum of codes is not greedily re-assignable),
+# so requantize() beam-searches (beam 8 -> 99% agreement, 1.6% latent error).
+#
+# Context: crop 2048 frames = 11.9 s, patch 2 -> 1024 transformer tokens
+# (user choice). d 512 x 12 layers, adaLN-Zero on t + style descriptor (mean
+# z_q over crop +-256 frames, L2-normed, same as the AR stage), style dropped
+# 20% of the time so CFG has a real unconditional branch.
+#
+# Pre-registered read-out (held-out tracks [18,33,34,45,51] only):
+#   val/loss vs train/loss gap        -> memorisation (finding_flow_phase_fail)
+#   val/sdedit_tok_agree_l0 @ 0.5     -> content retention of an edit
+#   val/sample_std vs val/data_std    -> collapse guard
+# Audio metrics (cdpam to source, timbre_profile distance to IM) come from
+# stylize_zflow.py on the two external tracks, then ear A/B.
+#
+# 24 h continuation of the 8 h run (2026-09-16). Warm start loads the weights of
+# saved_zflow/last.ckpt only -- optimiser, EMA shadow and the finished one-cycle
+# schedule are NOT restored, so this is a fresh one-cycle at peak lr 3e-4
+# re-annealed over 24 h (the lineage lever of finding_codebook_grad_fix), not a
+# resume. The 8 h run stays intact in saved_zflow/ for the A/B; this one writes
+# to saved_zflow_24h/. The 8 h run showed val at or below train for every epoch
+# (best val 0.3960 @ step 32999), so there is headroom and no memorisation to
+# unwind.
+#
+# Command (detached, GPU1):
+#   CUDA_VISIBLE_DEVICES=1 setsid nohup uv run python train_zflow.py \
+#     --config config_zflow_24h.yaml > logs/train_zflow_24h.log 2>&1 &
+
+tokenizer:
+  token_cache: ~/.cache/infected_pbm/tokens_88cacecb1e81
+  checkpoint: saved_20260914_dsteps2_24h/last.ckpt
+  meta: onnx/tokenizer_meta.json
+  encoder_onnx: onnx/encoder.onnx
+  decoder_onnx: onnx/decoder.onnx
+  tracks_dir: ~/.cache/infected_pbm/tracks
+  slices_dir: ~/.cache/infected_pbm/slices
+  chunk_frames: 4096
+  margin: 256
+
+data:
+  crop_frames: 2048
+  held_out_tracks: 5
+  split_seed: 1234
+  steps_per_epoch: 500
+  val_crops_per_track: 8
+  pca_dims: 128
+  pca_eig_floor: 1.0e-4
+  style_context_frames: 256
+  single_track: null
+
+model:
+  d_model: 512
+  n_layers: 12
+  n_heads: 8
+  patch: 2
+  mlp_hidden: 1408
+  dropout: 0.1
+  t_embed_dim: 256
+  style_bottleneck: 128
+  p_drop_style: 0.2
+  rope_theta: 10000.0
+
+flow:
+  t_sampling: logit_normal
+  t_mean: 0.0
+  t_std: 1.0
+  t_eps: 1.0e-3
+  steps: 32
+  churn: 0.0
+  cfg_scale: 1.0
+  sdedit_strength: 0.5
+  val_samples: 8
+
+train:
+  devices: 1
+  minutes: 1440
+  lr: 3.0e-4
+  lr_pct_start: 0.05
+  lr_div_factor: 25.0
+  batch_size: 16
+  accumulate_grad_batches: 1
+  precision: 32-true
+  weight_decay: 0.01
+  grad_clip: 1.0
+  num_workers: 4
+  ema_decay: 0.999
+  seed: 42
+  save_path: saved_zflow_24h/
+  checkpoint: saved_zflow/last.ckpt

@@ -309,3 +309,142 @@ def test_a_window_walk_draws_from_the_renders_own_tracks(service: SynthService) 
 def test_a_walk_needs_a_positive_period(service: SynthService) -> None:
     style = StyleSpec(kind="window", track_idx=0, window=3, walk="random", period=0)
     assert service.resolve_style(spec(style)).shape == (1, DIM)
+
+
+# -- the style model's walk --------------------------------------------------
+
+
+class StubStyleAr:
+    """
+    Stands in for StyleArSampler: unit rows from the generator, calls recorded.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def sample(
+        self,
+        prefix: torch.Tensor | None,
+        track_idx: int | None,
+        steps: int,
+        temperature: float,
+        cfg: float,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        self.calls.append(
+            {
+                "prefix": None if prefix is None else prefix.clone(),
+                "track_idx": track_idx,
+                "steps": steps,
+                "temperature": temperature,
+                "cfg": cfg,
+            }
+        )
+        return torch.nn.functional.normalize(
+            torch.randn(steps, DIM, generator=generator), dim=-1
+        )
+
+
+@pytest.fixture
+def ar_service(service: SynthService) -> tuple[SynthService, StubStyleAr]:
+    stub = StubStyleAr()
+    service._style_ar = stub  # type: ignore[assignment]
+    return service, stub
+
+
+def test_an_ar_walk_opens_with_the_real_window_and_continues(
+    ar_service: tuple[SynthService, StubStyleAr],
+) -> None:
+    service, stub = ar_service
+    style = StyleSpec(kind="window", track_idx=0, window=5, walk="ar", period=50)
+    rows = service.resolve_style(spec(style))
+    assert rows.shape == (5, DIM)
+    assert torch.allclose(rows.norm(dim=-1), torch.ones(5), atol=1e-5)
+    assert torch.equal(rows[0], service.model.by_idx[0].style[5])
+    call = stub.calls[-1]
+    assert call["steps"] == 4 and call["track_idx"] == 0
+    # ar_prefix 4 -> windows 2..5 of the base track, the last being segment 0
+    assert torch.equal(call["prefix"], service.model.by_idx[0].style[2:6])
+
+
+def test_the_prefix_clamps_at_the_start_of_the_track(
+    ar_service: tuple[SynthService, StubStyleAr],
+) -> None:
+    service, stub = ar_service
+    style = StyleSpec(kind="window", track_idx=0, window=1, walk="ar", period=50)
+    service.resolve_style(spec(style))
+    assert torch.equal(stub.calls[-1]["prefix"], service.model.by_idx[0].style[0:2])
+
+
+def test_a_cold_ar_walk_samples_every_segment(
+    ar_service: tuple[SynthService, StubStyleAr],
+) -> None:
+    service, stub = ar_service
+    style = StyleSpec(
+        kind="window", track_idx=0, window=5, walk="ar", period=50, ar_prefix=0
+    )
+    rows = service.resolve_style(spec(style))
+    assert rows.shape == (5, DIM)
+    assert stub.calls[-1]["prefix"] is None and stub.calls[-1]["steps"] == 5
+    assert not torch.equal(rows[0], service.model.by_idx[0].style[5])
+
+
+def test_an_ar_walk_replays_from_its_seed(
+    ar_service: tuple[SynthService, StubStyleAr],
+) -> None:
+    service, _ = ar_service
+    style = StyleSpec(
+        kind="window", track_idx=0, window=3, walk="ar", period=50, seed=2
+    )
+    assert torch.equal(
+        service.resolve_style(spec(style)), service.resolve_style(spec(style))
+    )
+    other = StyleSpec(
+        kind="window", track_idx=0, window=3, walk="ar", period=50, seed=3
+    )
+    assert not torch.equal(
+        service.resolve_style(spec(style))[1:], service.resolve_style(spec(other))[1:]
+    )
+
+
+def test_same_track_ar_walk_follows_the_render(
+    ar_service: tuple[SynthService, StubStyleAr],
+) -> None:
+    service, stub = ar_service
+    style = StyleSpec(
+        kind="window", track_idx=SAME_TRACK, window=0, walk="ar", period=50
+    )
+    rows = service.resolve_style(spec(style, track_idx=1))
+    assert torch.equal(rows[0], service.model.by_idx[1].style[0])
+    assert stub.calls[-1]["track_idx"] == 1
+    assert torch.equal(stub.calls[-1]["prefix"], service.model.by_idx[1].style[0:1])
+
+
+def test_non_window_kinds_feed_only_their_own_vector(
+    ar_service: tuple[SynthService, StubStyleAr],
+) -> None:
+    service, stub = ar_service
+    style = StyleSpec(
+        kind="random", seed=7, walk="ar", period=50, ar_temperature=0.5, ar_cfg=2.0
+    )
+    rows = service.resolve_style(spec(style, track_idx=None))
+    call = stub.calls[-1]
+    assert call["prefix"].shape == (1, DIM) and torch.equal(call["prefix"][0], rows[0])
+    assert call["track_idx"] is None
+    assert call["temperature"] == 0.5 and call["cfg"] == 2.0
+
+
+def test_a_single_segment_never_calls_the_model(
+    ar_service: tuple[SynthService, StubStyleAr],
+) -> None:
+    service, stub = ar_service
+    style = StyleSpec(kind="window", track_idx=0, window=5, walk="ar", period=500)
+    assert service.resolve_style(spec(style)).shape == (1, DIM)
+    assert not stub.calls
+
+
+def test_a_missing_style_model_is_a_clear_error(service: SynthService) -> None:
+    service.cfg.generator.style_ar_checkpoint = "auto"
+    style = StyleSpec(kind="window", track_idx=0, window=5, walk="ar", period=50)
+    with pytest.raises(FileNotFoundError, match="train_style_ar"):
+        service.resolve_style(spec(style))

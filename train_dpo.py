@@ -415,6 +415,12 @@ def load_preference_pairs(
         if left.is_reference or right.is_reference:
             report.dropped["reference clip"] += 1
             continue
+        if left.conditioning.walking:
+            # The bank keeps a walking clip's tokens but not the descriptors its
+            # later segments were sampled under; scoring it against the first
+            # segment's style alone would train on the wrong conditioning.
+            report.dropped["style walk"] += 1
+            continue
         if wanted is not None and judgement.tier not in wanted:
             report.dropped["tier excluded"] += 1
             continue
@@ -582,8 +588,8 @@ class PreferenceDataset(Dataset):
             "item_id": spec.item_id,
             "tokens": window,
             "score": score,
-            "track_idx": torch.tensor(cond.track_idx, dtype=torch.long),
-            "style": style_vector(self.tracks[cond.track_idx], spec).float(),
+            "track_idx": torch.tensor(cond.id_track, dtype=torch.long),
+            "style": style_vector(self.tracks[cond.style_track], spec).float(),
             "drop_id": torch.tensor(not cond.use_track_id),
             "drop_style": torch.tensor(not cond.use_style),
             "start": torch.tensor(start, dtype=torch.long),
@@ -1349,8 +1355,8 @@ def diversity_request(
     spec = pairs[0].winner
     cond = spec.conditioning
     return SampleRequest(
-        track_idx=cond.track_idx,
-        style=style_vector(tracks[cond.track_idx], spec).float(),
+        track_idx=cond.id_track,
+        style=style_vector(tracks[cond.style_track], spec).float(),
         use_track_id=cond.use_track_id,
         use_style=cond.use_style,
         frames=int(seconds * fps),

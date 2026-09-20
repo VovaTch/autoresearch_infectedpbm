@@ -10,6 +10,7 @@ Usage:
   uv run python -m slice_synth.render --tracks 0 --seconds 30 --cfg 8 --reference
   uv run python -m slice_synth.render --replay renders_synth/20260908_*.json
   uv run python -m slice_synth.render --tracks 3 14 --together --walk windows --period 512
+  uv run python -m slice_synth.render --tracks 2 --walk ar --ar-temperature 1.2 --seconds 20
 """
 
 from __future__ import annotations
@@ -68,9 +69,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="all --tracks as coexisting ids in ONE clip",
     )
-    parser.add_argument("--walk", default="none", choices=("none", "windows", "random"))
+    parser.add_argument(
+        "--walk", default="none", choices=("none", "windows", "random", "ar")
+    )
     parser.add_argument(
         "--period", type=int, default=512, help="frames per style segment"
+    )
+    parser.add_argument(
+        "--ar-prefix", type=int, default=4, help="walk ar: real windows fed first"
+    )
+    parser.add_argument("--ar-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--ar-cfg", type=float, default=1.0, help="walk ar: id guidance"
     )
     parser.add_argument("--out", default="")
     parser.add_argument(
@@ -115,6 +125,9 @@ def style_for(
         seed=seed,
         walk=args.walk,
         period=args.period,
+        ar_prefix=args.ar_prefix,
+        ar_temperature=args.ar_temperature,
+        ar_cfg=args.ar_cfg,
     )
 
 

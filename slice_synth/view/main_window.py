@@ -7,6 +7,8 @@ status, which is what keeps the synthesizer testable without a display.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QLabel,
@@ -112,8 +114,10 @@ class MainWindow(QMainWindow):
             float(ready.meta.get("frames_per_second", 172.265625)),
             int(ready.meta.get("num_tokens", 2048)),
         )
+        style_ar = Path(ready.style_ar_checkpoint).parent.name
         self._counts.setText(
             f"{len(ready.tracks)} tracks · window {ready.window_frames}"
+            + (f" · style-ar {style_ar}" if style_ar else "")
         )
 
     def _on_variants(self, variants: list) -> None:

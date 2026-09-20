@@ -1,0 +1,53 @@
+# Style-AR, 24 h run. The config_style_ar.yaml recipe with the wall time
+# stretched to a day (one-cycle over 24 h, so the peak-LR phase alone is ~1.2 h).
+# Held-out tracks are KEPT so val/nll is honest: the 30-min ho5 run memorised
+# after ~1600 steps and this run exists to see whether the long low-LR anneal
+# ever beats that early minimum. style_ar_best.ckpt (min val/nll) is the one
+# to trust; last.ckpt is expected to be memorised. In the GUI the five held-out
+# ids fall back to the null row (the real-window prefix still carries them).
+# steps_per_epoch is 10x the recipe so validation runs every ~2 min, not 10 s.
+#
+#   CUDA_VISIBLE_DEVICES=1 setsid nohup uv run python train_style_ar.py \
+#     --config config_style_ar_24h.yaml > logs/train_style_ar_24h.log 2>&1 &
+#   uv run python train_style_ar.py --config config_style_ar_24h.yaml --sample \
+#     --ckpt saved_style_ar_20260917_24h/style_ar_best.ckpt --temperature 1.2
+
+data:
+  token_cache: ~/.cache/infected_pbm/tokens_88cacecb1e81
+  held_out_tracks: 5        # plan_held_out(seed 1234) -> [18, 33, 34, 45, 51]
+  split_seed: 1234
+  pca_dims: 24               # 99% of the variance; recon cosine 0.996 (min 0.94) on held-out
+  pca_eig_floor: 1.0e-4
+  phases: 4                 # grids shifted by 0/128/256/384 frames
+  crop_positions: 128       # ~6.3 min of slices; the longest track is 216
+  min_crop: 8
+  steps_per_epoch: 2000     # x batch 64 = 128k crops per epoch; val every ~2 min
+
+model:
+  d_model: 128
+  n_layers: 3
+  n_heads: 4
+  dropout: 0.3
+  mog_components: 8
+  log_std_min: -5.0
+  log_std_max: 2.0
+  p_drop_id: 0.3            # null id 30% of the time -> CFG at sampling
+  input_noise: 0.3          # 3-min sweep: val nll/dim 1.12 -> 0.97 with d128/L3/drop0.3/noise0.3
+  rope_theta: 10000.0
+
+train:
+  devices: 1
+  minutes: 1440
+  lr: 3.0e-4
+  lr_pct_start: 0.05
+  lr_div_factor: 25
+  batch_size: 64
+  accumulate_grad_batches: 1
+  precision: 32-true
+  weight_decay: 0.05
+  grad_clip: 1.0
+  num_workers: 2
+  ema_decay: 0.999
+  seed: 42
+  save_path: saved_style_ar_20260917_24h/
+  checkpoint: null

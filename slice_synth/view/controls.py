@@ -42,7 +42,13 @@ from PySide6.QtWidgets import (
 
 from ab_harness.model.pair_sampler import TrackInfo
 from slice_synth.config import UiCfg
-from slice_synth.model.types import PromptSpec, RenderSpec, build_variants
+from slice_synth.model.types import (
+    SAME_TRACK,
+    PromptSpec,
+    RenderSpec,
+    StyleSpec,
+    build_variants,
+)
 from slice_synth.view.style_editor import StyleListEditor
 from slice_synth.worker.protocol import WorkerReady
 
@@ -180,7 +186,16 @@ class ControlPanel(QWidget):
         """
         box = QGroupBox("style embeddings", self)
         inner = QVBoxLayout(box)
-        self.styles = StyleListEditor(box)
+        self.styles = StyleListEditor(
+            box,
+            StyleSpec(
+                track_idx=SAME_TRACK,
+                track_b=SAME_TRACK,
+                walk=self.ui.style_walk,  # type: ignore[arg-type]
+                ar_temperature=self.ui.style_ar_temperature,
+                ar_cfg=self.ui.style_ar_cfg,
+            ),
+        )
         self.styles.changed.connect(self._update_count)
         inner.addWidget(self.styles)
         return box

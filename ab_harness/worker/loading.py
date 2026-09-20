@@ -25,7 +25,14 @@ import torch
 from ab_harness.config import REPO, GeneratorCfg
 from ab_harness.worker.generator import ArGenerator
 from generate_ar import config_from_ckpt
-from train_ar import ArConfig, DataCfg, TrackTokens, build_model, load_token_cache
+from train_ar import (
+    ArConfig,
+    DataCfg,
+    TrackTokens,
+    build_model,
+    load_token_cache,
+    token_cache_dir,
+)
 
 
 @dataclass
@@ -112,11 +119,20 @@ def load_ar_checkpoint(
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ar_cfg = config_from_ckpt(ckpt)
 
-    cache_root = Path(ar_cfg.tokenizer.cache_root).expanduser()
-    caches = sorted(cache_root.glob("tokens_*"))
-    if not caches:
-        raise FileNotFoundError(f"no token cache under {cache_root}")
-    cache_dir = caches[-1]
+    # The cache is content-addressed on the encoder graph and the style geometry
+    # (train_ar.token_cache_dir), the same rule train_ar.main builds it by. The
+    # newest directory is NOT that cache once several tokenizers have been run.
+    cache_dir = token_cache_dir(ar_cfg)
+    if not cache_dir.exists():
+        cache_root = Path(ar_cfg.tokenizer.cache_root).expanduser()
+        caches = sorted(cache_root.glob("tokens_*"))
+        if not caches:
+            raise FileNotFoundError(f"no token cache under {cache_root}")
+        print(
+            f"  WARN token cache {cache_dir.name} for {checkpoint} is missing; "
+            f"falling back to {caches[-1].name}"
+        )
+        cache_dir = caches[-1]
 
     if previous is not None and previous.cache_dir == cache_dir:
         tracks, manifest = previous.tracks, previous.manifest

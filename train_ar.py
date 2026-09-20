@@ -313,7 +313,11 @@ def _load_from_slice_cache(
     cached = slices_dir / f"slices_{path.stem.replace(' ', '_')}.pt"
     if not cached.exists():
         return None
-    wav = torch.load(cached, map_location="cpu", weights_only=False).reshape(1, -1).float()
+    wav = (
+        torch.load(cached, map_location="cpu", weights_only=False)
+        .reshape(1, -1)
+        .float()
+    )
     # prepare.py right-pads the last slice with zeros; drop that tail.
     nonzero = (wav[0] != 0).nonzero()
     if nonzero.numel():
@@ -517,7 +521,11 @@ def compute_style_windows(
         end = min(total, (w + 1) * window_frames)
         if not grid and w == num_win - 1:
             end = total
-        lo, hi = (max(0, start - context_frames), min(total, end + context_frames)) if grid else (start, end)
+        lo, hi = (
+            (max(0, start - context_frames), min(total, end + context_frames))
+            if grid
+            else (start, end)
+        )
         chunk = tokens[lo:hi]
         z_q = torch.zeros((hi - lo, codebooks.shape[-1]), dtype=torch.float32)
         for level in range(num_rq):
@@ -596,6 +604,27 @@ def plan_val_windows(
     return windows
 
 
+def token_cache_dir(cfg: ArConfig) -> Path:
+    """
+    Resolve the content-addressed token cache directory for a config.
+
+    Shared by training and sampling so both read the cache the checkpoint was
+    trained on; a glob over cache_root would pick an arbitrary tokenizer.
+
+    Args:
+      cfg (ArConfig): full config; tokenizer and data sections are used.
+
+    Returns:
+      Path: cache_root / tokens_<tag>.
+    """
+    tok = cfg.tokenizer
+    meta_path = REPO / tok.meta
+    meta: dict[str, Any] = json.loads(meta_path.read_text())
+    _, _, _, style_key = style_geometry(cfg.data, meta["frames_per_second"])
+    tag = cache_tag(meta_path, REPO / tok.encoder_onnx, style_key)
+    return Path(os.path.expanduser(tok.cache_root)) / f"tokens_{tag}"
+
+
 def build_token_cache(cfg: ArConfig, force: bool = False) -> Path:
     """
     Tokenize the whole corpus with the frozen ONNX encoder and cache it to disk.
@@ -619,13 +648,10 @@ def build_token_cache(cfg: ArConfig, force: bool = False) -> Path:
     meta: dict[str, Any] = json.loads(meta_path.read_text())
     hop, rate = meta["hop_length"], meta["sample_rate"]
 
-    window_frames, context_frames, grid, style_key = style_geometry(
+    window_frames, context_frames, grid, _ = style_geometry(
         cfg.data, meta["frames_per_second"]
     )
-    cache_dir = (
-        Path(os.path.expanduser(tok.cache_root))
-        / f"tokens_{cache_tag(meta_path, enc_path, style_key)}"
-    )
+    cache_dir = token_cache_dir(cfg)
     manifest_path = cache_dir / "_manifest.json"
     if manifest_path.exists() and not force:
         print(f"token cache present: {cache_dir}")
@@ -711,7 +737,9 @@ def build_token_cache(cfg: ArConfig, force: bool = False) -> Path:
                 ),
             }
         )
-        print(f"  [{track_idx + 1:2d}/{len(tracks)}] {name[:48]:48s} {tokens.shape[0]:7d} frames")
+        print(
+            f"  [{track_idx + 1:2d}/{len(tracks)}] {name[:48]:48s} {tokens.shape[0]:7d} frames"
+        )
 
     manifest = {
         "tokenizer_meta": meta,
@@ -754,7 +782,9 @@ class TrackTokens:
     val_windows: list[tuple[int, int]]
 
 
-def load_token_cache(cache_dir: Path, cfg: DataCfg) -> tuple[list[TrackTokens], dict[str, Any]]:
+def load_token_cache(
+    cache_dir: Path, cfg: DataCfg
+) -> tuple[list[TrackTokens], dict[str, Any]]:
     """
     Load every cached track into RAM and recompute the val split from config.
 
@@ -775,7 +805,9 @@ def load_token_cache(cache_dir: Path, cfg: DataCfg) -> tuple[list[TrackTokens], 
     for entry in manifest["tracks"]:
         if cfg.single_track and cfg.single_track not in entry["track_name"]:
             continue
-        blob = torch.load(cache_dir / entry["file"], map_location="cpu", weights_only=False)
+        blob = torch.load(
+            cache_dir / entry["file"], map_location="cpu", weights_only=False
+        )
         num_frames = int(blob["num_frames"])
         tracks.append(
             TrackTokens(
@@ -841,6 +873,35 @@ def _pick_style(track: TrackTokens, start: int, end: int, rng: random.Random) ->
     return int((centres - centre).abs().argmax())
 
 
+def pick_style_for_span(
+    track: TrackTokens, start: int, end: int, aligned: bool, rng: random.Random
+) -> int:
+    """
+    Choose the style window a sampler should condition on for a span.
+
+    Aligned models were trained on the descriptor of the grid slice they
+    predict, so sampling uses the slice containing `start`; disjoint models get
+    the training-time rule from _pick_style.
+
+    Args:
+      track (TrackTokens): the track being sampled.
+      start (int): span start frame.
+      end (int): span end frame, exclusive.
+      aligned (bool): DataCfg.style_mode == "aligned".
+      rng (random.Random): sampler for the disjoint rule.
+
+    Returns:
+      int: index into track.style.
+    """
+    if not aligned:
+        return _pick_style(track, start, end, rng)
+    bounds = track.style_bounds
+    inside = (bounds[:, 0] <= start) & (start < bounds[:, 1])
+    if bool(inside.any()):
+        return int(inside.nonzero()[0, 0])
+    return int((bounds[:, 0] - start).abs().argmin())
+
+
 def _check_aligned(cfg: DataCfg) -> bool:
     """
     Args:
@@ -852,7 +913,9 @@ def _check_aligned(cfg: DataCfg) -> bool:
     if cfg.style_mode not in ("disjoint", "aligned"):
         raise ValueError("style_mode must be 'disjoint' or 'aligned'")
     if cfg.style_mode == "aligned" and cfg.crop_frames != cfg.style_slice_frames:
-        raise ValueError("aligned style_mode requires crop_frames == style_slice_frames")
+        raise ValueError(
+            "aligned style_mode requires crop_frames == style_slice_frames"
+        )
     return cfg.style_mode == "aligned"
 
 
@@ -956,7 +1019,13 @@ class ValCropDataset(Dataset):
             # every grid slice fully inside a held-out window, scored end to end,
             # conditioned on its own descriptor -- the training condition exactly
             self._items = [
-                (t, int(t.style_bounds[k, 0]), int(t.style_bounds[k, 0]), int(t.style_bounds[k, 1]), k)
+                (
+                    t,
+                    int(t.style_bounds[k, 0]),
+                    int(t.style_bounds[k, 0]),
+                    int(t.style_bounds[k, 1]),
+                    k,
+                )
                 for t, lo, hi in spans
                 for k in range(t.style_bounds.shape[0])
                 if int(t.style_bounds[k, 0]) >= lo and int(t.style_bounds[k, 1]) <= hi
@@ -1025,9 +1094,10 @@ def build_delay_grid(tokens: torch.Tensor, pad_id: int) -> torch.Tensor:
     """
     batch, frames, depth = tokens.shape
     length = frames + depth - 1
-    offsets = torch.arange(length, device=tokens.device)[:, None] - torch.arange(
-        depth, device=tokens.device
-    )[None, :]
+    offsets = (
+        torch.arange(length, device=tokens.device)[:, None]
+        - torch.arange(depth, device=tokens.device)[None, :]
+    )
     valid = (offsets >= 0) & (offsets < frames)
     gathered = tokens.gather(
         1, offsets.clamp(0, frames - 1).expand(batch, length, depth)
@@ -1047,9 +1117,10 @@ def undelay_grid(grid: torch.Tensor, frames: int) -> torch.Tensor:
       torch.Tensor: (B, T, R) int64 aligned codes.
     """
     depth = grid.shape[-1]
-    offsets = torch.arange(frames, device=grid.device)[:, None] + torch.arange(
-        depth, device=grid.device
-    )[None, :]
+    offsets = (
+        torch.arange(frames, device=grid.device)[:, None]
+        + torch.arange(depth, device=grid.device)[None, :]
+    )
     return grid.gather(1, offsets.expand(grid.shape[0], frames, depth))
 
 
@@ -1214,8 +1285,12 @@ class KVCache:
         dtype: torch.dtype,
     ) -> None:
         shape = (batch, n_heads, max_length, head_dim)
-        self.keys = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(n_layers)]
-        self.values = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(n_layers)]
+        self.keys = [
+            torch.zeros(shape, device=device, dtype=dtype) for _ in range(n_layers)
+        ]
+        self.values = [
+            torch.zeros(shape, device=device, dtype=dtype) for _ in range(n_layers)
+        ]
         self.max_length = max_length
         self.length = 0
         # (B, max_length) bool of slots any later query may attend; None means
@@ -1562,7 +1637,11 @@ class ArTransformer(nn.Module):
             or self._cos.dtype != dtype
         ):
             self._cos, self._sin = rope_cache(
-                max(end, self.max_positions), head_dim, self.cfg.rope_theta, device, dtype
+                max(end, self.max_positions),
+                head_dim,
+                self.cfg.rope_theta,
+                device,
+                dtype,
             )
         assert self._sin is not None
         return self._cos[offset:end], self._sin[offset:end]
@@ -1590,12 +1669,16 @@ class ArTransformer(nn.Module):
         Returns:
           torch.Tensor: (B, 2 + E, d_model) prefix tokens: id, extras, style.
         """
-        ids = torch.where(drop_id, torch.full_like(track_idx, self.num_tracks), track_idx)
+        ids = torch.where(
+            drop_id, torch.full_like(track_idx, self.num_tracks), track_idx
+        )
         id_vec = self.track_emb(ids)[:, None]
         if extra_ids is not None and extra_ids.shape[1]:
             id_vec = torch.cat([id_vec, self.track_emb(extra_ids)], dim=1)
         style_vec = torch.where(
-            drop_style[:, None], self.style_null.to(style.dtype)[None, :], self.style_proj(style)
+            drop_style[:, None],
+            self.style_null.to(style.dtype)[None, :],
+            self.style_proj(style),
         )
         return torch.cat([id_vec, style_vec[:, None]], dim=1)
 
@@ -1646,7 +1729,9 @@ class ArTransformer(nn.Module):
         batch, length, depth = tokens_in.shape
         fold = self.frames_per_pos
         if length % fold:
-            raise ValueError(f"sequence {length} not divisible by frames_per_pos {fold}")
+            raise ValueError(
+                f"sequence {length} not divisible by frames_per_pos {fold}"
+            )
         embedded = sum(self.token_emb[d](tokens_in[:, :, d]) for d in range(depth))
         assert isinstance(embedded, torch.Tensor)
         if fold > 1:
@@ -1655,9 +1740,7 @@ class ArTransformer(nn.Module):
             )
         return embedded
 
-    def _project(
-        self, hidden: torch.Tensor, batch: int, length: int
-    ) -> torch.Tensor:
+    def _project(self, hidden: torch.Tensor, batch: int, length: int) -> torch.Tensor:
         """
         Run the per-depth output heads and unfold back to frame order.
 
@@ -1719,7 +1802,9 @@ class ArTransformer(nn.Module):
           KVCache: cache holding the prefix, length == 2 + E.
         """
         if self.frames_per_pos != 1:
-            raise NotImplementedError("incremental decoding assumes frames_per_pos == 1")
+            raise NotImplementedError(
+                "incremental decoding assumes frames_per_pos == 1"
+            )
         prefix = self.conditioning(track_idx, style, drop_id, drop_style, extra_ids)
         batch, width, _ = prefix.shape
         extra = width - PREFIX_POSITIONS
@@ -1740,7 +1825,8 @@ class ArTransformer(nn.Module):
             if extra_valid is None:
                 extra_valid = torch.ones(batch, extra, dtype=torch.bool, device=device)
             slot_valid = torch.cat(
-                [torch.ones(batch, 1, dtype=torch.bool, device=device), extra_valid], dim=1
+                [torch.ones(batch, 1, dtype=torch.bool, device=device), extra_valid],
+                dim=1,
             )  # (B, 1 + E): which id slots are real
             valid = torch.ones(batch, max_length, dtype=torch.bool, device=device)
             valid[:, 1 : 1 + extra] = extra_valid
@@ -1780,7 +1866,9 @@ class ArTransformer(nn.Module):
         """
         batch, length, _ = tokens_in.shape
         hidden = self._embed(tokens_in)
-        cos, sin = self._rope(length, hidden.device, hidden.dtype, offset=cache.rope_offset)
+        cos, sin = self._rope(
+            length, hidden.device, hidden.dtype, offset=cache.rope_offset
+        )
         for index, block in enumerate(self.blocks):
             hidden = block(hidden, cos, sin, cache, index)
         return self._project(self.norm_out(hidden), batch, length)
@@ -1835,7 +1923,9 @@ class ArTransformer(nn.Module):
         styles = torch.stack(
             [torch.zeros_like(style_a), style_a] + ([style_b] if two_sided else [])  # type: ignore[list-item]
         ).to(device)
-        drop_id = torch.tensor([True, False] + ([False] if two_sided else []), device=device)
+        drop_id = torch.tensor(
+            [True, False] + ([False] if two_sided else []), device=device
+        )
         drop_style = drop_id.clone()
 
         logits = self.forward(
@@ -2025,7 +2115,9 @@ class ArLightningModule(L.LightningModule):
 # ===========================================================================
 
 
-def build_model(cfg: ArConfig, tracks: list[TrackTokens], manifest: dict[str, Any]) -> ArTransformer:
+def build_model(
+    cfg: ArConfig, tracks: list[TrackTokens], manifest: dict[str, Any]
+) -> ArTransformer:
     """
     Instantiate the transformer against the cached corpus's geometry.
 
@@ -2053,7 +2145,9 @@ def build_model(cfg: ArConfig, tracks: list[TrackTokens], manifest: dict[str, An
     )
 
 
-def bench_attention(module: ArLightningModule, batch: dict[str, Any], steps: int = 8) -> None:
+def bench_attention(
+    module: ArLightningModule, batch: dict[str, Any], steps: int = 8
+) -> None:
     """
     Time forward+backward and report which SDPA backend actually runs.
 
@@ -2099,7 +2193,9 @@ def bench_attention(module: ArLightningModule, batch: dict[str, Any], steps: int
             if device.type == "cuda":
                 torch.cuda.synchronize()
             start = time.monotonic()
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        with torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"
+        ):
             loss = module._run(batch, "train")
         loss.backward()
         optimizer.step()
@@ -2184,7 +2280,9 @@ def parse_args() -> argparse.Namespace:
         "--force-rebuild", action="store_true", help="rebuild the cache even if present"
     )
     parser.add_argument(
-        "--bench-attn", action="store_true", help="time one batch and report the SDPA backend"
+        "--bench-attn",
+        action="store_true",
+        help="time one batch and report the SDPA backend",
     )
     parser.add_argument(
         "--shuffle-cond",
@@ -2244,7 +2342,9 @@ def main() -> None:
         return
 
     if cfg.train.checkpoint:
-        state = torch.load(REPO / cfg.train.checkpoint, map_location="cpu", weights_only=False)
+        state = torch.load(
+            REPO / cfg.train.checkpoint, map_location="cpu", weights_only=False
+        )
         missing, unexpected = module.load_state_dict(state["state_dict"], strict=False)
         print(f"warm start: {len(missing)} missing, {len(unexpected)} unexpected keys")
 

@@ -58,6 +58,11 @@ class UiCfg:
       crossfade_ms (float): fade applied by the playback transport.
       mel_columns (int): time resolution of the mel strip, in columns.
       seeds (int): how many seeds each conditioning cell is expanded into.
+      style_walk (str): walk every new style entry opens with -- "none",
+        "windows", "random" or "ar" (the style model continues the entry).
+      style_ar_temperature (float): style-model temperature new entries open
+        with; 1.0 replays the corpus closely, 1.2 gives distinct walks.
+      style_ar_cfg (float): style-model guidance new entries open with.
     """
 
     seconds: float = 10.0
@@ -70,6 +75,9 @@ class UiCfg:
     crossfade_ms: float = 5.0
     mel_columns: int = 1024
     seeds: int = 1
+    style_walk: str = "ar"
+    style_ar_temperature: float = 1.2
+    style_ar_cfg: float = 1.0
 
 
 @dataclass
@@ -89,9 +97,12 @@ class SynthConfig:
 
     def __post_init__(self) -> None:
         """Resolve an 'auto' checkpoint once, so no caller sees the sentinel."""
-        from ab_harness.checkpoints import resolve_checkpoint
+        from ab_harness.checkpoints import STYLE_AR_FAMILIES, resolve_checkpoint
 
         self.generator.checkpoint = resolve_checkpoint(self.generator.checkpoint, REPO)
+        self.generator.style_ar_checkpoint = resolve_checkpoint(
+            self.generator.style_ar_checkpoint, REPO, STYLE_AR_FAMILIES
+        )
 
     @property
     def checkpoints(self) -> list[str]:

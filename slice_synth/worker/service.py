@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from ab_harness.checkpoints import AUTO
 from ab_harness.config import REPO
 from ab_harness.model.audio import fill_fraction, normalize_lufs, to_int16
 from ab_harness.model.pair_sampler import TrackInfo, pick_style_window
@@ -45,6 +46,7 @@ from slice_synth.worker.protocol import (
     SwitchCheckpoint,
     WorkerReady,
 )
+from ab_harness.worker.style_ar import StyleArSampler
 from train_ar import TrackTokens
 
 PROMPT_CACHE = "~/.cache/infected_pbm/synth_prompts"
@@ -94,6 +96,7 @@ class SynthService:
         self._model: LoadedModel | None = None
         self._decoder: TokenDecoder | None = None
         self._encoder: FileEncoder | None = None
+        self._style_ar: StyleArSampler | None = None
 
     # -- startup -------------------------------------------------------------
 
@@ -153,6 +156,7 @@ class SynthService:
         self._model = None
         self._decoder = None
         self._encoder = None
+        self._style_ar = None
 
     # -- corpus --------------------------------------------------------------
 
@@ -193,6 +197,7 @@ class SynthService:
             tracks=self.corpus(),
             meta=dict(self.model.meta),
             window_frames=self.model.generator.window - self.model.generator.depth + 1,
+            style_ar_checkpoint=self.cfg.generator.style_ar_checkpoint,
         )
 
     def _track(self, track_idx: int) -> TrackTokens:
@@ -247,17 +252,41 @@ class SynthService:
         Returns:
           torch.Tensor: (D,) unit descriptor.
         """
-        track_idx = style.track_b if use_b else style.track_idx
+        track, window = self._resolve_window(spec, style, use_b)
+        return track.style[window].float()
+
+    def _base_track(self, spec: RenderSpec, track_idx: int) -> int:
+        """
+        Args:
+          spec (RenderSpec): the render.
+          track_idx (int): a style entry's track, possibly SAME_TRACK.
+
+        Returns:
+          int: a concrete track id. SAME_TRACK follows the render's own track,
+            or the prompt's when the id stream is nulled and there is no track
+            to follow.
+        """
+        if track_idx != SAME_TRACK:
+            return int(track_idx)
+        if spec.track_idx is not None:
+            return int(spec.track_idx)
+        return int(spec.prompt.track_idx) if spec.prompt.kind == "corpus" else 0
+
+    def _resolve_window(
+        self, spec: RenderSpec, style: StyleSpec, use_b: bool
+    ) -> tuple[TrackTokens, int]:
+        """
+        Args:
+          spec (RenderSpec): the render, for the disjointness span.
+          style (StyleSpec): the recipe.
+          use_b (bool): read the interp endpoint B instead of A.
+
+        Returns:
+          tuple[TrackTokens, int]: the track and a valid window index into it.
+        """
+        track_idx = self._base_track(spec, style.track_b if use_b else style.track_idx)
         window = style.window_b if use_b else style.window
-        if track_idx == SAME_TRACK:
-            # "follow the render" -- the render's own track, or the prompt's when
-            # the id stream is nulled and there is no track to follow.
-            track_idx = (
-                spec.track_idx
-                if spec.track_idx is not None
-                else (spec.prompt.track_idx if spec.prompt.kind == "corpus" else 0)
-            )
-        track = self._track(int(track_idx))
+        track = self._track(track_idx)
         if window < 0:
             # Section 11.3: a descriptor computed from the same window as the
             # target is a compressed copy of the answer. Training enforces this
@@ -265,8 +294,7 @@ class SynthService:
             bounds = [(int(lo), int(hi)) for lo, hi in track.style_bounds.tolist()]
             start, end = self._span(spec, track_idx)
             window = pick_style_window(bounds, start, end, random.Random(style.seed))
-        window = max(0, min(window, track.style.shape[0] - 1))
-        return track.style[window].float()
+        return track, max(0, min(window, track.style.shape[0] - 1))
 
     def _style_vector(self, spec: RenderSpec, style: StyleSpec) -> torch.Tensor:
         """
@@ -336,20 +364,84 @@ class SynthService:
 
         Returns:
           torch.Tensor: (S, D) descriptors, one per style segment -- S is 1
-            unless the style walks. Zeros when the stream is nulled: the model
+            unless the style walks; an "ar" walk asks the style model for the
+            later segments. Zeros when the stream is nulled: the model
             substitutes its learned null, so the value is inert.
         """
         style = spec.style
         dim = int(self.model.tracks[0].style.shape[-1])
         if style is None:
             return torch.zeros(1, dim)
-        first = self._style_vector(spec, style)
         positions = spec.n_frames + self.model.generator.depth - 1
+        if style.walk == "ar":
+            return self._ar_walk(spec, style, style.segments(positions))
+        first = self._style_vector(spec, style)
         later = [
             self._style_vector(spec, self._walk_step(spec, style, k))
             for k in range(1, style.segments(positions))
         ]
         return torch.stack([first, *later])
+
+    def _style_ar_sampler(self) -> StyleArSampler:
+        """
+        Returns:
+          StyleArSampler: the style model, loaded on first use.
+
+        Raises:
+          FileNotFoundError: when no style-AR checkpoint is configured or found.
+        """
+        if self._style_ar is None:
+            spec = self.cfg.generator.style_ar_checkpoint
+            if spec in AUTO:
+                raise FileNotFoundError(
+                    "no style-AR checkpoint (saved_style_ar_*); train one with "
+                    "train_style_ar.py"
+                )
+            self._style_ar = StyleArSampler(spec)
+        return self._style_ar
+
+    def _ar_walk(
+        self, spec: RenderSpec, style: StyleSpec, segments: int
+    ) -> torch.Tensor:
+        """
+        Let the style model continue the entry, one descriptor per segment.
+
+        Args:
+          spec (RenderSpec): the render.
+          style (StyleSpec): an entry with walk "ar".
+          segments (int): descriptors the clip needs.
+
+        Returns:
+          torch.Tensor: (segments, D) unit descriptors. With a prefix, row 0 is
+            the entry as written and the model continues from the base track's
+            windows ending there; cold (ar_prefix 0), every row is sampled.
+        """
+        cold = style.ar_prefix <= 0
+        first = None if cold else self._style_vector(spec, style)
+        if first is not None and segments == 1:
+            return first[None]
+        if cold:
+            prefix = None
+        elif style.kind == "window":
+            track, window = self._resolve_window(spec, style, False)
+            prefix = track.style[max(0, window - style.ar_prefix + 1) : window + 1]
+        else:
+            assert first is not None
+            prefix = first[None]
+        track_id = (
+            spec.track_idx
+            if style.kind == "random"
+            else self._base_track(spec, style.track_idx)
+        )
+        rows = self._style_ar_sampler().sample(
+            None if prefix is None else prefix.float(),
+            track_id,
+            segments if first is None else segments - 1,
+            float(style.ar_temperature),
+            float(style.ar_cfg),
+            torch.Generator().manual_seed(int(style.seed)),
+        )
+        return rows if first is None else torch.cat([first[None], rows])
 
     def resolve_prompt(self, spec: RenderSpec) -> torch.Tensor | None:
         """

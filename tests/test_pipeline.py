@@ -669,10 +669,7 @@ def test_banked_bulk_pairs_are_served_instead_of_regenerating(
     bulk = [
         s
         for s in drawn
-        if s is not None
-        and s.tier is Tier.BULK
-        and not s.is_repeat
-        and not s.is_anchor
+        if s is not None and s.tier is Tier.BULK and not s.is_repeat and not s.is_anchor
     ]
     assert bulk, "no ordinary bulk drawn"
     assert any(pipeline._is_banked(spec) for spec in bulk)
@@ -701,3 +698,48 @@ def test_banked_substitution_never_swallows_an_anchor(
             assert any(
                 clip.is_reference for clip in (spec.left, spec.right)
             ), "anchor lost its reference side to a banked substitution"
+
+
+def test_a_banked_pair_is_not_redrawn_while_queued_or_on_screen(
+    sampler: PairSampler, bank: ClipBank
+) -> None:
+    # Session 2026-09-18: the same banked pair served four times in thirty
+    # seconds, none flagged as a repeat. The fresh filter only knew about rated
+    # items, so a group sitting in the queue or on screen was still "unheard"
+    # and every top-up could draw it again.
+    warm = PairSampler(
+        sampler.tracks,
+        SamplerCfg(
+            fps=172.265625,
+            bulk_seconds=1.0,
+            bulk_share=1.0,
+            repeat_rate=0.0,
+            anchor_rate=0.0,
+        ),
+        checkpoint="ckpt_test",
+        rng=random.Random(11),
+    )
+    banked = [warm.next_spec() for _ in range(2)]
+    for spec in banked:
+        for clip in (spec.left, spec.right):
+            bank.add(clip, np.zeros((clip.n_frames, 3), dtype=np.int16))
+
+    cfg = SamplerCfg(
+        fps=172.265625,
+        bulk_seconds=1.0,
+        bulk_share=1.0,
+        repeat_rate=0.0,
+        anchor_rate=0.0,
+    )
+    live = PairSampler(
+        sampler.tracks, cfg, checkpoint="ckpt_test", rng=random.Random(3)
+    )
+    pipeline = PairPipeline(
+        live, FakeProducer(store=bank), bank, depth=4, structure_backfill=0
+    )
+    shown = [pipeline.next_pair() for _ in range(6)]
+    seen = [frozenset((p.spec.left.item_id, p.spec.right.item_id)) for p in shown if p]
+    assert len(seen) == 6
+    assert len(set(seen)) == 6, "a pair came round again unflagged"
+    banked_pairs = {frozenset((s.left.item_id, s.right.item_id)) for s in banked}
+    assert banked_pairs <= set(seen), "banked material was not served first"

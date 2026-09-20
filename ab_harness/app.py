@@ -115,6 +115,7 @@ def main() -> int:
         tracks,
         cfg.sampler,
         checkpoint=cfg.generator.checkpoint,
+        style_checkpoint=cfg.generator.style_ar_checkpoint,
         rng=random.Random(seed),
     )
     # What has already been judged, so banked material the rater has never

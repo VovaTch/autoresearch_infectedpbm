@@ -20,7 +20,11 @@ from typing import Any, TypeVar
 
 import yaml
 
-from ab_harness.checkpoints import discover_checkpoints, resolve_checkpoint
+from ab_harness.checkpoints import (
+    STYLE_AR_FAMILIES,
+    discover_checkpoints,
+    resolve_checkpoint,
+)
 from ab_harness.model.pair_sampler import SamplerCfg
 
 REPO = Path(__file__).resolve().parent.parent
@@ -86,6 +90,11 @@ class GeneratorCfg:
         fitting in VRAM.
       batch_wait_s (float): how long the worker waits for more requests before
         sampling what it already has, so a lone request is not held up.
+      style_ar_checkpoint (str): style-level model (train_style_ar.py) behind
+        the "ar" style walk -- the slice synthesizer's walk entries and the
+        harness's walking conditioning cell (sampler.p_style_walk) -- or "auto"
+        for the newest saved_style_ar_* run. Only loaded when a walking clip
+        is rendered.
     """
 
     checkpoint: str = "auto"
@@ -97,6 +106,7 @@ class GeneratorCfg:
     use_gpu_decoder: bool = True
     max_batch: int = 8
     batch_wait_s: float = 0.5
+    style_ar_checkpoint: str = "auto"
 
 
 @dataclass
@@ -154,6 +164,9 @@ class AbConfig:
     def __post_init__(self) -> None:
         """Resolve an "auto" checkpoint once, so no caller sees the sentinel."""
         self.generator.checkpoint = resolve_checkpoint(self.generator.checkpoint, REPO)
+        self.generator.style_ar_checkpoint = resolve_checkpoint(
+            self.generator.style_ar_checkpoint, REPO, STYLE_AR_FAMILIES
+        )
 
     @property
     def checkpoints(self) -> list[str]:

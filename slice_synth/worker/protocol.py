@@ -86,6 +86,8 @@ class WorkerReady:
       window_frames (int): the sliding window actually in use, after clamping to
         the checkpoint's crop_frames.
       error (str): empty on success.
+      style_ar_checkpoint (str): the style model an "ar" walk will load, or the
+        unresolved "auto" when no saved_style_ar_* run exists yet.
     """
 
     checkpoint: str
@@ -93,6 +95,7 @@ class WorkerReady:
     meta: dict[str, Any] = field(default_factory=dict)
     window_frames: int = 0
     error: str = ""
+    style_ar_checkpoint: str = ""
 
     @property
     def ok(self) -> bool:

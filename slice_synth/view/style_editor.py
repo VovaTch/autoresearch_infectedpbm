@@ -19,8 +19,10 @@ conditioned on. Without that, ticking five tracks and one style would condition
 all five on the first track's mood, which is a mistake that looks like a result.
 
 Any entry can also walk: every `period` frames the descriptor is swapped in
-place for a random corpus window of the render's own tracks, or for a fresh
-unit vector. The entry as written is always the opening segment.
+place for a random corpus window of the render's own tracks, for a fresh unit
+vector, or for the style model's continuation (train_style_ar.py, primed with
+the base track's real windows). The entry as written is always the opening
+segment, except for a cold style-model walk.
 """
 
 from __future__ import annotations
@@ -56,7 +58,9 @@ WALK_LABELS = {
     "none": "hold for the whole clip",
     "windows": "random corpus windows",
     "random": "random vectors",
+    "ar": "style model (AR)",
 }
+AR_ROWS = ("ar prefix", "ar temperature", "ar guidance")
 
 
 class StyleListEditor(QWidget):
@@ -65,14 +69,20 @@ class StyleListEditor(QWidget):
 
     Args:
       parent (QWidget | None): Qt parent.
+      default (StyleSpec | None): template every new entry starts from -- its
+        walk and style-model settings carry over, the kind and window do not.
+        None starts entries un-walked on the render's own track.
     """
 
     changed = Signal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, parent: QWidget | None = None, default: StyleSpec | None = None
+    ) -> None:
         super().__init__(parent)
         self._tracks: list[TrackInfo] = []
         self._loading = False
+        self._default = default or StyleSpec(track_idx=SAME_TRACK, track_b=SAME_TRACK)
 
         self._list = QListWidget(self)
         self._list.setMaximumHeight(110)
@@ -115,9 +125,25 @@ class StyleListEditor(QWidget):
             "'windows' draws from the render's own tracks (all of them, when ids coexist)"
         )
         self._period = self._spin(
-            1, 65536, "frames per style segment; 512 is about 3 s"
+            1, 65536, "frames per style segment; 512 is the style model's own slice"
         )
         self._period.setValue(DEFAULT_PERIOD)
+        self._ar_prefix = self._spin(
+            0,
+            64,
+            "real windows of the base track fed to the style model, ending at this "
+            "entry's window; 0 = cold start, every segment is sampled",
+        )
+        self._ar_temperature = self._dspin(
+            0.0, 3.0, 0.05, "style model sampling temperature; 0 = greedy"
+        )
+        self._ar_cfg = self._dspin(
+            0.0,
+            8.0,
+            0.25,
+            "guidance on the track id: 0 = null id, 1 = plain conditional, "
+            "above 1 pushes toward the track",
+        )
 
         self._form = QFormLayout()
         self._form.addRow("track", self._track)
@@ -129,12 +155,21 @@ class StyleListEditor(QWidget):
         self._form.addRow("seed", self._seed)
         self._form.addRow("walk", self._walk)
         self._form.addRow("period", self._period)
+        self._form.addRow("ar prefix", self._ar_prefix)
+        self._form.addRow("ar temperature", self._ar_temperature)
+        self._form.addRow("ar guidance", self._ar_cfg)
 
         for widget in (self._track, self._track_b, self._walk):
             widget.currentIndexChanged.connect(self._apply)
-        for widget in (self._window, self._window_b, self._seed, self._period):
+        for widget in (
+            self._window,
+            self._window_b,
+            self._seed,
+            self._period,
+            self._ar_prefix,
+        ):
             widget.valueChanged.connect(self._apply)
-        for widget in (self._mix, self._noise):
+        for widget in (self._mix, self._noise, self._ar_temperature, self._ar_cfg):
             widget.valueChanged.connect(self._apply)
 
         layout = QVBoxLayout(self)
@@ -143,7 +178,7 @@ class StyleListEditor(QWidget):
         layout.addLayout(buttons)
         layout.addLayout(self._form)
 
-        self.add(StyleSpec(kind="window", track_idx=SAME_TRACK, window=-1))
+        self.add(replace(self._default, kind="window", window=-1))
 
     # -- construction helpers ------------------------------------------------
 
@@ -162,7 +197,7 @@ class StyleListEditor(QWidget):
             lambda: self.add(
                 None
                 if not kind
-                else StyleSpec(kind=kind, track_idx=SAME_TRACK, track_b=SAME_TRACK)  # type: ignore[arg-type]
+                else replace(self._default, kind=kind)  # type: ignore[arg-type]
             )
         )
         return button
@@ -279,9 +314,11 @@ class StyleListEditor(QWidget):
             "interp": {"track", "window", "track B", "window B", "mix", "seed"},
         }.get(spec.kind if spec else "", set())
         if spec is not None:
-            enabled = (
-                enabled | {"walk"} | ({"period"} if spec.walk != "none" else set())
-            )
+            enabled = enabled | {"walk"}
+            if spec.walk != "none":
+                enabled = enabled | {"period"}
+            if spec.walk == "ar":
+                enabled = enabled | set(AR_ROWS)
 
         rows = {
             "track": self._track,
@@ -293,6 +330,9 @@ class StyleListEditor(QWidget):
             "seed": self._seed,
             "walk": self._walk,
             "period": self._period,
+            "ar prefix": self._ar_prefix,
+            "ar temperature": self._ar_temperature,
+            "ar guidance": self._ar_cfg,
         }
         for name, widget in rows.items():
             visible = name in enabled
@@ -313,6 +353,9 @@ class StyleListEditor(QWidget):
         self._seed.setValue(spec.seed)
         self._walk.setCurrentIndex(max(0, self._walk.findData(spec.walk)))
         self._period.setValue(max(1, spec.period))
+        self._ar_prefix.setValue(max(0, spec.ar_prefix))
+        self._ar_temperature.setValue(spec.ar_temperature)
+        self._ar_cfg.setValue(spec.ar_cfg)
         self._loading = False
 
     def _apply(self) -> None:
@@ -342,11 +385,14 @@ class StyleListEditor(QWidget):
             seed=self._seed.value(),
             walk=self._walk.currentData() or "none",
             period=self._period.value(),
+            ar_prefix=self._ar_prefix.value(),
+            ar_temperature=self._ar_temperature.value(),
+            ar_cfg=self._ar_cfg.value(),
         )
         item.setData(SPEC_ROLE, updated)
         item.setText(self._text(updated))
         if updated.walk != spec.walk:
-            self._load_current()  # the period row appears or goes with the walk
+            self._load_current()  # the period / ar rows appear or go with the walk
         self.changed.emit()
 
 

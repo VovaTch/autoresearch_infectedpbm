@@ -13,7 +13,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from ab_harness.checkpoints import discover_checkpoints, resolve_checkpoint
+from ab_harness.checkpoints import (
+    STYLE_AR_FAMILIES,
+    discover_checkpoints,
+    resolve_checkpoint,
+)
 
 
 def _ckpt(repo: Path, rel: str, mtime: float) -> Path:
@@ -79,3 +83,16 @@ def test_unresolvable_auto_is_left_for_the_worker_to_report(tmp_path: Path) -> N
     # Returning the sentinel keeps the one clear error in the worker, rather
     # than raising at config-load time in every process that reads a config.
     assert resolve_checkpoint("auto", tmp_path) == "auto"
+
+
+def test_the_style_ar_family_is_its_own_search(tmp_path: Path) -> None:
+    _ckpt(tmp_path, "saved_ar_x/ar_latest.ckpt", 1.0)
+    _ckpt(tmp_path, "saved_style_ar_x/style_ar_best.ckpt", 2.0)
+    assert discover_checkpoints(tmp_path) == ["saved_ar_x/ar_latest.ckpt"]
+    assert discover_checkpoints(tmp_path, STYLE_AR_FAMILIES) == [
+        "saved_style_ar_x/style_ar_best.ckpt"
+    ]
+    assert (
+        resolve_checkpoint("auto", tmp_path, STYLE_AR_FAMILIES)
+        == "saved_style_ar_x/style_ar_best.ckpt"
+    )

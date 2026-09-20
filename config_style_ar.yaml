@@ -1,0 +1,65 @@
+# Style-AR: autoregressive model over the token-AR's per-slice style
+# descriptors (train_style_ar.py). Recipe run with 5 held-out tracks; once the
+# read-out below looks right, train the GUI model with `held_out_tracks: 0` and
+# `save_path: saved_style_ar_<date>_all/` so every track has a trained id row
+# (held-out ids fall back to the null row in the synthesizer).
+#
+# Data (tokens_88cacecb1e81, 53 tracks): 7548 slices of 512 frames (2.97 s),
+# 62-216 per track; x4 grid phases = ~30k training rows. PCA-32 keeps 99.7% of
+# the descriptor variance, PCA-24 99%. Reference numbers for the read-out: adjacent-slice
+# cosine 0.91, lag-4 0.61, random pair 0.39, cosine to the corpus mean 0.62.
+#
+# Read-out (TensorBoard under save_path/style_ar):
+#   val/nll            must fall and stay near train/nll_null; a gap = memorising
+#   val/next_cos       one-step samples vs the real next slice; > 0.61 beats
+#                      lag-4 chance, 0.91 (val/copy_cos) is "copy the last slice"
+#   val/sample_pair_cos vs val/data_pair_cos (~0.4): equal = no collapse; -> 1 =
+#                      every sample is the corpus mean
+# CFG at sampling interpolates mixture logits/means between the null-id and the
+# id pass (heuristic, see train_style_ar.guide); 1 = plain conditional.
+#
+# Commands:
+#   uv run python train_style_ar.py --config config_style_ar.yaml --build-phases
+#   CUDA_VISIBLE_DEVICES=1 setsid nohup uv run python train_style_ar.py \
+#     --config config_style_ar.yaml > logs/train_style_ar.log 2>&1 &
+#   uv run python train_style_ar.py --config config_style_ar.yaml --sample
+
+data:
+  token_cache: ~/.cache/infected_pbm/tokens_88cacecb1e81
+  held_out_tracks: 5        # plan_held_out(seed 1234) -> [18, 33, 34, 45, 51]
+  split_seed: 1234
+  pca_dims: 24               # 99% of the variance; recon cosine 0.996 (min 0.94) on held-out
+  pca_eig_floor: 1.0e-4
+  phases: 4                 # grids shifted by 0/128/256/384 frames
+  crop_positions: 128       # ~6.3 min of slices; the longest track is 216
+  min_crop: 8
+  steps_per_epoch: 200      # x batch 64 = 12800 crops per epoch
+
+model:
+  d_model: 128
+  n_layers: 3
+  n_heads: 4
+  dropout: 0.3
+  mog_components: 8
+  log_std_min: -5.0
+  log_std_max: 2.0
+  p_drop_id: 0.3            # null id 30% of the time -> CFG at sampling
+  input_noise: 0.3          # 3-min sweep: val nll/dim 1.12 -> 0.97 with d128/L3/drop0.3/noise0.3
+  rope_theta: 10000.0
+
+train:
+  devices: 1
+  minutes: 30
+  lr: 3.0e-4
+  lr_pct_start: 0.05
+  lr_div_factor: 25
+  batch_size: 64
+  accumulate_grad_batches: 1
+  precision: 32-true
+  weight_decay: 0.05
+  grad_clip: 1.0
+  num_workers: 2
+  ema_decay: 0.999
+  seed: 42
+  save_path: saved_style_ar_20260916_ho5/
+  checkpoint: null

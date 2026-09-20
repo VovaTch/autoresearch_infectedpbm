@@ -145,6 +145,7 @@ def main() -> None:
         service.corpus(),
         cfg.sampler,
         checkpoint=cfg.generator.checkpoint,
+        style_checkpoint=cfg.generator.style_ar_checkpoint,
         rng=random.Random(args.seed),
     )
     if args.smoke:
@@ -162,10 +163,14 @@ def main() -> None:
     made = failed = 0
     for start, batch in enumerate(batches(todo, cfg.generator.max_batch)):
         head = batch[0].conditioning
+        # A crossed stream names the track it borrows from, e.g. id=1<7.
+        xid = f"<{head.id_track}" if head.id_track != head.track_idx else ""
+        xstyle = f"<{head.style_track}" if head.style_track != head.track_idx else ""
         print(
             f"\nbatch of {len(batch)}  {batch[0].tier} {batch[0].n_frames} frames  "
             f"first: track {head.track_idx} @ {head.start_frame} "
-            f"id={int(head.use_track_id)} style={int(head.use_style)} "
+            f"id={int(head.use_track_id)}{xid} style={int(head.use_style)}{xstyle} "
+            f"walk={head.style_walk if head.walking else 'none'} "
             f"prompt={head.prompt_frames} cfg={head.cfg_strength}",
             flush=True,
         )

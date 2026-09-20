@@ -1,10 +1,10 @@
 """
 Cross-track conditioning: does the style/id stream carry anything transferable?
 
-Every clip the harness has ever drawn takes its prompt, its style descriptor and
-its track id from ONE track -- ClipSpec has a single conditioning.track_idx, and
-service._real_tokens, service._style_vector and SampleRequest.track_idx all read
-it. Training matched them too (shuffle_cond is False in every checkpoint, and
+Until sampler.p_cross_track (2026-09-18) every clip the harness drew took its
+prompt, its style descriptor and its track id from ONE track -- ClipSpec had a
+single conditioning.track_idx, and service._real_tokens, service._style_vector
+and SampleRequest.track_idx all read it. Training matched them too (shuffle_cond is False in every checkpoint, and
 _pick_style draws "from elsewhere in the same track"). So the conditioning has
 never had to do work the prompt was not already doing, which is the likely
 reason the conditioning ladder measured it inert (id p=0.81, style p=0.67).

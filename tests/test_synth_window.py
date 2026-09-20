@@ -213,6 +213,25 @@ def test_style_editor_round_trips_the_walk(panel: ControlPanel) -> None:
     assert not editor._period.isVisibleTo(editor)
 
 
+def test_style_editor_shows_the_ar_rows_only_for_the_ar_walk(
+    panel: ControlPanel,
+) -> None:
+    editor = panel.styles
+    editor.add(StyleSpec(kind="window", track_idx=SAME_TRACK, walk="windows"))
+    assert not editor._ar_prefix.isVisibleTo(editor)
+    editor._walk.setCurrentIndex(editor._walk.findData("ar"))
+    assert editor._ar_prefix.isVisibleTo(editor)
+    assert editor._ar_cfg.isVisibleTo(editor) and editor._period.isVisibleTo(editor)
+    editor._ar_prefix.setValue(0)
+    editor._ar_cfg.setValue(2.0)
+    editor._ar_temperature.setValue(0.5)
+    spec = editor.styles()[-1]
+    assert spec is not None and spec.walk == "ar"
+    assert (spec.ar_prefix, spec.ar_cfg, spec.ar_temperature) == (0, 2.0, 0.5)
+    editor._walk.setCurrentIndex(editor._walk.findData("windows"))
+    assert not editor._ar_prefix.isVisibleTo(editor)
+
+
 def test_reference_rows_are_one_per_track(panel: ControlPanel) -> None:
     check(panel, 1, 2)
     panel.reference.setChecked(True)
@@ -557,3 +576,21 @@ def test_strip_images_survive_their_source_buffer(qapp) -> None:
     assert image is not None
     assert image.pixelColor(0, 0).isValid()
     assert image.width() == 500
+
+
+def test_new_style_entries_open_with_the_configured_walk(qapp) -> None:
+    ui = UiCfg(style_walk="ar", style_ar_temperature=1.2, style_ar_cfg=1.5)
+    widget = ControlPanel(ui, ["a/one.ckpt"])
+    widget.set_corpus(WorkerReady("a/one.ckpt", tracks(), dict(META), 4096))
+    first = widget.styles.styles()[0]
+    assert first is not None and first.kind == "window" and first.walk == "ar"
+    assert (first.ar_temperature, first.ar_cfg, first.track_idx) == (
+        1.2,
+        1.5,
+        SAME_TRACK,
+    )
+    widget.styles.add(StyleSpec(kind="random", track_idx=SAME_TRACK, walk="none"))
+    assert widget.styles.styles()[-1] is not None
+    plain = ControlPanel(UiCfg(style_walk="none"), ["a/one.ckpt"])
+    entry = plain.styles.styles()[0]
+    assert entry is not None and not entry.walking

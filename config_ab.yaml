@@ -12,7 +12,7 @@
 #   uv run python -m ab_harness.model.stats ~/.cache/infected_pbm/ab
 
 bank:
-  root: ~/.cache/infected_pbm/ab   # beside tracks/ and tokens_*/, which it points into
+  root: ~/.cache/infected_pbm/ab_dsteps2_24h   # tokens_88cacecb1e81 bank; old-tokenizer bank kept at ab/. Beside tracks/ and tokens_*/, which it points into
 
 generator:
   # auto = the newest checkpoint ab_harness.checkpoints finds, which is the last
@@ -41,6 +41,11 @@ generator:
   # it is what lets the app generate during a rating session at all.
   max_batch: 8
   batch_wait_s: 0.5
+  # Style-level model behind the walking cell (sampler.p_style_walk). Pinned to
+  # the all-tracks run: it has an id row for every track, where the honest
+  # held-out runs walk five tracks under the null id. Loaded on first walking
+  # clip only.
+  style_ar_checkpoint: saved_style_ar_20260916_all/last.ckpt
 
 sampler:
   fps: 172.265625
@@ -52,6 +57,14 @@ sampler:
   prompt_seconds: 3.0
   p_track_id: 0.5           # each stream nulled independently, so all 8 combos occur
   p_style: 0.5
+  # Cross-track streams (2026-09-18): per kept stream, the id or the style
+  # comes from a random OTHER track. The prompt stays the span's real tokens.
+  # Every clip before this took all three from one track, so the conditioning
+  # never had to do work the prompt was not already doing -- the likely reason
+  # the ladder measured it inert (probe_cross_track.py). matched / xid / xstyle
+  # / xboth each land at 0.25 of the styled+id'd cell. Off-distribution for
+  # the checkpoint (shuffle_cond was False in training); expect rougher clips.
+  p_cross_track: 0.5
   # 1.0 as of 2026-09-05: cold starts are not merely off-distribution, they are
   # the single measured cause of the "sounds like a mess" complaint. Conditioning
   # ladder, 8 seeds x 8 cells at a fixed track/span/seed (probe_conditioning.py),
@@ -90,6 +103,20 @@ sampler:
   temperature: 1.0
   top_k: 250
   top_p: 0.0
+  # Style walk (2026-09-18): a styled clip keeps its real window for the first
+  # style_period positions, then the style model (generator.style_ar_checkpoint)
+  # continues it one descriptor per period, primed with the style_ar_prefix
+  # real windows ending at that window. The walk is drawn INSIDE the styled
+  # cell, so fixed-window and walking clips share a bank and the same odds of
+  # every other stream. Both clips of a pair share the walk (style_seed lives
+  # in Conditioning); only token seeds differ. Bulk walks too as of
+  # 2026-09-18: 10 s is three or four segments, enough to hear the style move.
+  p_style_walk: 0.5
+  p_style_walk_bulk: 0.5
+  style_period: 512         # the style model's own slice (2.97 s)
+  style_ar_prefix: 4
+  style_ar_temperature: 1.2 # 1.0 replays the corpus; 1.2 measured for diversity
+  style_ar_cfg: 1.0
 
 session:
   target_lufs: -23.0        # section 7.7: non-optional, louder wins blind A/B

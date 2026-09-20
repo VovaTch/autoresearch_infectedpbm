@@ -131,6 +131,29 @@ def test_labels_spell_out_co_tracks_and_walks() -> None:
         == "rand4~rnd256"
     )
     assert StyleSpec(track_idx=1, window=2, walk="random", period=0).label() == "t1w2"
+    assert StyleSpec(track_idx=1, window=2, walk="ar").label() == "t1w2~ar512"
+    assert (
+        StyleSpec(
+            track_idx=1,
+            window=2,
+            walk="ar",
+            ar_prefix=0,
+            ar_cfg=2.0,
+            ar_temperature=0.5,
+        ).label()
+        == "t1w2~ar512p0c2T0.5"
+    )
+
+
+def test_ar_walk_fields_survive_json_and_old_recipes_default_them() -> None:
+    style = StyleSpec(walk="ar", ar_prefix=2, ar_temperature=0.7, ar_cfg=3.0)
+    again = StyleSpec.from_json(style.to_json())
+    assert again == style
+    raw = StyleSpec(walk="windows").to_json()
+    for key in ("ar_prefix", "ar_temperature", "ar_cfg"):
+        del raw[key]
+    old = StyleSpec.from_json(raw)
+    assert (old.ar_prefix, old.ar_temperature, old.ar_cfg) == (4, 1.0, 1.0)
 
 
 def test_segments_cover_the_clip() -> None:

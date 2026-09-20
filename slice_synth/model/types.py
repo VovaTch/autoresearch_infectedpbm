@@ -25,8 +25,9 @@ import numpy as np
 
 StyleKind = Literal["window", "random", "jitter", "interp"]
 # How the style moves once the clip is under way: fixed, a new corpus window
-# per period, or a fresh unit vector per period.
-StyleWalk = Literal["none", "windows", "random"]
+# per period, a fresh unit vector per period, or the style model's own
+# continuation (train_style_ar.py) sampled one descriptor per period.
+StyleWalk = Literal["none", "windows", "random", "ar"]
 DEFAULT_PERIOD = 512
 # A style entry that follows whichever track the render itself is conditioned on.
 SAME_TRACK = -1
@@ -82,10 +83,19 @@ class StyleSpec:
         reproducible.
       walk (StyleWalk): "none" holds this descriptor for the whole clip;
         "windows" replaces it every `period` frames with a random corpus window
-        of the render's own tracks; "random" with a fresh unit vector. Segment 0
-        is always this spec as written. A separate model predicting the next
-        style would be a further kind here.
-      period (int): frames per style segment when walking.
+        of the render's own tracks; "random" with a fresh unit vector; "ar"
+        continues it with the style model: the next descriptor is sampled from
+        the real windows fed as a prefix and the base track's id. Segment 0 is
+        this spec as written, except for a cold "ar" walk (ar_prefix 0), where
+        the model samples the opening descriptor too.
+      period (int): frames per style segment when walking; 512 is the style
+        model's own slice, other values stretch or squeeze its walk in time.
+      ar_prefix (int): real windows of the base track fed to the style model,
+        ending at `window` (so the walk continues from what is heard); 0 starts
+        cold. Kinds without a real base window feed just the resolved vector.
+      ar_temperature (float): style-model sampling temperature; 0 is greedy.
+      ar_cfg (float): guidance on the track id; 1 is plain conditional, 0 uses
+        the null id (a corpus-generic walk), above 1 pushes toward the track.
     """
 
     kind: StyleKind = "window"
@@ -98,6 +108,9 @@ class StyleSpec:
     seed: int = 0
     walk: StyleWalk = "none"
     period: int = DEFAULT_PERIOD
+    ar_prefix: int = 4
+    ar_temperature: float = 1.0
+    ar_cfg: float = 1.0
 
     @property
     def walking(self) -> bool:
@@ -147,7 +160,13 @@ class StyleSpec:
             base = f"{track}~{self._track_label(self.track_b)}@{self.mix:g}"
         if not self.walking:
             return base
-        return f"{base}~{'win' if self.walk == 'windows' else 'rnd'}{self.period}"
+        walk = {"windows": "win", "random": "rnd", "ar": "ar"}[self.walk]
+        tail = f"{base}~{walk}{self.period}"
+        if self.walk == "ar":
+            tail += f"p{self.ar_prefix}" if self.ar_prefix != 4 else ""
+            tail += f"c{self.ar_cfg:g}" if self.ar_cfg != 1.0 else ""
+            tail += f"T{self.ar_temperature:g}" if self.ar_temperature != 1.0 else ""
+        return tail
 
     def to_json(self) -> dict[str, Any]:
         """

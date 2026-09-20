@@ -135,6 +135,11 @@ class PairPipeline:
         self._clips: dict[str, Clip] = {}
         self._backfill: dict[str, PairSpec] = {}
         self.rated_items: set[str] = set(rated_items or ())
+        # Handed to the rater this session and not yet judged. Without it a
+        # banked group is "unheard" while it sits on screen, and the top-up
+        # that follows every hand-out re-draws it -- the same pair three or
+        # four times in a row, none of them flagged as a repeat.
+        self._heard: set[str] = set()
         self.dropped = 0
         self.skipped_structure = 0
         self.rejected_quiet = 0
@@ -234,10 +239,23 @@ class PairPipeline:
             if pair.spec.pair_id != pair_id:
                 continue
             del self._ready[index]
-            self._release(pair)
-            self._topup()
-            return pair
+            return self._hand_out(pair)
         return None
+
+    def _queued_items(self) -> set[str]:
+        """
+        Returns:
+          set[str]: item ids of every pair ready, in flight, in the backfill
+            lane, or on screen: what a banked draw must not hand out again.
+        """
+        specs = [
+            *(pair.spec for pair in self._ready),
+            *self._inflight.values(),
+            *self._backfill.values(),
+        ]
+        return self._heard | {
+            item for spec in specs for item in (spec.left.item_id, spec.right.item_id)
+        }
 
     def give_back(self, pair: Pair) -> None:
         """
@@ -314,6 +332,7 @@ class PairPipeline:
             unheard, so banked draws move on to material the rater has not met.
         """
         self.rated_items.update((spec.left.item_id, spec.right.item_id))
+        self._heard.difference_update((spec.left.item_id, spec.right.item_id))
 
     # -- drawing -------------------------------------------------------------
 
@@ -417,7 +436,15 @@ class PairPipeline:
             ]
             for members in groups.values()
         ]
-        usable = [members for members in usable if len(members) >= 2]
+        # A group already queued or on screen is out either way; a rated one
+        # only leaves the fresh pool, so a structure replay can still fall
+        # back on it.
+        queued = self._queued_items()
+        usable = [
+            members
+            for members in usable
+            if len(members) >= 2 and not any(m.item_id in queued for m in members)
+        ]
         fresh = [
             members
             for members in usable
@@ -610,7 +637,17 @@ class PairPipeline:
         self.pump()
         if not self._ready:
             return None
-        pair = self._ready.popleft()
+        return self._hand_out(self._ready.popleft())
+
+    def _hand_out(self, pair: Pair) -> Pair:
+        """
+        Args:
+          pair (Pair): the comparison leaving the queue for the screen.
+
+        Returns:
+          Pair: the same pair, its clips now counted as heard.
+        """
+        self._heard.update((pair.spec.left.item_id, pair.spec.right.item_id))
         self._release(pair)
         self._topup()
         return pair
