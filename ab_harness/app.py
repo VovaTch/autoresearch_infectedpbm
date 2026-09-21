@@ -149,7 +149,7 @@ def main() -> int:
         session,
         player,
         quiet_fill=cfg.session.quiet_fill,
-        checkpoints=cfg.checkpoints,
+        checkpoints=cfg.checkpoints_by_backend,
     )
     window.show()
     session.start()

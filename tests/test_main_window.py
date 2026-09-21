@@ -197,7 +197,7 @@ def test_checkpoint_selector_switches_the_session(
         PlayerViewModel(),
         checkpoints=["ckpt_test", "saved_dpo_x/dpo_latest.ckpt"],
     )
-    combo = window.findChild(QComboBox)
+    combo = window.findChild(QComboBox, "checkpoints")
     assert combo is not None and combo.count() == 2
     # the run directory is what tells two models apart at a glance
     assert combo.itemText(1) == "saved_dpo_x/dpo_latest"
@@ -224,7 +224,7 @@ def test_checkpoint_selector_is_hidden_when_there_is_nothing_to_choose(
 
     pipeline = PairPipeline(sampler, FakeProducer(store=bank), bank, depth=1)
     window = MainWindow(SessionViewModel(pipeline, fake_sink), PlayerViewModel())
-    combo = window.findChild(QComboBox)
+    combo = window.findChild(QComboBox, "checkpoints")
     assert combo is not None and combo.count() == 0
 
 
@@ -267,3 +267,42 @@ def test_clicking_a_waveform_moves_the_playhead(
         )
         assert player.source.seconds == pytest.approx(duration / 2, abs=1e-3)
         player.source.restart()
+
+
+def test_backend_picker_switches_to_that_backends_newest_checkpoint(
+    qapp, sampler: PairSampler, bank: ClipBank, fake_sink: FakeSink
+) -> None:
+    from PySide6.QtWidgets import QComboBox
+
+    from ab_harness.view.main_window import MainWindow
+    from ab_harness.viewmodel.player_vm import PlayerViewModel
+
+    pipeline = PairPipeline(
+        sampler, FakeProducer(store=bank), bank, depth=1, structure_live=True
+    )
+    session = SessionViewModel(pipeline, fake_sink)
+    window = MainWindow(
+        session,
+        PlayerViewModel(),
+        checkpoints={
+            "ar": ["ckpt_test", "saved_ar_x/ar_latest.ckpt"],
+            "zflow": ["saved_zflow_y/zflow_latest.ckpt"],
+            "mdm": [],
+        },
+    )
+    backends = window.findChild(QComboBox, "backends")
+    combo = window.findChild(QComboBox, "checkpoints")
+    assert backends is not None and combo is not None
+    assert [backends.itemText(i) for i in range(backends.count())] == ["ar", "zflow"]
+    assert combo.count() == 2 and combo.itemData(0) == "ckpt_test"
+
+    backends.setCurrentIndex(1)
+    backends.activated.emit(1)
+    assert combo.count() == 1 and combo.itemData(0) == "saved_zflow_y/zflow_latest.ckpt"
+    assert session.checkpoint == "saved_zflow_y/zflow_latest.ckpt"
+    session._pump()
+    assert combo.isEnabled()
+
+    # a switch arriving from elsewhere re-homes both selectors
+    window._on_checkpoint_changed("saved_ar_x/ar_latest.ckpt", "")
+    assert backends.currentData() == "ar" and combo.currentData() == "saved_ar_x/ar_latest.ckpt"

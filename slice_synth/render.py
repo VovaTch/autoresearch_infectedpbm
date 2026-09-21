@@ -11,6 +11,7 @@ Usage:
   uv run python -m slice_synth.render --replay renders_synth/20260908_*.json
   uv run python -m slice_synth.render --tracks 3 14 --together --walk windows --period 512
   uv run python -m slice_synth.render --tracks 2 --walk ar --ar-temperature 1.2 --seconds 20
+  uv run python -m slice_synth.render --backend mdm --tracks 3 --seconds 6 --prompt-sec 2
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ from pathlib import Path
 
 import numpy as np
 
+from ab_harness.checkpoints import BACKENDS, discover_checkpoints
+from ab_harness.config import REPO
 from slice_synth.config import resolve_config
 from slice_synth.model.library import load_spec, save_render
 from slice_synth.model.tokens import stats_line
@@ -46,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config_synth.yaml")
     parser.add_argument("--checkpoint", default="", help="default: the config's pick")
+    parser.add_argument(
+        "--backend",
+        default="",
+        choices=("", "ar", "zflow", "mdm"),
+        help="newest checkpoint of that backend (ignored with --checkpoint)",
+    )
     parser.add_argument("--tracks", type=int, nargs="+", default=[0])
     parser.add_argument("--styles", nargs="+", default=["window"], choices=STYLE_KINDS)
     parser.add_argument(
@@ -163,6 +172,12 @@ def main() -> int:
     cfg = resolve_config(args.config)
     if args.checkpoint:
         cfg.generator.checkpoint = args.checkpoint
+    elif args.backend:
+        newest = discover_checkpoints(REPO, BACKENDS[args.backend])
+        if not newest:
+            print(f"no {args.backend} checkpoint trained yet")
+            return 1
+        cfg.generator.checkpoint = newest[0]
     out_root = Path(args.out).expanduser() if args.out else cfg.output_root
 
     service = SynthService(cfg)

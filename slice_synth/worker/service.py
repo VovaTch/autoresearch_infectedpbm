@@ -33,7 +33,7 @@ from ab_harness.model.audio import fill_fraction, normalize_lufs, to_int16
 from ab_harness.model.pair_sampler import TrackInfo, pick_style_window
 from ab_harness.worker.decoder import TokenDecoder
 from ab_harness.worker.generator import SampleRequest
-from ab_harness.worker.loading import LoadedModel, load_ar_checkpoint
+from ab_harness.worker.loading import LoadedModel, load_checkpoint
 from slice_synth.config import SynthConfig
 from slice_synth.model.types import SAME_TRACK, RenderSpec, StyleSpec
 from slice_synth.worker.encoder import FileEncoder
@@ -118,8 +118,8 @@ class SynthService:
         self._encoder = FileEncoder(
             REPO / gen_cfg.encoder_onnx,
             self._model.meta,
-            chunk_frames=self._model.ar_cfg.tokenizer.chunk_frames,
-            margin=self._model.ar_cfg.tokenizer.margin,
+            chunk_frames=self._model.chunk_frames,
+            margin=self._model.margin,
             cache_dir=Path(PROMPT_CACHE).expanduser(),
         )
 
@@ -131,7 +131,7 @@ class SynthService:
         Raises:
           FileNotFoundError: when the checkpoint or its token cache is missing.
         """
-        self._model = load_ar_checkpoint(checkpoint, self.cfg.generator, self._model)
+        self._model = load_checkpoint(checkpoint, self.cfg.generator, self._model)
         self.checkpoint = checkpoint
 
     def switch_checkpoint(self, checkpoint: str) -> None:
@@ -196,7 +196,7 @@ class SynthService:
             checkpoint=self.checkpoint,
             tracks=self.corpus(),
             meta=dict(self.model.meta),
-            window_frames=self.model.generator.window - self.model.generator.depth + 1,
+            window_frames=self.model.generator.window_frames,
             style_ar_checkpoint=self.cfg.generator.style_ar_checkpoint,
         )
 
@@ -499,7 +499,7 @@ class SynthService:
         walking = spec.style is not None and spec.style.walking
         return SampleRequest(
             track_idx=(
-                self.model.generator.model.num_tracks
+                self.model.generator.num_tracks
                 if spec.track_idx is None
                 else int(spec.track_idx)
             ),

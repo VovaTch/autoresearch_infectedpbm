@@ -6,11 +6,13 @@ import numpy as np
 import pytest
 
 from ab_harness.model.audio import (
+    KNEE_THRESHOLD,
     PEAK_CEILING,
     envelope,
     fill_fraction,
     measure_lufs,
     normalize_lufs,
+    soft_knee,
     to_int16,
 )
 
@@ -43,10 +45,34 @@ def test_two_clips_of_different_loudness_end_up_matched() -> None:
     assert measure_lufs(quiet, SR) == pytest.approx(measure_lufs(loud, SR), abs=0.2)
 
 
-def test_peak_guard_prevents_clipping() -> None:
+def test_ceiling_holds_after_a_large_gain() -> None:
     # a very quiet clip needs a large gain, which would clip its own peaks
     out = normalize_lufs(_noise(3.0, 1e-4), SR, target=0.0)
     assert np.abs(out).max() <= PEAK_CEILING + 1e-6
+
+
+def test_sparse_overshoot_does_not_pull_the_body_down() -> None:
+    # the old peak guard scaled the whole clip for a handful of spikes; the
+    # knee must leave the target loudness untouched instead
+    body = _noise(3.0, 0.1)
+    spiked = body.copy()
+    spiked[::SR // 2] = 3.0
+    plain = normalize_lufs(body, SR, target=-23.0)
+    out = normalize_lufs(spiked, SR, target=-23.0)
+    assert np.abs(out).max() <= PEAK_CEILING + 1e-6
+    assert measure_lufs(out, SR) == pytest.approx(measure_lufs(plain, SR), abs=0.2)
+
+
+def test_soft_knee_is_identity_below_threshold() -> None:
+    x = np.linspace(-KNEE_THRESHOLD, KNEE_THRESHOLD, 1001, dtype=np.float32)
+    np.testing.assert_array_equal(soft_knee(x), x)
+
+
+def test_soft_knee_is_monotone_and_bounded() -> None:
+    x = np.linspace(-5.0, 5.0, 10001, dtype=np.float32)
+    y = soft_knee(x)
+    assert np.all(np.diff(y) >= 0)
+    assert np.abs(y).max() <= PEAK_CEILING + 1e-6
 
 
 def test_silence_is_returned_untouched() -> None:

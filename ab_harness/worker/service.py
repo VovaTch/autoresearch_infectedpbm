@@ -29,8 +29,9 @@ from ab_harness.model.bank import ClipBank
 from ab_harness.model.pair_sampler import TrackInfo, save_corpus
 from ab_harness.model.types import ClipSpec
 from ab_harness.worker.decoder import TokenDecoder
-from ab_harness.worker.generator import ArGenerator, SampleRequest
-from ab_harness.worker.loading import LoadedModel, load_ar_checkpoint
+from ab_harness.model.protocols import SampleSource
+from ab_harness.worker.generator import SampleRequest
+from ab_harness.worker.loading import LoadedModel, load_checkpoint
 from ab_harness.worker.protocol import (
     CheckpointChanged,
     ClipRequest,
@@ -84,7 +85,7 @@ class GenerationService:
         self._manifest: dict[str, Any] = {}
         self._cache_dir: Path | None = None
         self._loaded_model: LoadedModel | None = None
-        self._generator: ArGenerator | None = None
+        self._generator: SampleSource | None = None
         self._decoder: TokenDecoder | None = None
         self._meta: dict[str, Any] = {}
         self._loaded = False
@@ -128,7 +129,7 @@ class GenerationService:
         Raises:
           FileNotFoundError: when the checkpoint or its token cache is missing.
         """
-        loaded = load_ar_checkpoint(checkpoint, self.cfg.generator, self._loaded_model)
+        loaded = load_checkpoint(checkpoint, self.cfg.generator, self._loaded_model)
         if loaded.cache_dir != self._cache_dir:
             self._ordered_tracks = loaded.tracks
             self._tracks = loaded.by_idx

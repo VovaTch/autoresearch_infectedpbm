@@ -8,22 +8,18 @@ already on the roadmap and neither should require touching the UI when it lands.
 implementation for the CLI and a subprocess one for the app, exactly as the
 rating harness does, and a fake in the tests.
 
-`SampleSource` is what the worker calls to turn recipes into codes. ArGenerator
-already satisfies it structurally; a latent-DiT sampler satisfying the same
-signature drops in behind RenderSpec.kind without the layers above knowing.
+`SampleSource` is what the worker calls to turn recipes into codes. It lives in
+ab_harness.model.protocols (re-exported here): ArGenerator, ZFlowGenerator and
+MdmGenerator all satisfy it, and the checkpoint's family picks which one the
+worker builds, so nothing above the worker knows which sampler ran.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence, runtime_checkable
+from typing import Any, Protocol, Sequence, runtime_checkable
 
+from ab_harness.model.protocols import SampleSource
 from slice_synth.model.types import Render, RenderSpec
-
-if TYPE_CHECKING:
-    # Only for the SampleSource signature. Importing torch here for real would
-    # drag it into the UI process, which is the one thing the model layer is
-    # supposed to guarantee it never does.
-    import torch
 
 
 @runtime_checkable
@@ -59,26 +55,6 @@ class RenderProducer(Protocol):
 
     def close(self) -> None:
         """Release the worker."""
-        ...
-
-
-@runtime_checkable
-class SampleSource(Protocol):
-    """A generative model over RVQ token grids."""
-
-    def sample_batch(
-        self,
-        requests: Sequence[Any],
-        progress: Callable[[int, int], None] | None = None,
-    ) -> list["torch.Tensor"]:
-        """
-        Args:
-          requests (Sequence[Any]): one lane per clip.
-          progress (Callable[[int, int], None] | None): called with (step, total).
-
-        Returns:
-          list[torch.Tensor]: (T, R) int64 aligned codes per request, on the CPU.
-        """
         ...
 
 

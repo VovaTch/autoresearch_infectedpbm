@@ -108,14 +108,23 @@ class SynthConfig:
     def checkpoints(self) -> list[str]:
         """
         Returns:
-          list[str]: loadable checkpoints, the configured one first so the
-            selector opens on what is actually running.
+          list[str]: loadable checkpoints of every backend, the configured one
+            first so the selector opens on what is actually running.
         """
-        from ab_harness.checkpoints import discover_checkpoints
+        from ab_harness.config import checkpoint_menu
 
-        found = discover_checkpoints(REPO)
-        current = self.generator.checkpoint
-        return [current] + [c for c in found if c != current]
+        return checkpoint_menu(self.generator.checkpoint)
+
+    @property
+    def checkpoints_by_backend(self) -> dict[str, list[str]]:
+        """
+        Returns:
+          dict[str, list[str]]: backend -> its loadable checkpoints, newest
+            first, the configured one in front of its own backend's list.
+        """
+        from ab_harness.config import checkpoint_menus
+
+        return checkpoint_menus(self.generator.checkpoint)
 
     @property
     def output_root(self) -> Path:

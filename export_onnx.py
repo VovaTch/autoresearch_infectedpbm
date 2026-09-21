@@ -242,6 +242,7 @@ class OnnxDecoder(nn.Module):
         self.proj_in, self.res1 = dec._proj_in, dec._res1
         self.up, self.res2, self.proj_spec = dec._up, dec._res2, dec._proj_spec
         self.end_conv = dec._end_conv
+        self.output_act = dec._output_act
         istft = dec._istft
         self.istft = ConvISTFT(istft.n_fft, istft.hop_length, istft.win_length)
         cb = net.vq_module.vq_codebook
@@ -266,7 +267,8 @@ class OnnxDecoder(nn.Module):
             z_q = z_q + self.codebooks[level][indices[..., level]]
         h = self.proj_in(z_q.transpose(1, 2))
         h = self.res2(self.up(self.res1(h)))
-        return self.end_conv(self.istft(self.proj_spec(h)))
+        wav = self.end_conv(self.istft(self.proj_spec(h)))
+        return torch.tanh(wav) if self.output_act == "tanh" else wav
 
 
 # ===========================================================================
@@ -398,6 +400,7 @@ def main() -> None:
     ap.add_argument("--num-tokens", type=int, default=2048)
     ap.add_argument("--time-downsample", type=int, default=1)
     ap.add_argument("--ze-norm", default="none")
+    ap.add_argument("--output-act", default="none", choices=("none", "tanh"))
     ap.add_argument("--per-level-codebooks", action="store_true", default=True)
     ap.add_argument("--slice-length", type=int, default=32768)
     ap.add_argument("--opset", type=int, default=17)
@@ -426,6 +429,7 @@ def main() -> None:
         hidden=args.hidden,
         ze_norm=args.ze_norm,
         per_level_codebooks=args.per_level_codebooks,
+        output_act=args.output_act,
     )
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt

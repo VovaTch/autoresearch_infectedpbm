@@ -23,6 +23,8 @@ from typing import Any, Literal, Sequence
 
 import numpy as np
 
+from ab_harness.checkpoints import backend_of
+
 StyleKind = Literal["window", "random", "jitter", "interp"]
 # How the style moves once the clip is under way: fixed, a new corpus window
 # per period, a fresh unit vector per period, or the style model's own
@@ -32,7 +34,7 @@ DEFAULT_PERIOD = 512
 # A style entry that follows whichever track the render itself is conditioned on.
 SAME_TRACK = -1
 PromptKind = Literal["none", "corpus", "file"]
-RenderKind = Literal["ar", "reference"]
+RenderKind = Literal["ar", "zflow", "mdm", "reference"]
 
 # The id embedding's last row is the learned null; the UI spells that as None.
 NULL_TRACK: int | None = None
@@ -264,8 +266,9 @@ class RenderSpec:
       top_k (int): top-k cutoff, 0 disables.
       top_p (float): nucleus cutoff, 0 disables.
       seed (int): sampling RNG seed.
-      kind (RenderKind): "ar" samples; "reference" decodes the real tokens of the
-        same span instead, which is the tokenizer's own ceiling for comparison.
+      kind (RenderKind): the backend that sampled it ("ar", "zflow", "mdm",
+        from the checkpoint's family); "reference" decodes the real tokens of
+        the same span instead, the tokenizer's own ceiling for comparison.
       checkpoint (str): model the clip came from.
     """
 
@@ -441,7 +444,12 @@ def build_variants(
         cells += [(None, ())] if None in tracks else []
     out = [
         replace(
-            base, track_idx=track, co_tracks=extra, style=style, seed=seed, kind="ar"
+            base,
+            track_idx=track,
+            co_tracks=extra,
+            style=style,
+            seed=seed,
+            kind=backend_of(base.checkpoint),  # type: ignore[arg-type]
         )
         for track, extra in cells
         for style in styles

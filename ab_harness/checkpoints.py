@@ -19,6 +19,7 @@ and bake_ab_bank.py all resolve the same way.
 
 from __future__ import annotations
 
+from fnmatch import fnmatch
 from pathlib import Path
 
 # Config values meaning "pick for me"; anything else is taken as a path.
@@ -28,6 +29,52 @@ FAMILIES = ("saved_dpo_*", "saved_ar_*")
 # The style-level model (train_style_ar.py) is a different family: it is never
 # sampled for tokens, only asked for the next style descriptor.
 STYLE_AR_FAMILIES = ("saved_style_ar_*",)
+# The two non-autoregressive token generators: the latent-flow DiT
+# (train_zflow.py, sampled by ab_harness.worker.zflow_gen) and the masked
+# discrete diffusion model (train_mdm.py, ab_harness.worker.mdm_gen).
+ZFLOW_FAMILIES = ("saved_zflow_*",)
+MDM_FAMILIES = ("saved_mdm_*",)
+# Backend name -> the directory globs its checkpoints live in. The backend is
+# implied by the checkpoint path, so no message or bank record needs a second
+# field to say which sampler produced a clip.
+BACKENDS: dict[str, tuple[str, ...]] = {
+    "ar": FAMILIES,
+    "zflow": ZFLOW_FAMILIES,
+    "mdm": MDM_FAMILIES,
+}
+ALL_FAMILIES: tuple[str, ...] = FAMILIES + ZFLOW_FAMILIES + MDM_FAMILIES
+
+
+def backend_of(checkpoint: str) -> str:
+    """
+    Which sampler a checkpoint path belongs to.
+
+    Args:
+      checkpoint (str): repo-relative checkpoint path.
+
+    Returns:
+      str: a key of BACKENDS; "ar" for anything outside the other families,
+        which is also what an explicit AR path resolves to.
+    """
+    top = Path(checkpoint).parts[0] if Path(checkpoint).parts else ""
+    for backend, families in BACKENDS.items():
+        if backend == "ar":
+            continue
+        if any(fnmatch(top, family) for family in families):
+            return backend
+    return "ar"
+
+
+def discover_all(repo: Path) -> dict[str, list[str]]:
+    """
+    Args:
+      repo (Path): repository root.
+
+    Returns:
+      dict[str, list[str]]: backend -> its checkpoints, newest first; every
+        backend is present, possibly with an empty list.
+    """
+    return {b: discover_checkpoints(repo, fams) for b, fams in BACKENDS.items()}
 
 
 def discover_checkpoints(repo: Path, families: tuple[str, ...] = FAMILIES) -> list[str]:

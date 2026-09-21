@@ -21,8 +21,10 @@ from typing import Any, TypeVar
 import yaml
 
 from ab_harness.checkpoints import (
+    BACKENDS,
     STYLE_AR_FAMILIES,
-    discover_checkpoints,
+    backend_of,
+    discover_all,
     resolve_checkpoint,
 )
 from ab_harness.model.pair_sampler import SamplerCfg
@@ -95,6 +97,16 @@ class GeneratorCfg:
         harness's walking conditioning cell (sampler.p_style_walk) -- or "auto"
         for the newest saved_style_ar_* run. Only loaded when a walking clip
         is rendered.
+      flow_steps (int): Euler steps per window for a latent-flow checkpoint
+        (saved_zflow_*; ab_harness.worker.zflow_gen).
+      flow_churn (float): noise re-draw fraction per flow step, 0 = plain ODE.
+      requantize_beam (int): beam width turning a flow latent back into RVQ
+        tokens (train_zflow.requantize); 8 agrees with the source on 99% of
+        tokens, greedy (1) flips ~15% of level 0.
+      mdm_steps (list[int]): MaskGIT rounds per RVQ level for a masked
+        diffusion checkpoint (saved_mdm_*; ab_harness.worker.mdm_gen).
+      mdm_choice_temperature (float): Gumbel scale on the confidence ranking
+        that decides which draws survive a round, annealed to 0 per level.
     """
 
     checkpoint: str = "auto"
@@ -107,6 +119,11 @@ class GeneratorCfg:
     max_batch: int = 8
     batch_wait_s: float = 0.5
     style_ar_checkpoint: str = "auto"
+    flow_steps: int = 32
+    flow_churn: float = 0.0
+    requantize_beam: int = 8
+    mdm_steps: list[int] = field(default_factory=lambda: [16, 8, 8])
+    mdm_choice_temperature: float = 4.5
 
 
 @dataclass
@@ -172,12 +189,20 @@ class AbConfig:
     def checkpoints(self) -> list[str]:
         """
         Returns:
-          list[str]: loadable checkpoints, newest first, with the configured one
-            in front so the selector opens on what is actually running.
+          list[str]: loadable checkpoints of every backend, AR family first and
+            newest first within each, with the configured one in front so the
+            selector opens on what is actually running.
         """
-        found = discover_checkpoints(REPO)
-        current = self.generator.checkpoint
-        return [current] + [c for c in found if c != current]
+        return checkpoint_menu(self.generator.checkpoint)
+
+    @property
+    def checkpoints_by_backend(self) -> dict[str, list[str]]:
+        """
+        Returns:
+          dict[str, list[str]]: backend -> its loadable checkpoints, newest
+            first, the configured one in front of its own backend's list.
+        """
+        return checkpoint_menus(self.generator.checkpoint)
 
     @property
     def bank_root(self) -> Path:
@@ -186,6 +211,34 @@ class AbConfig:
           Path: the bank directory with ~ expanded.
         """
         return Path(self.bank.root).expanduser()
+
+
+def checkpoint_menus(current: str) -> dict[str, list[str]]:
+    """
+    Args:
+      current (str): the checkpoint in use.
+
+    Returns:
+      dict[str, list[str]]: backend -> loadable checkpoints, newest first,
+        with `current` moved to the front of its backend's list.
+    """
+    menus = discover_all(REPO)
+    own = backend_of(current)
+    menus[own] = [current] + [c for c in menus[own] if c != current]
+    return menus
+
+
+def checkpoint_menu(current: str) -> list[str]:
+    """
+    Args:
+      current (str): the checkpoint in use.
+
+    Returns:
+      list[str]: every backend's checkpoints in one list, `current` first.
+    """
+    menus = checkpoint_menus(current)
+    rest = [c for b in BACKENDS for c in menus[b] if c != current]
+    return [current] + rest
 
 
 def load_config(path: str | Path) -> AbConfig:

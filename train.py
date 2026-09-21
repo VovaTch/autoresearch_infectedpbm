@@ -1423,8 +1423,16 @@ class TemporalDecoder(DecoderBase):
         dilation_factor: int = 2,
         time_upsample: int = 2,
         output_conv_hidden_dim: int = 32,
+        output_act: str = "none",
     ) -> None:
         super().__init__()
+        if output_act not in ("none", "tanh"):
+            raise ValueError(f"output_act must be none|tanh, got {output_act!r}")
+        # "tanh" bounds the waveform to (-1, 1) like DAC/HiFi-GAN; the decoder
+        # must then learn the atanh pre-compensation over the body. 2026-09-21
+        # post-hoc measurement (render_fixed.py): plain tanh at inference costs
+        # cdpam 0.029 -> 0.046 vs a clamp, so this only pays if training absorbs it.
+        self._output_act = output_act
         self._spec_bins = n_fft // 2 + 1
         # complex head: decoder predicts raw (real, imag) STFT -> ISTFT.
         out_dim = self._spec_bins * 2
@@ -1488,7 +1496,8 @@ class TemporalDecoder(DecoderBase):
         self.last_spec = complex_spec
         self.last_istft = y
         # fp32 output: the loss stack (mrstft/chroma/melspec) runs torch.stft on it.
-        return self._end_conv(y.to(self._end_conv[0].weight.dtype)).float()
+        out = self._end_conv(y.to(self._end_conv[0].weight.dtype)).float()
+        return torch.tanh(out) if self._output_act == "tanh" else out
 
 
 # ===========================================================================
@@ -2786,6 +2795,7 @@ def build_generator(
     hidden: int = 1024,
     ze_norm: str = "none",
     per_level_codebooks: bool = False,
+    output_act: str = "none",
 ) -> MultiLvlVQVariationalAutoEncoder:
     # temporal STFT arch: 32768-sample slice, hop 256 -> 128 STFT frames ->
     # T_lat = 128 / time_downsample. Encoder pins z_e scale (ze_norm); decoder
@@ -2797,7 +2807,10 @@ def build_generator(
         ze_norm=ze_norm,
     )
     decoder = TemporalDecoder(
-        token_dim=token_dim, hidden=hidden, time_upsample=time_downsample
+        token_dim=token_dim,
+        hidden=hidden,
+        time_upsample=time_downsample,
+        output_act=output_act,
     )
     return MultiLvlVQVariationalAutoEncoder(
         input_channels=1,
@@ -2979,6 +2992,7 @@ def build_module(
     hidden: int = 1024,
     ze_norm: str = "none",
     per_level_codebooks: bool = False,
+    output_act: str = "none",
 ) -> VqganMusicLightningModule:
     generator = build_generator(
         loss_aggregator,
@@ -2989,6 +3003,7 @@ def build_module(
         hidden=hidden,
         ze_norm=ze_norm,
         per_level_codebooks=per_level_codebooks,
+        output_act=output_act,
     )
     discriminator = build_discriminator(
         disc_width=disc_width,
@@ -3136,6 +3151,8 @@ def main() -> None:
         # DEFAULT none since 2026-07-15: from-scratch race (fixed codebook,
         # seed-paired 3h) ranked none > grms > l2 on every metric + ear check.
         ze_norm=m.get("ze_norm", "none"),
+        # "none" (raw, clamp at playback) or "tanh" (bounded output, needs training)
+        output_act=m.get("output_act", "none"),
     )
 
     if tr.get("compile"):

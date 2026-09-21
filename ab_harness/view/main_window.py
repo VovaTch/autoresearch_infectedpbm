@@ -15,11 +15,33 @@ from PySide6.QtWidgets import (
     QStatusBar,
 )
 
+from ab_harness.checkpoints import backend_of
 from ab_harness.model.types import Pair, Tier
 from ab_harness.view.rating_view import RatingView
 from ab_harness.view.worklist import DEFAULT_QUIET_FILL
 from ab_harness.viewmodel.player_vm import PlayerViewModel
 from ab_harness.viewmodel.session_vm import SessionViewModel
+
+
+def _menus(
+    checkpoints: list[str] | dict[str, list[str]] | None,
+) -> dict[str, list[str]]:
+    """
+    Args:
+      checkpoints (list[str] | dict[str, list[str]] | None): selector input.
+
+    Returns:
+      dict[str, list[str]]: backend -> checkpoints, a flat list split by the
+        family of each path.
+    """
+    if checkpoints is None:
+        return {}
+    if isinstance(checkpoints, dict):
+        return {b: list(paths) for b, paths in checkpoints.items()}
+    menus: dict[str, list[str]] = {}
+    for path in checkpoints:
+        menus.setdefault(backend_of(path), []).append(path)
+    return menus
 
 
 def _short(checkpoint: str) -> str:
@@ -45,9 +67,12 @@ class MainWindow(QMainWindow):
       player (PlayerViewModel): playback transport.
       quiet_fill (float): fill fraction below which a queued pair counts as
         mostly empty and can be hidden from the worklist.
-      checkpoints (list[str] | None): models offered in the selector, current
-        one first. None hides the selector entirely, which is what tests and a
-        repo with nothing trained get.
+      checkpoints (list[str] | dict[str, list[str]] | None): models offered
+        in the selector, current one first -- a flat list, or one list per
+        backend ("ar", "zflow", "mdm") which also shows a backend picker
+        when more than one backend has something trained. None hides the
+        selectors entirely, which is what tests and a repo with nothing
+        trained get.
     """
 
     def __init__(
@@ -55,7 +80,7 @@ class MainWindow(QMainWindow):
         session: SessionViewModel,
         player: PlayerViewModel,
         quiet_fill: float = DEFAULT_QUIET_FILL,
-        checkpoints: list[str] | None = None,
+        checkpoints: list[str] | dict[str, list[str]] | None = None,
     ) -> None:
         super().__init__()
         self.session = session
@@ -65,15 +90,26 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("A/B harness")
         self.resize(880, 520)
 
-        self._checkpoints = QComboBox(self)
+        self._menus = _menus(checkpoints)
+        offered = [b for b, paths in self._menus.items() if paths]
         # No focus: the rating view owns the keyboard, and a combo that steals
         # space or the arrow keys mid-session breaks the whole transport.
+        self._checkpoints = QComboBox(self)
+        self._checkpoints.setObjectName("checkpoints")
         self._checkpoints.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._checkpoints.setToolTip("model new pairs are drawn from")
-        for path in checkpoints or []:
-            self._checkpoints.addItem(_short(path), path)
-        self._checkpoints.setVisible(bool(checkpoints))
+        self._checkpoints.setVisible(bool(offered))
         self._checkpoints.activated.connect(self._on_checkpoint_picked)
+        self._backends = QComboBox(self)
+        self._backends.setObjectName("backends")
+        self._backends.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._backends.setToolTip("generation backend: ar / zflow / mdm")
+        for backend in offered:
+            self._backends.addItem(backend, backend)
+        self._backends.setVisible(len(offered) > 1)
+        self._backends.activated.connect(self._on_backend_picked)
+        if offered:
+            self._show_backend(offered[0])
 
         self._rated = QLabel("0 rated", self)
         self._queue = QLabel("queue 0/0", self)
@@ -84,6 +120,7 @@ class MainWindow(QMainWindow):
         status.addPermanentWidget(self._structure)
         status.addPermanentWidget(self._queue)
         status.addWidget(self._rated)
+        status.addWidget(self._backends)
         status.addWidget(self._checkpoints)
         self.setStatusBar(status)
 
@@ -113,6 +150,29 @@ class MainWindow(QMainWindow):
 
         self.view.setFocus()
 
+    def _show_backend(self, backend: str) -> None:
+        """
+        Args:
+          backend (str): whose checkpoints the checkpoint selector lists.
+        """
+        row = self._backends.findData(backend)
+        if row >= 0:
+            self._backends.setCurrentIndex(row)
+        self._checkpoints.clear()
+        for path in self._menus.get(backend, []):
+            self._checkpoints.addItem(_short(path), path)
+
+    def _on_backend_picked(self, index: int) -> None:
+        """
+        Args:
+          index (int): backend row chosen; its newest checkpoint is loaded.
+        """
+        backend = self._backends.itemData(index)
+        if not backend or not self._menus.get(backend):
+            return
+        self._show_backend(backend)
+        self._on_checkpoint_picked(0)
+
     def _on_checkpoint_picked(self, index: int) -> None:
         """
         Args:
@@ -135,6 +195,8 @@ class MainWindow(QMainWindow):
           error (str): empty on success.
         """
         self._checkpoints.setEnabled(True)
+        if checkpoint and self._checkpoints.findData(checkpoint) < 0:
+            self._show_backend(backend_of(checkpoint))
         index = self._checkpoints.findData(checkpoint)
         if index >= 0:
             self._checkpoints.setCurrentIndex(index)

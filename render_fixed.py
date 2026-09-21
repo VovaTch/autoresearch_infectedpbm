@@ -1,4 +1,21 @@
-"""Re-render the GAN checkpoint with the two post-hoc artifact fixes.
+"""Render one checkpoint through the candidate peak-outlier treatments.
+
+2026-09-21 rework. The listening paths (ab_harness LUFS+peak guard,
+render_samples shared headroom) scale a clip down whenever its loudest sample
+would clip, so a dozen drum-hit overshoot samples pull the whole body down
+~1.5 dB. This script compares that guard against bounding the decoder output
+instead, at inference (no retraining):
+
+  guard    rms-matched, then /peak     -- the current playback behaviour
+  hardclip rms-matched, clamp to +-1   -- what an int16 sink does anyway
+  tanh     tanh(decoder output) at native level, then rms-matched
+  lim      soft knee at LIM_K x rms (tanh above), then rms-matched
+  knee     rms-matched, tanh knee from KNEE_THR (full-scale) up to 1.0
+
+Every variant is rms-matched to ORIG (peak-normed source) so cdpam compares
+equal-loudness bodies; `peak` is the value the guard would have divided by.
+
+Older notes, still true of the decoder:
 
 Two artifacts were measured on the 2026-08-25 gancap10 renders:
 
@@ -13,9 +30,6 @@ Two artifacts were measured on the 2026-08-25 gancap10 renders:
    listening renders are peak-normalized, a dozen outlier samples drag the
    whole clip down ~12% in rms -- the audible "volume is lower".
 
-Variants written per clip: ORIG, gan_sliced (the old path, for reference),
-gan_full (fix 1), gan_lim (fix 1 + fix 2).
-
 Env: N_CLIPS (default 3 per track), LIM_K (knee in units of rms, default 4.0),
 LIM_CEIL (ceiling as a multiple of the knee, default 1.15), CKPT, TAG.
 """
@@ -29,7 +43,6 @@ import torch
 import torchaudio
 
 from render_samples import (
-    OUT,
     SLICE,
     SR,
     build_learning_params,
@@ -41,10 +54,13 @@ from render_samples import (
     pick_clips,
 )
 
-CKPT = os.environ.get("CKPT", "saved_20260827_cont9h/lvl1_vqgan_last.ckpt")
-TAG = os.environ.get("TAG", "gan")
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "renders_limiter")
+CKPT = os.environ.get("CKPT", "saved_20260914_dsteps2_24h/lvl1_vqgan_last.ckpt")
+TAG = os.environ.get("TAG", "d24")
 LIM_K = float(os.environ.get("LIM_K", "4.0"))
 LIM_CEIL = float(os.environ.get("LIM_CEIL", "1.15"))
+KNEE_THR = float(os.environ.get("KNEE_THR", "0.8"))
+OUTPUT_ACT = os.environ.get("OUTPUT_ACT", "none")  # match the checkpoint's model.output_act
 
 
 def crest_ratio(x: torch.Tensor) -> float:
@@ -99,48 +115,56 @@ def decode_full(module, clip: torch.Tensor) -> torch.Tensor:
     return out[:, : clip.shape[1]]
 
 
+def soft_knee(x: torch.Tensor, thr: float = KNEE_THR, ceil: float = 1.0) -> torch.Tensor:
+    """Absolute-level soft clipper: identity below thr, tanh knee saturating at ceil.
+
+    Unlike soft_limit the knee is in full-scale units, not rms units, so it is
+    deployable without a reference and its ceiling is a real ceiling.
+
+    Args:
+      x (torch.Tensor): waveform (1, L).
+      thr (float): knee start in full-scale units.
+      ceil (float): asymptotic ceiling in full-scale units.
+
+    Returns:
+      torch.Tensor: limited waveform (1, L), |out| < ceil.
+    """
+    head = ceil - thr
+    mag = x.abs()
+    over = mag > thr
+    out = x.clone()
+    out[over] = torch.sign(x[over]) * (thr + head * torch.tanh((mag[over] - thr) / head))
+    return out
+
+
 def peak_norm(x: torch.Tensor) -> torch.Tensor:
     return x / (x.abs().max() + 1e-8)
 
 
-def loudness_match(variants: dict[str, torch.Tensor], ref: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Scale every variant to the reference rms, then apply one shared headroom scale.
+def rms_match(variants: dict[str, torch.Tensor], ref: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Scale every variant to the reference rms. No headroom scale on purpose.
 
-    Peak-normalizing each variant independently is what made the old renders
-    unusable: a reconstruction with sparse peak overshoot gets scaled down
-    harder than the reference, so orig and recon end up at different levels.
-    cdpam is level-sensitive (0.2153 peak-normed vs 0.0176 rms-matched on the
-    same audio), and a quieter file also loses a blind ear A/B for reasons that
-    have nothing to do with fidelity. Matching rms first and then dividing
-    everything by a single scalar keeps the comparison honest and still
-    guarantees nothing clips.
+    The shared headroom divide is exactly the guard under test, so it is applied
+    explicitly by the "guard" variant instead of to the whole group.
 
     Args:
       variants (dict[str, torch.Tensor]): named waveforms (1, L).
       ref (torch.Tensor): reference waveform (1, L) to match rms to.
 
     Returns:
-      dict[str, torch.Tensor]: rms-matched waveforms sharing one headroom scale.
+      dict[str, torch.Tensor]: rms-matched waveforms.
     """
     target = ref.pow(2).mean().sqrt()
-    out = {k: v * (target / (v.pow(2).mean().sqrt() + 1e-8)) for k, v in variants.items()}
-    peak = max(float(v.abs().max()) for v in out.values())
-    return {k: v / (peak + 1e-8) for k, v in out.items()}
+    return {k: v * (target / (v.pow(2).mean().sqrt() + 1e-8)) for k, v in variants.items()}
 
 
-def stats(x: torch.Tensor) -> tuple[float, float, float]:
-    """Returns (crest_dB, rms, boundary/body jump ratio) of a peak-normed clip."""
+def stats(x: torch.Tensor) -> tuple[float, float, float, float]:
+    """Returns (crest_dB, rms, peak, ppm of samples with |x| > 1)."""
     a = x.reshape(-1).double().numpy()
     rms = float(np.sqrt((a**2).mean()))
-    crest = 20.0 * np.log10(np.abs(a).max() / rms)
-    d = np.abs(np.diff(a))
-    n = len(a) // SLICE
-    bnd = [j * SLICE - 1 for j in range(1, n) if j * SLICE - 1 < len(d)]
-    if not bnd:
-        return crest, rms, float("nan")
-    mask = np.ones(len(d), bool)
-    mask[bnd] = False
-    return crest, rms, float(d[bnd].mean() / d[mask].mean())
+    peak = float(np.abs(a).max())
+    over = float((np.abs(a) > 1.0).mean() * 1e6)
+    return 20.0 * np.log10(peak / rms), rms, peak, over
 
 
 def main() -> None:
@@ -170,10 +194,13 @@ def main() -> None:
     clips = pick_clips(int(os.environ.get("N_CLIPS", "3")))
     print(f"Picked {len(clips)} clips.")
     print(f"Loading {TAG} <- {CKPT}")
-    module = load_module(CKPT, lp, oc, sc, la, per_level_codebooks=True).cuda().eval()
+    module = load_module(
+        CKPT, lp, oc, sc, la, per_level_codebooks=True, output_act=OUTPUT_ACT
+    ).cuda().eval()
     print(f"Limiter: knee {LIM_K:.2f}x rms, ceiling {LIM_K * LIM_CEIL:.2f}x rms\n")
 
-    hdr = f"{'clip':<24}{'variant':<12}{'cdpam':>9}{'mrstft':>9}{'crest_dB':>10}{'rms':>8}{'bnd_jump':>10}"
+    cols = ("cdpam", "mrstft", "crest_dB", "rms", "peak", "over_ppm")
+    hdr = f"{'clip':<24}{'variant':<10}" + "".join(f"{c:>10}" for c in cols)
     print(hdr)
     print("-" * len(hdr))
     acc: dict[str, list[tuple[float, ...]]] = {}
@@ -183,35 +210,43 @@ def main() -> None:
         full = decode_full(module, clip)
         ref = clip[:, : full.shape[1]]
 
-        group = {
-            "ORIG": ref,
-            "gan_full": full,
-            "gan_lim": soft_limit(full),
-            "gan_limsrc": soft_limit(full, ceil=1.05, ref=ref),
-        }
-        group = loudness_match(group, ref)
-        clip = group["ORIG"]
+        # tanh/lim act on the decoder's native-level output, as a baked-in
+        # output nonlinearity would; rms matching comes after.
+        group = rms_match(
+            {
+                "ORIG": ref,
+                "raw": full,
+                "tanh": torch.tanh(full),
+                "lim": soft_limit(full),
+            },
+            ref,
+        )
+        raw = group.pop("raw")
+        group["guard"] = raw / (raw.abs().max() + 1e-8)
+        group["hardclip"] = raw.clamp(-1.0, 1.0)
+        group["knee"] = soft_knee(raw)
+        _, _, rpk, rover = stats(raw)
+        print(f"  raw decoder output (rms-matched): peak {rpk:.3f}, over_ppm {rover:.1f}")
+        orig = group["ORIG"]
 
         for vname, rec in group.items():
             suffix = "ORIG" if vname == "ORIG" else f"{TAG}_{vname}"
             torchaudio.save(os.path.join(OUT, f"clip{i}_{name}_{suffix}.wav"), rec, SR)
-            L = min(clip.shape[1], rec.shape[1])
-            cd = 0.0 if vname == "ORIG" else cdpam_score(clip[:, :L], rec[:, :L])
-            mr = 0.0 if vname == "ORIG" else multi_res_stft_dist(clip[:, :L], rec[:, :L])
-            cr, rm, bj = stats(rec)
-            acc.setdefault(vname, []).append((cd, mr, cr, rm, bj))
+            L = min(orig.shape[1], rec.shape[1])
+            cd = 0.0 if vname == "ORIG" else cdpam_score(orig[:, :L], rec[:, :L])
+            mr = 0.0 if vname == "ORIG" else multi_res_stft_dist(orig[:, :L], rec[:, :L])
+            row = (cd, mr, *stats(rec))
+            acc.setdefault(vname, []).append(row)
             print(
-                f"{('clip' + str(i) + ' ' + name)[:23]:<24}{vname:<12}"
-                f"{cd:>9.4f}{mr:>9.4f}{cr:>10.2f}{rm:>8.4f}{bj:>10.2f}"
+                f"{('clip' + str(i) + ' ' + name)[:23]:<24}{vname:<10}"
+                + "".join(f"{v:>10.4f}" for v in row)
             )
 
     print("\n" + "=" * len(hdr))
-    print(f"{'MEAN':<24}{'variant':<12}{'cdpam':>9}{'mrstft':>9}{'crest_dB':>10}{'rms':>8}{'bnd_jump':>10}")
+    print(f"{'MEAN':<24}{'variant':<10}" + "".join(f"{c:>10}" for c in cols))
     for vname, rows in acc.items():
         m = np.mean(rows, axis=0)
-        print(
-            f"{'':<24}{vname:<12}{m[0]:>9.4f}{m[1]:>9.4f}{m[2]:>10.2f}{m[3]:>8.4f}{m[4]:>10.2f}"
-        )
+        print(f"{'':<24}{vname:<10}" + "".join(f"{v:>10.4f}" for v in m))
     print(f"\nWavs in: {OUT}")
 
 

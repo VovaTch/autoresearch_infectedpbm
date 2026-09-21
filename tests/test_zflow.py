@@ -253,7 +253,9 @@ def test_prepare_returns_whitened_crop_and_source_tokens():
     crop, ctx = 8, module.cfg.data.style_context_frames
     tok = random_tokens(crop + 2 * ctx).unsqueeze(0)
     valid = torch.ones(1, crop + 2 * ctx, dtype=torch.bool)
-    x1, style, crop_tok = module.prepare({"tokens": tok, "valid": valid})
+    prep = module.prepare({"tokens": tok, "valid": valid})
+    x1, style, crop_tok = prep.x1, prep.style, prep.tokens
+    assert prep.track_idx is None and prep.score_mask.all()
     assert x1.shape == (1, DIM, crop)
     assert style.shape == (1, DIM)
     assert torch.equal(crop_tok, tok[:, ctx : ctx + crop])
@@ -269,7 +271,7 @@ class OracleNet(torch.nn.Module):
         self.x1 = x1
         self.calls: list[float] = []
 
-    def forward(self, x, t, style=None, drop=None):
+    def forward(self, x, t, style=None, drop=None, *_):
         self.calls.append(float(t[0]))
         tt = t.reshape(-1, 1, 1)
         # x = (1 - t) eps + t x1  ->  eps = (x - t x1) / (1 - t)
@@ -440,3 +442,143 @@ def test_held_out_tracks_depend_only_on_the_seed():
     a = zf.plan_held_out(entries, zf.DataCfg(split_seed=1234, held_out_tracks=5))  # type: ignore[arg-type]
     b = zf.plan_held_out(entries, zf.DataCfg(split_seed=1234, held_out_tracks=5))  # type: ignore[arg-type]
     assert a == b == [18, 33, 34, 45, 51]
+
+
+# ------------------------------------------------- xattn + prefix (generator)
+
+
+def xattn_module(**model: int | float) -> zf.ZFlowModule:
+    """
+    Returns:
+      zf.ZFlowModule: tiny module in generator mode (xattn, 4 ids, prefix on).
+    """
+    return tiny_module(cond_mode="xattn", num_tracks=4, prefix_max_frac=0.5, **model)
+
+
+def ar_batch(batch: int, frames: int, seed: int = 5) -> dict:
+    """
+    Returns:
+      dict: an AR-stage loader batch (train_ar.TokenCropDataset layout).
+    """
+    gen = torch.Generator().manual_seed(seed)
+    return {
+        "tokens": torch.randint(0, CODES, (batch, frames, RQ), generator=gen),
+        "style": torch.nn.functional.normalize(
+            torch.randn(batch, DIM, generator=gen), dim=-1
+        ),
+        "track_idx": torch.randint(0, 4, (batch,), generator=gen),
+        "score_mask": torch.ones(batch, frames, dtype=torch.bool),
+    }
+
+
+def test_xattn_dit_preserves_shape_and_starts_at_zero():
+    net = xattn_module().net
+    x = torch.randn(3, DIM, 12)
+    out = net(x, torch.rand(3), torch.randn(3, DIM), None, torch.tensor([0, 1, 3]))
+    assert out.shape == x.shape
+    assert torch.equal(out, torch.zeros_like(out))
+    assert net.in_proj.in_features == (DIM + 1) * net.cfg.patch
+
+
+def test_xattn_memory_nulls_each_stream_independently():
+    torch.manual_seed(0)
+    mem = xattn_module().net.memory
+    assert mem is not None
+    torch.nn.init.normal_(mem.null_style, std=1.0)
+    ids = torch.tensor([1, 2])
+    style = torch.randn(2, DIM)
+    full = mem(ids, style)
+    no_id = mem(ids, style, drop_id=torch.tensor([True, True]))
+    no_style = mem(ids, style, drop_style=torch.tensor([True, True]))
+    null = mem(None, None, batch=2)
+    assert full.shape == (2, 2, mem.null_style.shape[0])
+    assert torch.allclose(no_id[:, 0], null[:, 0]) and torch.allclose(
+        no_id[:, 1], full[:, 1]
+    )
+    assert torch.allclose(no_style[:, 1], null[:, 1]) and torch.allclose(
+        no_style[:, 0], full[:, 0]
+    )
+    assert not torch.allclose(full, null)
+
+
+def test_xattn_gradients_reach_every_parameter():
+    torch.manual_seed(0)
+    net = xattn_module().net
+    for p in net.parameters():
+        if p.ndim >= 1:
+            torch.nn.init.normal_(p, std=0.05)
+    x = torch.randn(2, DIM, 8)
+    mask = torch.zeros(2, 8, dtype=torch.bool)
+    mask[0, :4] = True
+    drop = torch.tensor([False, True])
+    out = net(
+        x, torch.rand(2), torch.randn(2, DIM), drop, torch.tensor([0, 2]), drop, mask
+    )
+    out.pow(2).mean().backward()
+    for name, p in net.named_parameters():
+        assert p.grad is not None and p.grad.abs().sum() > 0, name
+
+
+def test_prepare_accepts_ar_stage_items():
+    module = xattn_module()
+    batch = ar_batch(2, 8)
+    prep = module.prepare(batch)
+    assert prep.x1.shape == (2, DIM, 8)
+    assert torch.equal(prep.tokens, batch["tokens"])
+    assert prep.track_idx is not None and torch.equal(
+        prep.track_idx, batch["track_idx"]
+    )
+    assert torch.equal(prep.style, batch["style"])
+
+
+def test_training_step_runs_in_generator_mode():
+    module = xattn_module()
+    loss = module._run(ar_batch(4, 8), "train")
+    assert loss.ndim == 0 and torch.isfinite(loss)
+
+
+def test_prefix_frames_survive_sampling_untouched():
+    module = xattn_module()
+    for p in module.net.parameters():
+        if p.ndim >= 1:
+            torch.nn.init.normal_(p, std=0.05)
+    prefix = torch.randn(2, DIM, 8)
+    mask = torch.zeros(2, 8, dtype=torch.bool)
+    mask[:, :4] = True
+    noise = torch.randn(2, DIM, 8)
+    out = module.sample(
+        noise,
+        0.0,
+        torch.randn(2, DIM),
+        steps=3,
+        track_idx=torch.tensor([1, 2]),
+        prefix=prefix,
+        prefix_mask=mask,
+    )
+    assert torch.equal(out[:, :, :4], prefix[:, :, :4])
+    assert not torch.allclose(out[:, :, 4:], prefix[:, :, 4:])
+
+
+def test_cfg_null_branch_drops_id_and_style():
+    torch.manual_seed(0)
+    module = xattn_module()
+    for p in module.net.parameters():
+        if p.ndim >= 1:
+            torch.nn.init.normal_(p, std=0.05)
+    x, t = torch.randn(2, DIM, 8), torch.rand(2)
+    style, ids = torch.randn(2, DIM), torch.tensor([0, 3])
+    cond = module.net(x, t, style, None, ids)
+    both_dropped = torch.ones(2, dtype=torch.bool)
+    null = module.net(x, t, style, both_dropped, ids, both_dropped)
+    guided = module.velocity(x, t, style, 3.0, ids)
+    assert torch.allclose(guided, null + 3.0 * (cond - null), atol=1e-5)
+
+
+def test_legacy_adaln_config_round_trips_without_new_keys():
+    raw = zf.asdict(tiny_cfg())
+    for key in ("cond_mode", "num_tracks", "p_drop_cond", "prefix_max_frac"):
+        raw["model"].pop(key)
+    cfg = zf.config_from_dict(raw)
+    assert cfg.model.cond_mode == "adaln" and cfg.model.prefix_max_frac == 0.0
+    net = zf.LatentDiT(cfg.model, DIM, DIM)
+    assert net.memory is None and net.in_proj.in_features == DIM * cfg.model.patch

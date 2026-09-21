@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
 
+from ab_harness.checkpoints import backend_of
 from ab_harness.model.types import ClipSpec, Conditioning, PairSpec, Sampling, Tier
 
 
@@ -376,7 +377,7 @@ class PairSampler:
             n_frames=frames,
             conditioning=cond,
             sampling=sampling,
-            generator="ar",
+            generator=backend_of(self.checkpoint),
             checkpoint=self.checkpoint,
         )
 

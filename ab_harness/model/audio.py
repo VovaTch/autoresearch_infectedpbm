@@ -22,6 +22,8 @@ import pyloudnorm as pyln
 
 DEFAULT_TARGET_LUFS = -23.0
 PEAK_CEILING = 0.99
+# soft_knee starts here; between it and the ceiling the transfer is a tanh
+KNEE_THRESHOLD = 0.8
 # BS.1770 needs 400 ms for one gating block; below that the meter cannot run.
 MIN_SECONDS = 0.4
 
@@ -44,6 +46,38 @@ def measure_lufs(pcm: np.ndarray, sample_rate: int) -> float:
     return float(meter.integrated_loudness(pcm.astype(np.float64)))
 
 
+def soft_knee(
+    pcm: np.ndarray, threshold: float = KNEE_THRESHOLD, ceiling: float = PEAK_CEILING
+) -> np.ndarray:
+    """
+    Soft-clip the few samples above `threshold` into a tanh knee under `ceiling`.
+
+    The decoder overshoots full scale on ~0.01-0.3% of samples (drum-hit
+    transients); the body of the clip is at the right level. Squashing those
+    samples is inaudible next to attenuating the whole clip to make room for
+    them (render_fixed.py 2026-09-21: cdpam 0.029 vs 0.139 for the old peak
+    guard, six clips, same ear verdict).
+
+    Args:
+      pcm (np.ndarray): (N,) float32 waveform.
+      threshold (float): knee start, absolute sample value; identity below it.
+      ceiling (float): asymptote; |out| < ceiling.
+
+    Returns:
+      np.ndarray: (N,) float32 limited waveform, |out| <= ceiling.
+    """
+    head = ceiling - threshold
+    mag = np.abs(pcm)
+    over = mag > threshold
+    if not over.any():
+        return pcm.astype(np.float32, copy=False)
+    out = pcm.astype(np.float32, copy=True)
+    out[over] = np.sign(pcm[over]) * (
+        threshold + head * np.tanh((mag[over] - threshold) / head)
+    )
+    return out
+
+
 def normalize_lufs(
     pcm: np.ndarray,
     sample_rate: int,
@@ -51,12 +85,12 @@ def normalize_lufs(
     ceiling: float = PEAK_CEILING,
 ) -> np.ndarray:
     """
-    Scale a waveform to a target loudness without letting it clip.
+    Scale a waveform to a target loudness, then soft-knee anything over the ceiling.
 
-    The peak guard can leave a clip quieter than the target. That is the correct
-    trade: a clipped clip loses the A/B for a reason unrelated to the model,
-    which is exactly the confound this module exists to remove. Pick a target
-    low enough that the guard rarely engages.
+    Until 2026-09-21 this reduced the gain instead whenever the peak would
+    exceed the ceiling. That guard fired on sparse decoder overshoot and pulled
+    the whole clip ~2 dB under the target, which the rater heard as "quieter"
+    and cdpam scored 5x worse; see soft_knee.
 
     Args:
       pcm (np.ndarray): (N,) float32 mono waveform.
@@ -71,10 +105,7 @@ def normalize_lufs(
     if not np.isfinite(loudness):
         return pcm.astype(np.float32, copy=True)
     gain = float(10.0 ** ((target - loudness) / 20.0))
-    peak = float(np.abs(pcm).max())
-    if peak * gain > ceiling:
-        gain = ceiling / peak
-    return (pcm * gain).astype(np.float32)
+    return soft_knee((pcm * gain).astype(np.float32), ceiling=ceiling)
 
 
 def to_int16(pcm: np.ndarray) -> np.ndarray:

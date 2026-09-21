@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ab_harness.checkpoints import backend_of
 from ab_harness.model.pair_sampler import TrackInfo
 from slice_synth.config import UiCfg
 from slice_synth.model.types import (
@@ -63,8 +64,11 @@ class ControlPanel(QWidget):
 
     Args:
       ui (UiCfg): opening values for every knob.
-      checkpoints (list[str] | None): models offered in the selector, current
-        first. None hides the selector, which is what tests get.
+      checkpoints (list[str] | dict[str, list[str]] | None): models offered
+        in the selector, current first -- a flat list, or one list per backend
+        ("ar", "zflow", "mdm"), which also shows a backend picker when more
+        than one backend has something trained. None hides the selectors,
+        which is what tests get.
       parent (QWidget | None): Qt parent.
     """
 
@@ -75,23 +79,36 @@ class ControlPanel(QWidget):
     def __init__(
         self,
         ui: UiCfg,
-        checkpoints: list[str] | None = None,
+        checkpoints: list[str] | dict[str, list[str]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.ui = ui
         self._tracks: list[TrackInfo] = []
         self._fps = 172.265625
-        self._checkpoint = checkpoints[0] if checkpoints else ""
+        self._menus = _menus(checkpoints)
+        offered = [b for b, paths in self._menus.items() if paths]
+        self._checkpoint = self._menus[offered[0]][0] if offered else ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
 
+        self.backends = QComboBox(self)
+        self.backends.setObjectName("backends")
+        self.backends.setToolTip(
+            "generation backend: ar = token model, zflow = latent flow, "
+            "mdm = masked diffusion. Picking one loads its newest checkpoint."
+        )
+        for backend in offered:
+            self.backends.addItem(backend, backend)
+        self.backends.setVisible(len(offered) > 1)
+        self.backends.activated.connect(self._on_backend)
+        layout.addWidget(self.backends)
+
         self.checkpoints = QComboBox(self)
+        self.checkpoints.setObjectName("checkpoints")
         self.checkpoints.setToolTip("model every new variant is sampled from")
-        for path in checkpoints or []:
-            self.checkpoints.addItem(_short(path), path)
-        self.checkpoints.setVisible(bool(checkpoints))
+        self.checkpoints.setVisible(bool(offered))
         self.checkpoints.activated.connect(self._on_checkpoint)
         layout.addWidget(self.checkpoints)
 
@@ -99,6 +116,8 @@ class ControlPanel(QWidget):
         layout.addWidget(self._style_box())
         layout.addWidget(self._prompt_box())
         layout.addWidget(self._sampling_box())
+        if offered:
+            self._show_backend(offered[0])
 
         self.generate = QPushButton("Generate", self)
         self.generate.setDefault(True)
@@ -410,6 +429,7 @@ class ControlPanel(QWidget):
         """
         self.cancel.setEnabled(busy)
         self.checkpoints.setEnabled(not busy)
+        self.backends.setEnabled(not busy)
         if not busy:
             self.progress.setValue(0)
             self.progress.setFormat("idle")
@@ -430,10 +450,40 @@ class ControlPanel(QWidget):
           checkpoint (str): the model now loaded.
         """
         self._checkpoint = checkpoint
+        if checkpoint and self.checkpoints.findData(checkpoint) < 0:
+            self._show_backend(backend_of(checkpoint))
         index = self.checkpoints.findData(checkpoint)
         if index >= 0:
             self.checkpoints.setCurrentIndex(index)
         self.checkpoints.setEnabled(True)
+        self.backends.setEnabled(True)
+        self._knobs_for(backend_of(checkpoint))
+
+    def _show_backend(self, backend: str) -> None:
+        """
+        Args:
+          backend (str): whose checkpoints the checkpoint selector lists.
+        """
+        row = self.backends.findData(backend)
+        if row >= 0:
+            self.backends.setCurrentIndex(row)
+        self.checkpoints.clear()
+        for path in self._menus.get(backend, []):
+            self.checkpoints.addItem(_short(path), path)
+        self._knobs_for(backend)
+
+    def _knobs_for(self, backend: str) -> None:
+        """
+        Grey out the sampling knobs a backend ignores.
+
+        Args:
+          backend (str): "ar" (all live), "mdm" (top-p unused) or "zflow"
+            (temperature / top-k / top-p unused: it integrates an ODE, and its
+            own knobs are the config's flow_steps / flow_churn).
+        """
+        self.temperature.setEnabled(backend != "zflow")
+        self.top_k.setEnabled(backend != "zflow")
+        self.top_p.setEnabled(backend == "ar")
 
     # -- spec building -------------------------------------------------------
 
@@ -554,7 +604,19 @@ class ControlPanel(QWidget):
         path = self.checkpoints.itemData(index)
         if path and path != self._checkpoint:
             self.checkpoints.setEnabled(False)
+            self.backends.setEnabled(False)
             self.checkpoint_picked.emit(path)
+
+    def _on_backend(self, index: int) -> None:
+        """
+        Args:
+          index (int): backend row picked; its newest checkpoint is loaded.
+        """
+        backend = self.backends.itemData(index)
+        if not backend or not self._menus.get(backend):
+            return
+        self._show_backend(backend)
+        self._on_checkpoint(0)
 
     def _browse(self) -> None:
         """Pick a prompt file."""
@@ -652,6 +714,27 @@ class ControlPanel(QWidget):
         if blended is not None:
             note += f", ids {'+'.join(map(str, blended.tracks))} in one clip"
         self.count.setText(f"{len(specs)} variants{note}")
+
+
+def _menus(
+    checkpoints: list[str] | dict[str, list[str]] | None,
+) -> dict[str, list[str]]:
+    """
+    Args:
+      checkpoints (list[str] | dict[str, list[str]] | None): selector input.
+
+    Returns:
+      dict[str, list[str]]: backend -> checkpoints, a flat list split by the
+        family of each path.
+    """
+    if checkpoints is None:
+        return {}
+    if isinstance(checkpoints, dict):
+        return {b: list(paths) for b, paths in checkpoints.items()}
+    menus: dict[str, list[str]] = {}
+    for path in checkpoints:
+        menus.setdefault(backend_of(path), []).append(path)
+    return menus
 
 
 def _short(checkpoint: str) -> str:

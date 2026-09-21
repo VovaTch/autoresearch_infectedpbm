@@ -1,0 +1,62 @@
+# lvl1_vqgan tokenizer -- bounded-output (tanh) fine-tune from dsteps2_24h.
+#
+# 2026-09-21 question: does the decoder do better owning its output bound than
+# having playback clip it? Post-hoc (render_fixed.py, 6 clips, rms-matched):
+#   old peak guard   cdpam 0.139  (body -2.2 dB, one 2x spike halves clip2)
+#   clamp / knee     cdpam 0.029  (crest == source)
+#   plain tanh       cdpam 0.046  (8% compression at 0.5 FS, crest -0.6 dB)
+# So tanh at inference is worse than a clamp UNLESS training absorbs the atanh
+# pre-compensation. This leg tests that. Playback now soft-knees at 0.8->0.99
+# regardless (ab_harness/model/audio.py), so the comparison is tanh-trained
+# vs none-trained, both through the same knee.
+#
+# Warm start = dsteps2_24h last.ckpt (weights load unchanged; only the output
+# nonlinearity is new). Short leg: the decoder tail is the only thing that
+# has to move. Judge on: cdpam/mrstft on test vs dsteps2_24h (0.0970 / 1.127),
+# crest_dB of renders vs ORIG, and ear on renders_limiter clips (any HF hash
+# on loud sustained material = failed compensation).
+#
+# Render with:  OUTPUT_ACT=tanh CKPT=saved_20260921_tanh_ft/lvl1_vqgan_last.ckpt \
+#               uv run python render_fixed.py
+# Export with:  --output-act tanh
+
+model:
+  hidden: 1024
+  token_dim: 1024
+  num_rq: 3
+  num_tokens: 2048
+  time_downsample: 1
+  ze_norm: none
+  per_level_codebooks: true
+  output_act: tanh  # LEVER: bounded decoder output (DAC / HiFi-GAN style)
+
+vq:
+  commit_weight: 0.75
+
+loss:
+  consistency_weight: 2.0
+  periodicity_weight: 10.0  # BUZZ: hop-periodic excess on output
+  spec_mean_weight: 5.0     # BUZZ: constant complex offset in the STFT head
+
+gan:
+  gan_start_step: 1000  # inert on a warm start
+  disc_warmup: 3000     # inert on a warm start
+  disc_only_steps: 0    # critics carried from dsteps2_24h
+  disc_clip: per_critic
+  disc_lr_mult: 4.0
+  disc_steps: 2
+  d_weight_cap: 1.0
+  disc_width: 1
+  disc_freq_pool: 2
+  disc_stft_resolutions: [[1024, 256], [2048, 512], [512, 128]]
+
+train:
+  devices: 1
+  minutes: 180
+  lr: 5.0e-5       # half the continuation peak: compensation is a small move
+  lr_pct_start: 0.05
+  lr_div_factor: 50
+  batch_size: 48
+  single_song: null
+  save_path: saved_20260921_tanh_ft/
+  checkpoint: saved_20260914_dsteps2_24h/lvl1_vqgan_last.ckpt

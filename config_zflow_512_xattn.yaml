@@ -1,0 +1,92 @@
+# Latent-flow GENERATOR (alternative to the AR token model), 2026-09-21.
+#
+# Same data and conditionals as the AR stage: data.ar_config points at the AR
+# YAML, so crops are its aligned 512-frame grid slices (2.97 s), each with its
+# own +-256-context style descriptor and track id, and validation is its
+# in-track held-out windows. Track id + style enter as two memory tokens that
+# every block cross-attends to (cond_mode xattn, user's pick over adaLN); flow
+# time alone drives adaLN. Each stream is dropped independently 50% of the time
+# (p_drop_cond, as the AR) so cfg has a real null branch per stream.
+#
+# Prefix conditioning is trained in (prefix_max_frac 0.5): a random clean
+# leading fraction of the crop rides along with an is-prefix channel and is
+# excluded from the loss, so a prompt continues natively at sampling and long
+# clips chain 512-frame windows re-primed from the previous tail
+# (ab_harness.worker.zflow_gen.ZFlowGenerator).
+#
+# Why: the horizon probe (2026-09-20) showed the 512-ctx AR does not copy from
+# its context and its identity conditioning sits at chance below cfg 8 -- two
+# prefix tokens drown under 512 content tokens in causal attention. A
+# bidirectional denoiser with conditioning at every block is the test of that.
+#
+# Pre-registered read-out:
+#   val/loss (velocity MSE on non-prefix frames of held-out windows)
+#   val/prefix_tok_agree_l0     -> continuation from a clean quarter
+#   val/sdedit_tok_agree_l0     -> content retention at strength 0.5
+#   val/sample_std vs val/data_std -> collapse guard
+# Then ear: slice_synth.render --checkpoint saved_zflow_512_xattn/zflow_latest.ckpt
+#
+# Command (detached, GPU1):
+#   CUDA_VISIBLE_DEVICES=1 setsid nohup uv run python train_zflow.py \
+#     --config config_zflow_512_xattn.yaml > logs/train_zflow_512_xattn.log 2>&1 &
+
+tokenizer:
+  token_cache: ~/.cache/infected_pbm/tokens_88cacecb1e81   # overridden by ar_config's cache
+  checkpoint: saved_20260914_dsteps2_24h/last.ckpt
+  meta: onnx/tokenizer_meta.json
+  encoder_onnx: onnx/encoder.onnx
+  decoder_onnx: onnx/decoder.onnx
+  tracks_dir: ~/.cache/infected_pbm/tracks
+  slices_dir: ~/.cache/infected_pbm/slices
+  chunk_frames: 4096
+  margin: 256
+
+data:
+  ar_config: config_ar_512_aligned.yaml   # crops, descriptors, ids, val split
+  crop_frames: 512        # informational; the AR config's value is used
+  pca_dims: 128
+  pca_eig_floor: 1.0e-4
+  steps_per_epoch: 500    # informational; the AR config's steps_per_epoch is used
+  single_track: null
+
+model:
+  d_model: 512
+  n_layers: 12
+  n_heads: 8
+  patch: 2                # 512 frames -> 256 tokens
+  mlp_hidden: 1408
+  dropout: 0.1
+  t_embed_dim: 256
+  style_bottleneck: 128
+  cond_mode: xattn
+  p_drop_cond: 0.5
+  prefix_max_frac: 0.5
+  rope_theta: 10000.0
+
+flow:
+  t_sampling: logit_normal
+  t_mean: 0.0
+  t_std: 1.0
+  t_eps: 1.0e-3
+  steps: 32
+  churn: 0.0
+  cfg_scale: 1.0
+  sdedit_strength: 0.5
+  val_samples: 8
+
+train:
+  devices: 1
+  minutes: 480
+  lr: 3.0e-4
+  lr_pct_start: 0.05
+  lr_div_factor: 25.0
+  batch_size: 64          # 64 x 512 frames = the AR's 32768 frames/step
+  accumulate_grad_batches: 1
+  precision: 32-true
+  weight_decay: 0.01
+  grad_clip: 1.0
+  num_workers: 4
+  ema_decay: 0.999
+  seed: 42
+  save_path: saved_zflow_512_xattn/
+  checkpoint: null

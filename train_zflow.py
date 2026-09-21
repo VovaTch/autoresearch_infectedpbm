@@ -17,6 +17,13 @@ Validation runs on HELD-OUT TRACKS only (never in-track windows): with ~6 h of
 audio a generative model memorises timbre before it generalises, and in-track
 validation cannot see that (finding_flow_phase_fail).
 
+Generator mode (data.ar_config set): the same model trains as an alternative to
+the AR token model, on the AR stage's own 512-frame aligned crops, style
+descriptors, track ids and in-track val split. Id + style then enter as memory
+tokens by cross-attention (model.cond_mode xattn) and a random clean prefix is
+trained in (model.prefix_max_frac) so sampling can continue a prompt; the
+ab_harness ZFlowGenerator drives it behind the apps' backend picker.
+
 Usage:
     uv run python train_zflow.py --build-stats            # PCA stats only
     uv run python train_zflow.py --build-stats --probe-pca  # + k sweep
@@ -26,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import random
 import sys
@@ -44,8 +52,19 @@ REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
 
 from train import EMA, TimeOneCycleLR  # noqa: E402
-from train_ar import RMSNorm, SwiGLU, TrackTokens, apply_rope, rope_cache  # noqa: E402
+from train_ar import (  # noqa: E402
+    ArConfig,
+    RMSNorm,
+    SwiGLU,
+    TokenCropDataset,
+    TrackTokens,
+    ValCropDataset,
+    apply_rope,
+    rope_cache,
+    token_cache_dir,
+)
 from train_ar import DataCfg as ArDataCfg  # noqa: E402
+from train_ar import load_config as load_ar_config  # noqa: E402
 from train_ar import load_token_cache  # noqa: E402
 from train_flow import plan_held_out, timestep_embedding  # noqa: E402
 
@@ -87,6 +106,12 @@ class DataCfg:
     pca_eig_floor: float = 1.0e-4
     style_context_frames: int = 256
     single_track: str | None = None
+    # Path to an AR-stage YAML (train_ar.py). When set, crops, style descriptors,
+    # track ids and the in-track val windows come from the AR datasets verbatim
+    # (TokenCropDataset / ValCropDataset), so the flow trains on exactly the
+    # AR's data and conditionals; crop_frames / held-out / context fields above
+    # are then ignored.
+    ar_config: str | None = None
 
 
 @dataclass
@@ -105,6 +130,19 @@ class ModelCfg:
     # null embedding, so the unconditional branch CFG needs is actually trained.
     p_drop_style: float = 0.2
     rope_theta: float = 10000.0
+    # "adaln": t + style summed into the adaLN vector (legacy checkpoints).
+    # "xattn": t alone drives adaLN; track id + style are memory tokens every
+    # block cross-attends to, each with a learned null for CFG dropout.
+    cond_mode: str = "adaln"
+    # Track-id vocabulary for cond_mode xattn (0 = id stream always null). Filled
+    # from the token-cache manifest at build time when data.ar_config is set.
+    num_tracks: int = 0
+    # xattn only: independent drop probability of the id and the style token.
+    p_drop_cond: float = 0.5
+    # Prefix conditioning: a random leading fraction of each crop, up to this,
+    # is given clean (unnoised) with an is-prefix input channel, and excluded
+    # from the loss. 0 disables it (and the extra channel), as legacy runs had.
+    prefix_max_frac: float = 0.0
 
 
 @dataclass
@@ -417,14 +455,32 @@ class LatentStats:
         return cls(blob["mean"], blob["basis"], blob["eigvals"], dims, eig_floor)
 
 
+def ar_config(cfg: ZFlowConfig) -> ArConfig | None:
+    """
+    Args:
+      cfg (ZFlowConfig): full config.
+
+    Returns:
+      ArConfig | None: the AR-stage config named by data.ar_config, if any.
+    """
+    if cfg.data.ar_config is None:
+        return None
+    path = Path(cfg.data.ar_config).expanduser()
+    return load_ar_config(path if path.is_absolute() else REPO / path)
+
+
 def cache_dir(cfg: ZFlowConfig) -> Path:
     """
     Args:
       cfg (ZFlowConfig): full config.
 
     Returns:
-      Path: the token cache directory.
+      Path: the token cache directory (the AR config's when data.ar_config is
+        set, so both stages read the very same tokens and descriptors).
     """
+    ar_cfg = ar_config(cfg)
+    if ar_cfg is not None:
+        return token_cache_dir(ar_cfg)
     return Path(cfg.tokenizer.token_cache).expanduser()
 
 
@@ -436,6 +492,9 @@ def stats_path(cfg: ZFlowConfig) -> Path:
     Returns:
       Path: where the PCA stats for this split live, inside the token cache.
     """
+    if cfg.data.ar_config is not None:
+        # AR split holds out in-track windows, not tracks: every track trains.
+        return cache_dir(cfg) / "zflow_pca_ar.pt"
     tag = f"seed{cfg.data.split_seed}_ho{cfg.data.held_out_tracks}"
     if cfg.data.single_track:
         tag += "_single"
@@ -451,17 +510,36 @@ def load_corpus(cfg: ZFlowConfig) -> tuple[list[TrackTokens], list[int], torch.T
 
     Returns:
       tuple[list[TrackTokens], list[int], torch.Tensor]: all tracks, held-out
-        track indices, and (R, N, C) codebooks.
+        track indices (empty in AR mode, whose split is in-track windows), and
+        (R, N, C) codebooks.
     """
     root = cache_dir(cfg)
-    tracks, manifest = load_token_cache(
-        root, ArDataCfg(single_track=cfg.data.single_track)
-    )
-    held = plan_held_out(manifest["tracks"], cfg.data)  # type: ignore[arg-type]
-    if cfg.data.single_track:
-        held = []
+    ar_cfg = ar_config(cfg)
+    if ar_cfg is not None:
+        tracks, _ = load_token_cache(root, ar_cfg.data)
+        held: list[int] = []
+    else:
+        tracks, manifest = load_token_cache(
+            root, ArDataCfg(single_track=cfg.data.single_track)
+        )
+        held = plan_held_out(manifest["tracks"], cfg.data)  # type: ignore[arg-type]
+        if cfg.data.single_track:
+            held = []
     codebooks = torch.load(root / "codebooks.pt", map_location="cpu", weights_only=True)
     return tracks, held, codebooks.float()
+
+
+def manifest_num_tracks(cfg: ZFlowConfig) -> int:
+    """
+    Args:
+      cfg (ZFlowConfig): full config.
+
+    Returns:
+      int: track-id vocabulary size, as the AR stage sizes its embedding
+        (train_ar.build_model): the manifest's track count.
+    """
+    manifest = json.loads((cache_dir(cfg) / "_manifest.json").read_text())
+    return len(manifest["tracks"])
 
 
 def build_latent_stats(cfg: ZFlowConfig, force: bool = False) -> Path:
@@ -683,6 +761,13 @@ def build_dataloaders(
     Returns:
       tuple[DataLoader, DataLoader]: train and validation loaders.
     """
+    ar_cfg = ar_config(cfg)
+    if ar_cfg is not None:
+        if ar_cfg.data.crop_frames % cfg.model.patch:
+            raise ValueError("AR crop_frames must be a multiple of model.patch")
+        return ar_dataloaders(
+            ar_cfg, tracks, cfg.train.batch_size, cfg.train.num_workers
+        )
     train_tracks = [t for t in tracks if t.track_idx not in held]
     val_tracks = [t for t in tracks if t.track_idx in held]
     if not val_tracks:
@@ -693,18 +778,56 @@ def build_dataloaders(
     )
     train_ds.set_length(cfg.data.steps_per_epoch * cfg.train.batch_size)
     val_ds = ValLatentDataset(val_tracks, cfg.data, cfg.model.patch)
+    return loaders(train_ds, val_ds, cfg.train.batch_size, cfg.train.num_workers)
+
+
+def ar_dataloaders(
+    ar_cfg: ArConfig, tracks: list[TrackTokens], batch_size: int, num_workers: int
+) -> tuple[DataLoader, DataLoader]:
+    """
+    The AR stage's own loaders: aligned grid-slice crops with their own
+    descriptor and track id, and in-track held-out windows for validation --
+    the identical data and conditionals train_ar.py trains on.
+
+    Args:
+      ar_cfg (ArConfig): the AR-stage config.
+      tracks (list[TrackTokens]): the token cache.
+      batch_size (int): items per batch.
+      num_workers (int): loader workers.
+
+    Returns:
+      tuple[DataLoader, DataLoader]: train and validation loaders.
+    """
+    train_ds = TokenCropDataset(
+        tracks, ar_cfg.data, ar_cfg.data.steps_per_epoch * batch_size
+    )
+    val_ds = ValCropDataset(tracks, ar_cfg.data)
+    return loaders(train_ds, val_ds, batch_size, num_workers)
+
+
+def loaders(
+    train_ds: Dataset, val_ds: Dataset, batch_size: int, num_workers: int
+) -> tuple[DataLoader, DataLoader]:
+    """
+    Args:
+      train_ds (Dataset): random-crop dataset.
+      val_ds (Dataset): fixed validation dataset.
+      batch_size (int): items per batch.
+      num_workers (int): loader workers for training.
+
+    Returns:
+      tuple[DataLoader, DataLoader]: train and validation loaders.
+    """
     train_loader = DataLoader(
         train_ds,
-        batch_size=cfg.train.batch_size,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=cfg.train.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=cfg.train.num_workers > 0,
+        persistent_workers=num_workers > 0,
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=cfg.train.batch_size, shuffle=False, num_workers=0
-    )
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
     return train_loader, val_loader
 
 
@@ -775,19 +898,155 @@ class Attention(nn.Module):
         return self.proj(out.transpose(1, 2).reshape(batch, length, -1))
 
 
+class CrossAttention(nn.Module):
+    """
+    Multi-head attention from the sequence to a short conditioning memory.
+
+    Queries come from the sequence, keys/values from the memory tokens; no
+    positional code on either side (the memory is a set). The output projection
+    is zero-initialised so a fresh block ignores its memory until trained.
+
+    Args:
+      d_model (int): model width.
+      n_heads (int): heads; d_model must divide evenly.
+      dropout (float): attention dropout during training.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+        super().__init__()
+        if d_model % n_heads:
+            raise ValueError("d_model must be divisible by n_heads")
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.dropout = dropout
+        self.q = nn.Linear(d_model, d_model, bias=False)
+        self.kv = nn.Linear(d_model, 2 * d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        nn.init.zeros_(self.proj.weight)
+
+    def forward(self, x: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+          x (torch.Tensor): (B, L, D) queries.
+          memory (torch.Tensor): (B, M, D) conditioning tokens.
+
+        Returns:
+          torch.Tensor: (B, L, D) output.
+        """
+        batch, length, _ = x.shape
+        q = self.q(x).reshape(batch, length, self.n_heads, self.head_dim)
+        k, v = (
+            self.kv(memory).reshape(batch, -1, 2, self.n_heads, self.head_dim).unbind(2)
+        )
+        q = self.q_norm(q).transpose(1, 2)
+        k = self.k_norm(k).transpose(1, 2)
+        out = F.scaled_dot_product_attention(
+            q, k, v.transpose(1, 2), dropout_p=self.dropout if self.training else 0.0
+        )
+        return self.proj(out.transpose(1, 2).reshape(batch, length, -1))
+
+
+class CondMemory(nn.Module):
+    """
+    Track id + style descriptor as two memory tokens for cross-attention.
+
+    Each stream has a learned null (id index `num_tracks`, `null_style`) that
+    replaces it when dropped, so classifier-free guidance has a trained
+    unconditional branch per stream -- the AR stage's scheme (train_ar.py
+    ArTransformer.conditioning) in memory-token form.
+
+    Args:
+      d_model (int): model width.
+      num_tracks (int): id vocabulary; 0 leaves only the null id.
+      style_dim (int): style descriptor width.
+      bottleneck (int): style projection inner width.
+    """
+
+    def __init__(
+        self, d_model: int, num_tracks: int, style_dim: int, bottleneck: int
+    ) -> None:
+        super().__init__()
+        self.num_tracks = num_tracks
+        self.track_emb = nn.Embedding(num_tracks + 1, d_model)
+        self.style_mlp = nn.Sequential(
+            nn.Linear(style_dim, bottleneck, bias=False),
+            nn.SiLU(),
+            nn.Linear(bottleneck, d_model),
+        )
+        self.null_style = nn.Parameter(torch.zeros(d_model))
+
+    @property
+    def null_id(self) -> int:
+        """Embedding row standing for "no track id"."""
+        return self.num_tracks
+
+    def forward(
+        self,
+        track_idx: torch.Tensor | None,
+        style: torch.Tensor | None,
+        drop_id: torch.Tensor | None = None,
+        drop_style: torch.Tensor | None = None,
+        batch: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+          track_idx (torch.Tensor | None): (B,) int64 ids; None = all null.
+          style (torch.Tensor | None): (B, style_dim) descriptors; None = null.
+          drop_id (torch.Tensor | None): (B,) bool, True nulls that sample's id.
+          drop_style (torch.Tensor | None): (B,) bool, same for the style.
+          batch (int | None): batch size when both inputs are None.
+
+        Returns:
+          torch.Tensor: (B, 2, D) memory tokens [id, style].
+        """
+        ref = track_idx if track_idx is not None else style
+        if ref is None:
+            if batch is None:
+                raise ValueError("batch is required when no conditioning is given")
+            size, device = batch, self.null_style.device
+        else:
+            size, device = ref.shape[0], ref.device
+        ids = (
+            torch.full((size,), self.null_id, dtype=torch.int64, device=device)
+            if track_idx is None
+            else track_idx.clone()
+        )
+        if drop_id is not None:
+            ids = torch.where(drop_id, torch.full_like(ids, self.null_id), ids)
+        null = self.null_style.unsqueeze(0).expand(size, -1)
+        if style is None:
+            s = null
+        else:
+            s = self.style_mlp(style)
+            if drop_style is not None:
+                s = torch.where(drop_style.unsqueeze(1), null, s)
+        return torch.stack([self.track_emb(ids), s], dim=1)
+
+
 class DiTBlock(nn.Module):
     """
     Pre-norm transformer block with adaLN-Zero conditioning.
+
+    With `xattn` a cross-attention sublayer over a conditioning memory sits
+    between self-attention and the MLP, ungated (its projection starts at zero).
 
     Args:
       d_model (int): model width.
       n_heads (int): attention heads.
       mlp_hidden (int): SwiGLU inner width.
       dropout (float): dropout on attention weights and residual branches.
+      xattn (bool): build the cross-attention sublayer.
     """
 
     def __init__(
-        self, d_model: int, n_heads: int, mlp_hidden: int, dropout: float
+        self,
+        d_model: int,
+        n_heads: int,
+        mlp_hidden: int,
+        dropout: float,
+        xattn: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False)
@@ -798,9 +1057,18 @@ class DiTBlock(nn.Module):
         self.ada = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 6 * d_model))
         nn.init.zeros_(self.ada[1].weight)
         nn.init.zeros_(self.ada[1].bias)
+        self.xattn: CrossAttention | None = None
+        if xattn:
+            self.norm_x = nn.LayerNorm(d_model, elementwise_affine=False)
+            self.xattn = CrossAttention(d_model, n_heads, dropout)
 
     def forward(
-        self, x: torch.Tensor, c: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        memory: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -808,6 +1076,7 @@ class DiTBlock(nn.Module):
           c (torch.Tensor): (B, D) conditioning vector.
           cos (torch.Tensor): (L, Dh // 2) rotary cosines.
           sin (torch.Tensor): (L, Dh // 2) rotary sines.
+          memory (torch.Tensor | None): (B, M, D) tokens for cross-attention.
 
         Returns:
           torch.Tensor: (B, L, D) tokens.
@@ -816,6 +1085,10 @@ class DiTBlock(nn.Module):
         x = x + g1.unsqueeze(1) * self.drop(
             self.attn(modulate(self.norm1(x), sh1, sc1), cos, sin)
         )
+        if self.xattn is not None:
+            if memory is None:
+                raise ValueError("xattn block needs a conditioning memory")
+            x = x + self.drop(self.xattn(self.norm_x(x), memory))
         x = x + g2.unsqueeze(1) * self.drop(self.mlp(modulate(self.norm2(x), sh2, sc2)))
         return x
 
@@ -824,9 +1097,11 @@ class LatentDiT(nn.Module):
     """
     1-D DiT predicting the flow velocity of a whitened latent sequence.
 
-    Frames are grouped `patch` at a time into one token; the time and style
-    conditioning enter every block through adaLN-Zero, so an untrained network
-    outputs exactly zero.
+    Frames are grouped `patch` at a time into one token; the time conditioning
+    enters every block through adaLN-Zero, so an untrained network outputs
+    exactly zero. Style (and track id) join either the adaLN vector
+    (cond_mode "adaln") or a memory each block cross-attends to ("xattn").
+    With prefix training on, an is-prefix channel rides along the latent.
 
     Args:
       cfg (ModelCfg): geometry.
@@ -836,22 +1111,35 @@ class LatentDiT(nn.Module):
 
     def __init__(self, cfg: ModelCfg, in_dim: int, style_dim: int) -> None:
         super().__init__()
+        if cfg.cond_mode not in ("adaln", "xattn"):
+            raise ValueError(f"unknown cond_mode {cfg.cond_mode!r}")
         self.cfg = cfg
         self.in_dim = in_dim
+        self.prefix = cfg.prefix_max_frac > 0.0
         d = cfg.d_model
-        self.in_proj = nn.Linear(in_dim * cfg.patch, d)
+        self.in_proj = nn.Linear((in_dim + int(self.prefix)) * cfg.patch, d)
         self.t_mlp = nn.Sequential(
             nn.Linear(cfg.t_embed_dim, d), nn.SiLU(), nn.Linear(d, d)
         )
-        self.style_mlp = nn.Sequential(
-            nn.Linear(style_dim, cfg.style_bottleneck),
-            nn.SiLU(),
-            nn.Linear(cfg.style_bottleneck, d),
-        )
-        self.null_style = nn.Parameter(torch.zeros(d))
+        self.memory: CondMemory | None = None
+        if cfg.cond_mode == "xattn":
+            self.memory = CondMemory(d, cfg.num_tracks, style_dim, cfg.style_bottleneck)
+        else:
+            self.style_mlp = nn.Sequential(
+                nn.Linear(style_dim, cfg.style_bottleneck),
+                nn.SiLU(),
+                nn.Linear(cfg.style_bottleneck, d),
+            )
+            self.null_style = nn.Parameter(torch.zeros(d))
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(d, cfg.n_heads, cfg.mlp_hidden, cfg.dropout)
+                DiTBlock(
+                    d,
+                    cfg.n_heads,
+                    cfg.mlp_hidden,
+                    cfg.dropout,
+                    xattn=self.memory is not None,
+                )
                 for _ in range(cfg.n_layers)
             ]
         )
@@ -888,6 +1176,8 @@ class LatentDiT(nn.Module):
         self, t: torch.Tensor, style: torch.Tensor | None, drop: torch.Tensor | None
     ) -> torch.Tensor:
         """
+        The adaLN vector: time, plus the style stream in cond_mode "adaln".
+
         Args:
           t (torch.Tensor): (B,) flow times.
           style (torch.Tensor | None): (B, style_dim) descriptors; None = all null.
@@ -898,6 +1188,8 @@ class LatentDiT(nn.Module):
           torch.Tensor: (B, D) conditioning vector.
         """
         c = self.t_mlp(timestep_embedding(t, self.cfg.t_embed_dim))
+        if self.memory is not None:
+            return c
         null = self.null_style.unsqueeze(0).expand(c.shape[0], -1)
         if style is None:
             return c + null
@@ -912,6 +1204,9 @@ class LatentDiT(nn.Module):
         t: torch.Tensor,
         style: torch.Tensor | None = None,
         drop: torch.Tensor | None = None,
+        track_idx: torch.Tensor | None = None,
+        drop_id: torch.Tensor | None = None,
+        prefix_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -919,6 +1214,10 @@ class LatentDiT(nn.Module):
           t (torch.Tensor): (B,) flow times in [0, 1].
           style (torch.Tensor | None): (B, style_dim) descriptors.
           drop (torch.Tensor | None): (B,) bool style-drop mask.
+          track_idx (torch.Tensor | None): (B,) int64 ids (xattn only).
+          drop_id (torch.Tensor | None): (B,) bool id-drop mask (xattn only).
+          prefix_mask (torch.Tensor | None): (B, T) bool, True on frames given
+            clean; required (may be all False) when prefix training is on.
 
         Returns:
           torch.Tensor: (B, in_dim, T) predicted velocity.
@@ -927,11 +1226,20 @@ class LatentDiT(nn.Module):
         patch = self.cfg.patch
         if frames % patch:
             raise ValueError(f"frames {frames} not divisible by patch {patch}")
-        h = self.in_proj(x.transpose(1, 2).reshape(batch, frames // patch, dim * patch))
+        if self.prefix:
+            if prefix_mask is None:
+                prefix_mask = torch.zeros(
+                    batch, frames, dtype=torch.bool, device=x.device
+                )
+            x = torch.cat([x, prefix_mask.unsqueeze(1).to(x.dtype)], dim=1)
+        h = self.in_proj(x.transpose(1, 2).reshape(batch, frames // patch, -1))
         c = self.condition(t, style, drop)
+        memory = None
+        if self.memory is not None:
+            memory = self.memory(track_idx, style, drop_id, drop, batch=batch)
         cos, sin = self.rope(h.shape[1], h.device)
         for block in self.blocks:
-            h = block(h, c, cos, sin)
+            h = block(h, c, cos, sin, memory)
         shift, scale = self.ada_out(c).chunk(2, dim=-1)
         h = self.out_proj(modulate(self.norm_out(h), shift, scale))
         return h.reshape(batch, frames, dim).transpose(1, 2)
@@ -986,6 +1294,43 @@ def apply_ema(net: nn.Module, ckpt: dict[str, Any]) -> bool:
     return False
 
 
+@dataclass
+class Prepared:
+    """
+    One loader batch turned into what the flow trains on.
+
+    Args:
+      x1 (torch.Tensor): (B, dims, T) whitened crop latent.
+      style (torch.Tensor): (B, C) unit-norm style descriptors.
+      tokens (torch.Tensor): (B, T, R) source tokens of the crop.
+      track_idx (torch.Tensor | None): (B,) int64 ids; None outside AR mode.
+      score_mask (torch.Tensor): (B, T) bool, frames that count in the loss.
+    """
+
+    x1: torch.Tensor
+    style: torch.Tensor
+    tokens: torch.Tensor
+    track_idx: torch.Tensor | None
+    score_mask: torch.Tensor
+
+
+def clamp_prefix(
+    x: torch.Tensor, prefix: torch.Tensor | None, prefix_mask: torch.Tensor | None
+) -> torch.Tensor:
+    """
+    Args:
+      x (torch.Tensor): (B, D, T) iterate.
+      prefix (torch.Tensor | None): (B, D, T) clean latent to hold on the prefix.
+      prefix_mask (torch.Tensor | None): (B, T) bool, True where held.
+
+    Returns:
+      torch.Tensor: (B, D, T) x with the prefix frames replaced.
+    """
+    if prefix is None or prefix_mask is None:
+        return x
+    return torch.where(prefix_mask.unsqueeze(1), prefix, x)
+
+
 class ZFlowModule(L.LightningModule):
     """
     Rectified flow between Gaussian noise and the whitened latent.
@@ -1029,28 +1374,67 @@ class ZFlowModule(L.LightningModule):
 
     # ------------------------------------------------------------------ data
 
-    def prepare(
-        self, batch: dict[str, torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def prepare(self, batch: dict[str, Any]) -> Prepared:
         """
-        Tokens -> whitened crop latent, style descriptor and source tokens.
+        Tokens -> whitened crop latent, conditionals and source tokens.
+
+        Two item layouts: LatentCropDataset items {"tokens": (B, crop + 2*ctx,
+        R), "valid": (B, crop + 2*ctx)} whose descriptor is computed here, and
+        AR-stage items (train_ar.TokenCropDataset) {"tokens": (B, crop, R),
+        "style": (B, C), "track_idx": (B,), "score_mask": (B, crop)} whose
+        descriptor and id come ready-made.
 
         Args:
-          batch (dict[str, torch.Tensor]): {"tokens": (B, crop + 2*ctx, R),
-            "valid": (B, crop + 2*ctx)}.
+          batch (dict[str, Any]): loader batch in either layout.
 
         Returns:
-          tuple[torch.Tensor, torch.Tensor, torch.Tensor]: x1 (B, dims, crop),
-            style (B, C), crop tokens (B, crop, R).
+          Prepared: latent, conditionals and tokens of the crop.
         """
-        tokens, valid = batch["tokens"], batch["valid"]
+        tokens = batch["tokens"]
+        if "valid" not in batch:
+            z = embed_zq(tokens, self.codebooks)  # type: ignore[arg-type]
+            return Prepared(
+                x1=self.stats.whiten(z.transpose(1, 2)),
+                style=batch["style"].float(),
+                tokens=tokens,
+                track_idx=batch["track_idx"].long(),
+                score_mask=batch["score_mask"].bool(),
+            )
+        valid = batch["valid"]
         ctx = self.cfg.data.style_context_frames
         crop = tokens.shape[1] - 2 * ctx
         z = embed_zq(tokens, self.codebooks)  # type: ignore[arg-type]
         style = style_vector(z, valid)
         crop_tokens = tokens[:, ctx : ctx + crop]
         x1 = self.stats.whiten(z[:, ctx : ctx + crop].transpose(1, 2))
-        return x1, style, crop_tokens
+        return Prepared(
+            x1=x1,
+            style=style,
+            tokens=crop_tokens,
+            track_idx=None,
+            score_mask=torch.ones(
+                crop_tokens.shape[:2], dtype=torch.bool, device=x1.device
+            ),
+        )
+
+    def draw_prefix(
+        self, batch: int, frames: int, device: torch.device
+    ) -> torch.Tensor:
+        """
+        Random clean-prefix lengths for training, patch-aligned.
+
+        Args:
+          batch (int): samples.
+          frames (int): crop length.
+          device (torch.device): target device.
+
+        Returns:
+          torch.Tensor: (B, frames) bool, True on the frames given clean.
+        """
+        patch = self.cfg.model.patch
+        longest = int(self.cfg.model.prefix_max_frac * frames) // patch
+        lengths = torch.randint(0, longest + 1, (batch,), device=device) * patch
+        return torch.arange(frames, device=device).unsqueeze(0) < lengths.unsqueeze(1)
 
     # ------------------------------------------------------------------ flow
 
@@ -1095,36 +1479,55 @@ class ZFlowModule(L.LightningModule):
         x: torch.Tensor,
         t: torch.Tensor,
         style: torch.Tensor | None,
-        cfg_scale: float = 1.0,
+        cfg_scale: float | torch.Tensor = 1.0,
+        track_idx: torch.Tensor | None = None,
+        prefix_mask: torch.Tensor | None = None,
+        drop_id: torch.Tensor | None = None,
+        drop_style: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Predicted velocity, with classifier-free guidance on the style vector.
+        Predicted velocity, with classifier-free guidance on the conditionals.
 
         Args:
           x (torch.Tensor): (B, D, T) iterate.
           t (torch.Tensor): (B,) times.
           style (torch.Tensor | None): (B, C) descriptors; None = unconditional.
-          cfg_scale (float): 1 = conditional only; w > 1 extrapolates
-            v_u + w * (v_c - v_u).
+          cfg_scale (float | torch.Tensor): 1 = conditional only; w > 1
+            extrapolates v_u + w * (v_c - v_u), the null branch dropping id
+            AND style. A (B,) tensor guides each lane by its own strength.
+          track_idx (torch.Tensor | None): (B,) ids (xattn models).
+          prefix_mask (torch.Tensor | None): (B, T) clean-prefix flags.
+          drop_id (torch.Tensor | None): (B,) lanes whose id is nulled even
+            in the conditional branch.
+          drop_style (torch.Tensor | None): (B,) same for the style.
 
         Returns:
           torch.Tensor: (B, D, T) velocity.
         """
-        if style is None or cfg_scale == 1.0:
-            return self.net(x, t, style)
+        plain = isinstance(cfg_scale, float) and cfg_scale == 1.0
+        if plain or (style is None and track_idx is None):
+            return self.net(x, t, style, drop_style, track_idx, drop_id, prefix_mask)
+        keep_id = torch.zeros_like(t, dtype=torch.bool) if drop_id is None else drop_id
+        keep_st = (
+            torch.zeros_like(t, dtype=torch.bool) if drop_style is None else drop_style
+        )
+        drop = torch.ones_like(t, dtype=torch.bool)
         both = self.net(
             torch.cat([x, x]),
             torch.cat([t, t]),
-            torch.cat([style, style]),
-            torch.cat(
-                [
-                    torch.zeros_like(t, dtype=torch.bool),
-                    torch.ones_like(t, dtype=torch.bool),
-                ]
-            ),
+            None if style is None else torch.cat([style, style]),
+            torch.cat([keep_st, drop]),
+            None if track_idx is None else torch.cat([track_idx, track_idx]),
+            torch.cat([keep_id, drop]),
+            None if prefix_mask is None else torch.cat([prefix_mask, prefix_mask]),
         )
         v_c, v_u = both.chunk(2)
-        return v_u + cfg_scale * (v_c - v_u)
+        w = (
+            cfg_scale.reshape(-1, 1, 1)
+            if isinstance(cfg_scale, torch.Tensor)
+            else cfg_scale
+        )
+        return v_u + w * (v_c - v_u)
 
     @torch.no_grad()
     def sample(
@@ -1134,8 +1537,13 @@ class ZFlowModule(L.LightningModule):
         style: torch.Tensor | None = None,
         steps: int | None = None,
         churn: float | None = None,
-        cfg_scale: float | None = None,
+        cfg_scale: float | torch.Tensor | None = None,
         generator: torch.Generator | None = None,
+        track_idx: torch.Tensor | None = None,
+        prefix: torch.Tensor | None = None,
+        prefix_mask: torch.Tensor | None = None,
+        drop_id: torch.Tensor | None = None,
+        drop_style: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Integrate the flow from t_start to 1.
@@ -1145,6 +1553,7 @@ class ZFlowModule(L.LightningModule):
         eps_mix = sqrt(1 - churn^2) * eps_hat + churn * eps_new. churn = 0 is
         exactly the Euler ODE step; churn = 1 re-draws the noise entirely
         (stochastic re-anchoring, every iterate on the training interpolant).
+        Prefix frames are held at their clean value throughout.
 
         Args:
           x (torch.Tensor): (B, D, T) iterate at t_start (pure noise at 0).
@@ -1152,8 +1561,14 @@ class ZFlowModule(L.LightningModule):
           style (torch.Tensor | None): (B, C) descriptors.
           steps (int | None): Euler steps; config default when None.
           churn (float | None): noise re-draw fraction; config default when None.
-          cfg_scale (float | None): guidance; config default when None.
+          cfg_scale (float | torch.Tensor | None): guidance, per lane when a
+            (B,) tensor; config default when None.
           generator (torch.Generator | None): noise source for churn > 0.
+          track_idx (torch.Tensor | None): (B,) ids (xattn models).
+          prefix (torch.Tensor | None): (B, D, T) clean latent for the prefix.
+          prefix_mask (torch.Tensor | None): (B, T) bool, True on prefix frames.
+          drop_id (torch.Tensor | None): (B,) lanes sampling with a null id.
+          drop_style (torch.Tensor | None): (B,) lanes with a null style.
 
         Returns:
           torch.Tensor: (B, D, T) sample at t=1.
@@ -1162,13 +1577,23 @@ class ZFlowModule(L.LightningModule):
         steps = flow.steps if steps is None else steps
         churn = flow.churn if churn is None else churn
         cfg_scale = flow.cfg_scale if cfg_scale is None else cfg_scale
+        x = clamp_prefix(x, prefix, prefix_mask)
         if t_start >= 1.0:
             return x
         grid = torch.linspace(t_start, 1.0, steps + 1, device=x.device)
         batch = x.shape[0]
         for i in range(steps):
             t, t_next = grid[i], grid[i + 1]
-            v = self.velocity(x, t.expand(batch), style, cfg_scale)
+            v = self.velocity(
+                x,
+                t.expand(batch),
+                style,
+                cfg_scale,
+                track_idx,
+                prefix_mask,
+                drop_id,
+                drop_style,
+            )
             x1_hat = x + (1.0 - t) * v
             eps_hat = x - t * v
             if churn > 0.0:
@@ -1176,7 +1601,9 @@ class ZFlowModule(L.LightningModule):
                     x.shape, generator=generator, device=x.device, dtype=x.dtype
                 )
                 eps_hat = math.sqrt(1.0 - churn * churn) * eps_hat + churn * fresh
-            x = (1.0 - t_next) * eps_hat + t_next * x1_hat
+            x = clamp_prefix(
+                (1.0 - t_next) * eps_hat + t_next * x1_hat, prefix, prefix_mask
+            )
         return x
 
     @torch.no_grad()
@@ -1189,6 +1616,7 @@ class ZFlowModule(L.LightningModule):
         churn: float | None = None,
         cfg_scale: float | None = None,
         generator: torch.Generator | None = None,
+        track_idx: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Noise a source latent to t0 = 1 - strength and integrate back to 1.
@@ -1201,6 +1629,7 @@ class ZFlowModule(L.LightningModule):
           churn (float | None): see sample().
           cfg_scale (float | None): see sample().
           generator (torch.Generator | None): noise source.
+          track_idx (torch.Tensor | None): (B,) ids (xattn models).
 
         Returns:
           torch.Tensor: (B, D, T) edited latent.
@@ -1214,30 +1643,46 @@ class ZFlowModule(L.LightningModule):
         x = self.interpolate(
             eps, x_src, torch.full((x_src.shape[0],), t0, device=x_src.device)
         )
-        return self.sample(x, t0, style, steps, churn, cfg_scale, generator)
+        return self.sample(
+            x, t0, style, steps, churn, cfg_scale, generator, track_idx=track_idx
+        )
 
     # ------------------------------------------------------------- training
 
-    def _run(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
+    def _run(self, batch: dict[str, Any], stage: str) -> torch.Tensor:
         """
         Args:
-          batch (dict[str, torch.Tensor]): loader batch.
+          batch (dict[str, Any]): loader batch.
           stage (str): "train" or "val".
 
         Returns:
-          torch.Tensor: () MSE between predicted and true velocity.
+          torch.Tensor: () MSE between predicted and true velocity over the
+            scored, non-prefix frames.
         """
-        x1, style, _ = self.prepare(batch)
+        p = self.prepare(batch)
+        x1 = p.x1
+        batch_size, _, frames = x1.shape
         eps = torch.randn_like(x1)
-        t = self.sample_t(x1.shape[0], x1.device)
+        t = self.sample_t(batch_size, x1.device)
         x_t = self.interpolate(eps, x1, t)
-        drop = None
+        scored = p.score_mask
+        prefix_mask = None
+        if self.net.prefix:
+            prefix_mask = self.draw_prefix(batch_size, frames, x1.device)
+            x_t = clamp_prefix(x_t, x1, prefix_mask)
+            scored = scored & ~prefix_mask
+        drop_style = drop_id = None
         if stage == "train":
-            drop = (
-                torch.rand(x1.shape[0], device=x1.device) < self.cfg.model.p_drop_style
-            )
-        v_hat = self.net(x_t, t, style, drop)
-        loss = F.mse_loss(v_hat, x1 - eps)
+            model = self.cfg.model
+            xattn = self.net.memory is not None
+            p_style = model.p_drop_cond if xattn else model.p_drop_style
+            drop_style = torch.rand(batch_size, device=x1.device) < p_style
+            if xattn:
+                drop_id = torch.rand(batch_size, device=x1.device) < model.p_drop_cond
+        v_hat = self.net(x_t, t, p.style, drop_style, p.track_idx, drop_id, prefix_mask)
+        weight = scored.unsqueeze(1).to(v_hat.dtype)
+        sq = (v_hat - (x1 - eps)).pow(2) * weight
+        loss = sq.sum() / (weight.sum() * x1.shape[1]).clamp_min(1.0)
         on_step = stage == "train"
         self.log(
             f"{stage}/loss",
@@ -1289,10 +1734,13 @@ class ZFlowModule(L.LightningModule):
           batch (dict[str, torch.Tensor]): loader batch.
         """
         n = min(self.cfg.flow.val_samples, batch["tokens"].shape[0])
-        sub = {k: v[:n] for k, v in batch.items()}
-        x1, style, tokens = self.prepare(sub)
+        sub = {k: v[:n] for k, v in batch.items() if isinstance(v, torch.Tensor)}
+        p = self.prepare(sub)
+        x1, style, tokens, ids = p.x1, p.style, p.tokens, p.track_idx
         gen = torch.Generator(device=x1.device).manual_seed(self.cfg.train.seed)
-        edited = self.sdedit(x1, self.cfg.flow.sdedit_strength, style, generator=gen)
+        edited = self.sdedit(
+            x1, self.cfg.flow.sdedit_strength, style, generator=gen, track_idx=ids
+        )
         idx = requantize(self.stats.unwhiten(edited), self.codebooks)  # type: ignore[arg-type]
         agree = (idx == tokens).float().mean(dim=(0, 1))
         for level in range(agree.shape[0]):
@@ -1308,8 +1756,35 @@ class ZFlowModule(L.LightningModule):
             on_epoch=True,
             sync_dist=True,
         )
+        if self.net.prefix:
+            # continuation from a clean quarter: token agreement on the rest is
+            # a weak signal (many valid continuations) but free and monotone
+            frames = x1.shape[2]
+            held = (frames // 4) // self.cfg.model.patch * self.cfg.model.patch
+            mask = torch.arange(frames, device=x1.device).unsqueeze(0) < held
+            mask = mask.expand(x1.shape[0], -1)
+            noise = torch.randn(x1.shape, generator=gen, device=x1.device)
+            cont = self.sample(
+                noise,
+                0.0,
+                style,
+                generator=gen,
+                track_idx=ids,
+                prefix=x1,
+                prefix_mask=mask,
+            )
+            idx = requantize(self.stats.unwhiten(cont), self.codebooks)  # type: ignore[arg-type]
+            agree = ((idx == tokens) & ~mask.unsqueeze(-1)).float().sum(dim=(0, 1))
+            agree = agree / (~mask).sum().clamp_min(1)
+            for level in range(agree.shape[0]):
+                self.log(
+                    f"val/prefix_tok_agree_l{level}",
+                    agree[level],
+                    on_epoch=True,
+                    sync_dist=True,
+                )
         noise = torch.randn(x1.shape, generator=gen, device=x1.device)
-        free = self.sample(noise, 0.0, style, generator=gen)
+        free = self.sample(noise, 0.0, style, generator=gen, track_idx=ids)
         self.log(
             "val/sample_std", free.std(dim=(0, 2)).mean(), on_epoch=True, sync_dist=True
         )
@@ -1463,12 +1938,18 @@ def main() -> None:
     tracks, held, codebooks = load_corpus(cfg)
     stats = LatentStats.load(path, cfg.data.pca_dims, cfg.data.pca_eig_floor)
     train_loader, val_loader = build_dataloaders(cfg, tracks, held)
+    ar_cfg = ar_config(cfg)
+    crop = cfg.data.crop_frames if ar_cfg is None else ar_cfg.data.crop_frames
+    if ar_cfg is not None and cfg.model.cond_mode == "xattn":
+        cfg.model.num_tracks = manifest_num_tracks(cfg)
     module = ZFlowModule(cfg, stats, codebooks)
     params = sum(p.numel() for p in module.net.parameters())
     print(
-        f"tracks {len(tracks)} (held out {held})  crop {cfg.data.crop_frames}f "
-        f"= {cfg.data.crop_frames / 172.265625:.1f} s, {cfg.data.crop_frames // cfg.model.patch} tokens  "
-        f"latent dims {cfg.data.pca_dims}  params {params / 1e6:.1f}M  val crops {len(val_loader.dataset)}"  # type: ignore[arg-type]
+        f"tracks {len(tracks)} (held out {held})  crop {crop}f "
+        f"= {crop / 172.265625:.1f} s, {crop // cfg.model.patch} tokens  "
+        f"latent dims {cfg.data.pca_dims}  cond {cfg.model.cond_mode} "
+        f"ids {cfg.model.num_tracks}  prefix<= {cfg.model.prefix_max_frac}  "
+        f"params {params / 1e6:.1f}M  val crops {len(val_loader.dataset)}"  # type: ignore[arg-type]
     )
     if cfg.train.checkpoint:
         state = torch.load(

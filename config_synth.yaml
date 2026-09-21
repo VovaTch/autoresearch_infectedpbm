@@ -33,6 +33,17 @@ generator:
   # recipe run is newer but has no id rows for its 5 held-out tracks. Only
   # loaded when such a walk is rendered.
   style_ar_checkpoint: saved_style_ar_20260916_all/last.ckpt
+  # Non-AR backends (picked by loading a saved_zflow_* / saved_mdm_* checkpoint,
+  # see ab_harness.checkpoints.backend_of). flow_*: latent-flow Euler steps per
+  # 512-frame window and the noise re-draw fraction; requantize_beam: latent ->
+  # RVQ tokens beam (8 = 99% token agreement, greedy flips 15% of level 0).
+  # mdm_steps: MaskGIT rounds per RVQ level; mdm_choice_temperature: Gumbel
+  # scale on the confidence ranking, annealed to 0 within each level.
+  flow_steps: 32
+  flow_churn: 0.0
+  requantize_beam: 8
+  mdm_steps: [16, 8, 8]
+  mdm_choice_temperature: 4.5
 
 output:
   root: renders_synth

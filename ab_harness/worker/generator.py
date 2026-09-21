@@ -142,6 +142,9 @@ class ArGenerator:
         self.device = device
         self.depth = model.num_rq
         self.pad_id = model.pad_id
+        self.num_tracks = model.num_tracks
+        # aligned frames of context, the SampleSource geometry
+        self.window_frames = window_frames
         # +depth-1 for the delay pattern, +PREFIX_POSITIONS for the conditioning
         self.window = window_frames + self.depth - 1
         self.max_length = self.window + PREFIX_POSITIONS

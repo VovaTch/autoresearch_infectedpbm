@@ -7,11 +7,49 @@ inject fakes and never touch a GPU, an audio device or the filesystem.
 
 from __future__ import annotations
 
-from typing import Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
 from ab_harness.model.types import Clip, ClipSpec, Judgement, Pair, Tier
+
+if TYPE_CHECKING:
+    # Only for the SampleSource signature. Importing torch here for real would
+    # drag it into the UI process, which the process split exists to prevent.
+    import torch
+
+
+@runtime_checkable
+class SampleSource(Protocol):
+    """
+    A generative model over RVQ token grids, whatever its sampling scheme.
+
+    ArGenerator, ZFlowGenerator and MdmGenerator all satisfy this; the worker
+    services pick one by the checkpoint's family (ab_harness.checkpoints) and
+    the layers above never learn which. The four attributes are the geometry
+    the services need for request budgeting and prompt handling.
+    """
+
+    depth: int
+    window_frames: int
+    num_tracks: int
+    pad_id: int
+
+    def sample_batch(
+        self,
+        requests: Sequence[Any],
+        progress: Callable[[int, int], None] | None = None,
+    ) -> list["torch.Tensor"]:
+        """
+        Args:
+          requests (Sequence[Any]): one SampleRequest per clip.
+          progress (Callable[[int, int], None] | None): called with (step, total).
+
+        Returns:
+          list[torch.Tensor]: (T, R) int64 aligned codes per request, on the
+            CPU, prompt frames included.
+        """
+        ...
 
 
 class ClipProducer(Protocol):

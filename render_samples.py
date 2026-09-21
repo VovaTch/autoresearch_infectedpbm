@@ -100,12 +100,12 @@ def _apply_ema(module, ckpt) -> bool:
     return False
 
 
-def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 1024, num_rq: int = 3, num_tokens: int = 2048, time_downsample: int = 1, hidden: int = 1024, ze_norm: str = "none", per_level_codebooks: bool = False):
+def load_module(ckpt_path: str, lp, oc, sc, la, token_dim: int = 1024, num_rq: int = 3, num_tokens: int = 2048, time_downsample: int = 1, hidden: int = 1024, ze_norm: str = "none", per_level_codebooks: bool = False, output_act: str = "none"):
     module = build_module(
         lp, la, oc, sc,
         token_dim=token_dim, num_rq_steps=num_rq, num_tokens=num_tokens,
         time_downsample=time_downsample, hidden=hidden, ze_norm=ze_norm,
-        per_level_codebooks=per_level_codebooks,
+        per_level_codebooks=per_level_codebooks, output_act=output_act,
     )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
@@ -167,10 +167,29 @@ def reconstruct(module, clip: torch.Tensor) -> torch.Tensor:
     return out[:, : clip.shape[1]]
 
 
+def soft_knee(x: torch.Tensor, thr: float = 0.8, ceil: float = 1.0) -> torch.Tensor:
+    """Identity below thr, tanh knee saturating at ceil (full-scale units).
+
+    Args:
+      x (torch.Tensor): waveform (1, L).
+      thr (float): knee start.
+      ceil (float): asymptotic ceiling.
+
+    Returns:
+      torch.Tensor: limited waveform (1, L), |out| < ceil.
+    """
+    head = ceil - thr
+    mag = x.abs()
+    over = mag > thr
+    out = x.clone()
+    out[over] = torch.sign(x[over]) * (thr + head * torch.tanh((mag[over] - thr) / head))
+    return out
+
+
 def loudness_match(
     variants: dict[str, torch.Tensor], ref: torch.Tensor
 ) -> dict[str, torch.Tensor]:
-    """Scale each variant to the reference rms, then apply one shared headroom scale.
+    """Scale each variant to the reference rms, then soft-knee its overshoot.
 
     Peak-normalizing every file independently -- what this script used to do --
     silently biases the comparison: a reconstruction with sparse peak overshoot
@@ -181,19 +200,23 @@ def loudness_match(
     disagreed with the aggregate test metrics for months. A quieter file also
     loses a blind ear A/B for reasons unrelated to fidelity.
 
+    The shared headroom divide that replaced it had the same flaw one step
+    removed (one 2x spike halved the whole group). 2026-09-21: overshoot is
+    ~0.04% of samples, so it is soft-clipped instead (render_fixed.py: cdpam
+    0.029 knee vs 0.139 guard; ear agrees).
+
     Args:
       variants (dict[str, torch.Tensor]): named waveforms (1, L).
       ref (torch.Tensor): reference waveform (1, L) whose rms is the target.
 
     Returns:
-      dict[str, torch.Tensor]: rms-matched waveforms sharing one headroom scale.
+      dict[str, torch.Tensor]: rms-matched, knee-limited waveforms.
     """
     target = ref.pow(2).mean().sqrt()
-    out = {
-        k: v * (target / (v.pow(2).mean().sqrt() + 1e-8)) for k, v in variants.items()
+    return {
+        k: soft_knee(v * (target / (v.pow(2).mean().sqrt() + 1e-8)))
+        for k, v in variants.items()
     }
-    peak = max(float(v.abs().max()) for v in out.values())
-    return {k: v / (peak + 1e-8) for k, v in out.items()}
 
 
 def main():
@@ -230,6 +253,7 @@ def main():
                 hidden=cfg.get("hidden", 1024),
                 ze_norm=cfg.get("ze_norm", "none"),
                 per_level_codebooks=cfg.get("per_level_codebooks", False),
+                output_act=cfg.get("output_act", "none"),
             )
         else:
             print(f"SKIP {tag}: {path} missing")

@@ -594,3 +594,40 @@ def test_new_style_entries_open_with_the_configured_walk(qapp) -> None:
     plain = ControlPanel(UiCfg(style_walk="none"), ["a/one.ckpt"])
     entry = plain.styles.styles()[0]
     assert entry is not None and not entry.walking
+
+
+def test_backend_picker_lists_backends_and_loads_their_newest(qapp) -> None:
+    from slice_synth.config import UiCfg
+    from slice_synth.view.controls import ControlPanel
+
+    panel = ControlPanel(
+        UiCfg(),
+        {
+            "ar": ["saved_ar_a/ar_latest.ckpt"],
+            "zflow": ["saved_zflow_b/zflow_latest.ckpt", "saved_zflow_b/last.ckpt"],
+            "mdm": [],
+        },
+    )
+    picked: list[str] = []
+    panel.checkpoint_picked.connect(picked.append)
+    assert [panel.backends.itemText(i) for i in range(panel.backends.count())] == ["ar", "zflow"]
+    assert panel.backends.isVisibleTo(panel) and panel.checkpoints.count() == 1
+    assert panel.top_p.isEnabled() and panel.temperature.isEnabled()
+
+    panel.backends.setCurrentIndex(1)
+    panel.backends.activated.emit(1)
+    assert picked == ["saved_zflow_b/zflow_latest.ckpt"]
+    assert panel.checkpoints.count() == 2 and not panel.checkpoints.isEnabled()
+    panel.set_checkpoint("saved_zflow_b/zflow_latest.ckpt")
+    assert panel.checkpoints.isEnabled() and panel.backends.isEnabled()
+    # a flow model ignores the token-draw knobs
+    assert not panel.temperature.isEnabled() and not panel.top_k.isEnabled()
+
+    # the worker can land on a checkpoint the panel never listed
+    panel.set_checkpoint("saved_mdm_c/mdm_latest.ckpt")
+    assert panel.backends.currentData() == "zflow"  # no mdm row to move to
+    assert panel.checkpoints.count() == 0
+    assert panel.temperature.isEnabled() and not panel.top_p.isEnabled()
+
+    flat = ControlPanel(UiCfg(), ["saved_ar_a/ar_latest.ckpt"])
+    assert not flat.backends.isVisibleTo(flat) and flat.checkpoints.count() == 1

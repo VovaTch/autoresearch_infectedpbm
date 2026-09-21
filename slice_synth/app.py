@@ -58,7 +58,7 @@ def main() -> int:
     # the transport can be built before the worker has finished loading.
     player = PlayerViewModel(44100, cfg.ui.crossfade_ms)
     vm = SynthViewModel(producer, cfg.output_root)
-    window = MainWindow(vm, player, cfg.ui, cfg.checkpoints)
+    window = MainWindow(vm, player, cfg.ui, cfg.checkpoints_by_backend)
     window.show()
     vm.start()
 

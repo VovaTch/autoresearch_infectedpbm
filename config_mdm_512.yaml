@@ -1,0 +1,65 @@
+# Masked discrete diffusion GENERATOR over the RVQ grid (train_mdm.py),
+# 2026-09-21 -- the second alternative to the AR token model, sibling of
+# config_zflow_512_xattn.yaml and trained on the identical data.
+#
+# Data: the AR stage's aligned 512-frame grid slices with their own style
+# descriptor, track id and in-track held-out windows (data.ar_config). Model:
+# bidirectional transformer over the (512, 3) grid, one token per frame (sum of
+# the three level embeddings), track id + style as cross-attended memory
+# tokens, no adaLN (the mask pattern is the diffusion time).
+#
+# Corruption (SoundStorm): per sample draw level l; levels < l clean, level l
+# masked at cos(pi/2 u), levels > l fully masked; a random clean prefix (up to
+# half the crop) is never masked and never scored. Loss = CE on the masked
+# cells of level l. Sampling: MaskGIT rounds per level, 16 / 8 / 8, confidence
+# = log-prob + annealed Gumbel (choice_temperature 4.5).
+#
+# Pre-registered read-out:
+#   val/loss, val/ce_l{0,1,2}, val/acc_l{0,1,2}   (masked-cell CE / greedy acc)
+#   val/prefix_tok_agree_l0  -> continuation from a clean quarter
+# Then ear: slice_synth.render --checkpoint saved_mdm_512/mdm_latest.ckpt
+#
+# Command (detached, GPU1):
+#   CUDA_VISIBLE_DEVICES=1 setsid nohup uv run python train_mdm.py \
+#     --config config_mdm_512.yaml > logs/train_mdm_512.log 2>&1 &
+
+data:
+  ar_config: config_ar_512_aligned.yaml
+
+model:
+  d_model: 512
+  n_layers: 12
+  n_heads: 8
+  mlp_hidden: 1408
+  dropout: 0.1
+  style_bottleneck: 128
+  rope_theta: 10000.0
+  p_drop_cond: 0.5
+  prefix_max_frac: 0.5
+
+mask:
+  schedule: cosine
+  steps: [16, 8, 8]
+  choice_temperature: 4.5
+  temperature: 1.0
+  top_k: 0
+  top_p: 0.0
+  cfg_scale: 1.0
+  val_samples: 8
+
+train:
+  devices: 1
+  minutes: 480
+  lr: 3.0e-4
+  lr_pct_start: 0.05
+  lr_div_factor: 25.0
+  batch_size: 32          # 64 x 512 frames per optimiser step, as the AR
+  accumulate_grad_batches: 2   # (batch 64 OOMs at 24 GB: the (B,T,3,2048) logits)
+  precision: bf16-mixed
+  weight_decay: 0.01
+  grad_clip: 1.0
+  num_workers: 4
+  ema_decay: 0.999
+  seed: 42
+  save_path: saved_mdm_512/
+  checkpoint: null

@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from ab_harness.viewmodel.player_vm import PlayerViewModel
+from ab_harness.checkpoints import backend_of
 from slice_synth.config import UiCfg
 from slice_synth.model.types import Render
 from slice_synth.view.controls import ControlPanel, _short
@@ -40,7 +41,8 @@ class MainWindow(QMainWindow):
         sides and the flip degenerates to a no-op -- cheaper than a second
         QAudioSink implementation that would drift from the first.
       ui (UiCfg): opening values for the controls.
-      checkpoints (list[str] | None): models offered in the selector.
+      checkpoints (list[str] | dict[str, list[str]] | None): models offered
+        in the selector, flat or per backend.
     """
 
     def __init__(
@@ -48,7 +50,7 @@ class MainWindow(QMainWindow):
         vm: SynthViewModel,
         player: PlayerViewModel,
         ui: UiCfg,
-        checkpoints: list[str] | None = None,
+        checkpoints: list[str] | dict[str, list[str]] | None = None,
     ) -> None:
         super().__init__()
         self.vm = vm
@@ -159,7 +161,8 @@ class MainWindow(QMainWindow):
         """
         self.controls.set_checkpoint(checkpoint)
         self._checkpoint.setText(
-            f"{_short(checkpoint)}{'  (load failed)' if error else ''}"
+            f"{backend_of(checkpoint)} · {_short(checkpoint)}"
+            f"{'  (load failed)' if error else ''}"
         )
 
     def _seek_by(self, seconds: float) -> None:
