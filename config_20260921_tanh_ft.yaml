@@ -1,4 +1,4 @@
-# lvl1_vqgan tokenizer -- bounded-output (tanh) fine-tune from dsteps2_24h.
+# lvl1_vqgan tokenizer -- 24 H bounded-output (tanh) fine-tune from dsteps2_24h.
 #
 # 2026-09-21 question: does the decoder do better owning its output bound than
 # having playback clip it? Post-hoc (render_fixed.py, 6 clips, rms-matched):
@@ -11,13 +11,14 @@
 # vs none-trained, both through the same knee.
 #
 # Warm start = dsteps2_24h last.ckpt (weights load unchanged; only the output
-# nonlinearity is new). Short leg: the decoder tail is the only thing that
-# has to move. Judge on: cdpam/mrstft on test vs dsteps2_24h (0.0970 / 1.127),
+# nonlinearity is new). Full 24 h leg at the continuation peak so the result is
+# comparable to dsteps2_24h on wall clock. Judge on: cdpam/mrstft on test vs dsteps2_24h (0.0970 / 1.127),
 # crest_dB of renders vs ORIG, and ear on renders_limiter clips (any HF hash
 # on loud sustained material = failed compensation).
 #
-# Render with:  OUTPUT_ACT=tanh CKPT=saved_20260921_tanh_ft/lvl1_vqgan_last.ckpt \
-#               uv run python render_fixed.py
+# Verdict = three-way A/B when done (compare_tanh_ft.sh): dsteps2_24h through the
+# old peak guard (== production onnx + guard), dsteps2_24h with ad-hoc tanh (no
+# training), this ckpt with its trained tanh. All rms-matched, same clips.
 # Export with:  --output-act tanh
 
 model:
@@ -52,8 +53,8 @@ gan:
 
 train:
   devices: 1
-  minutes: 180
-  lr: 5.0e-5       # half the continuation peak: compensation is a small move
+  minutes: 1440
+  lr: 1.0e-4       # continuation peak (one-cycle, div 50, pct 0.05)
   lr_pct_start: 0.05
   lr_div_factor: 50
   batch_size: 48

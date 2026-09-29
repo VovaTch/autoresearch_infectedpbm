@@ -1,0 +1,64 @@
+# lvl1_vqgan -- 2 H PAIRED CRITIC-WIDTH A/B, arm disc_width=4.
+#
+# Question (2026-09-23): the critic is 0.336 M against a 73.5 M decoder, a 216x
+# asymmetry that finding_critic_undersized already named as the real limiter.
+# disc_width 4 makes it 5.258 M (15.3x), still 14x under the decoder.
+#
+# Paired design: the two arms differ ONLY in disc_width. Both warm start from
+# dsteps2_24h, both get the same 500 critic-only steps, same lr, same split.
+# prepare.py now seeds random_split independently (split_seed), so the
+# param-count reshuffle that invalidated every previous width A/B is gone --
+# but that also means val/test here are NOT comparable to pre-2026-09-23 runs,
+# which is why the w1 control is re-run rather than read off dsteps2_24h.
+#
+# GPU assignment is deliberate: w4 (treatment) runs on GPU0, w1 (control) on
+# GPU1, because GPU1 has historically scored 0.02-0.03 LOWER cdpam. The
+# asymmetry therefore works against the treatment; a w4 win is conservative.
+#
+# ASYMMETRY TO REMEMBER WHEN READING THIS: w1 inherits the parent's TRAINED
+# critics, w4 changes shape so its critics RE-INIT from scratch. In 2 h a fresh
+# 15x critic is unlikely to fully catch up, so the primary readout is
+# probe_critics.py AUC (is the bigger critic learning to discriminate at all?),
+# with cdpam/mrstft secondary and the generator barely expected to move --
+# the time lever is dead (24 h of tanh-ft moved test cdpam 0.0970 -> 0.0968).
+
+model:
+  hidden: 1024
+  token_dim: 1024
+  num_rq: 3
+  num_tokens: 2048
+  time_downsample: 1
+  ze_norm: none
+  per_level_codebooks: true
+  output_act: none  # tanh lost, 2026-09-23
+
+vq:
+  commit_weight: 0.75
+
+loss:
+  consistency_weight: 2.0
+  periodicity_weight: 10.0
+  spec_mean_weight: 5.0
+
+gan:
+  gan_start_step: 0
+  disc_warmup: 0
+  disc_only_steps: 500   # identical in both arms; w4's critics are fresh
+  disc_clip: per_critic
+  disc_lr_mult: 4.0
+  disc_steps: 2
+  d_weight_cap: 1.0
+  disc_width: 4       # <-- THE ONLY VARIABLE
+  disc_freq_pool: 2
+  disc_stft_resolutions: [[1024, 256], [2048, 512], [512, 128]]
+
+train:
+  devices: 1
+  minutes: 120
+  lr: 5.0e-5
+  lr_pct_start: 0.05
+  lr_div_factor: 50
+  batch_size: 24  # halved from the parent recipe: the 15x critic OOMs at 48; both arms cut together so the pairing holds
+  single_song: null
+  save_path: saved_20260923_critic_w4/
+  checkpoint: saved_20260914_dsteps2_24h/lvl1_vqgan_last.ckpt

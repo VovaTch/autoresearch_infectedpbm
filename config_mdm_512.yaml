@@ -19,8 +19,8 @@
 #   val/prefix_tok_agree_l0  -> continuation from a clean quarter
 # Then ear: slice_synth.render --checkpoint saved_mdm_512/mdm_latest.ckpt
 #
-# Command (detached, GPU1):
-#   CUDA_VISIBLE_DEVICES=1 setsid nohup uv run python train_mdm.py \
+# Command (detached, GPU0):
+#   CUDA_VISIBLE_DEVICES=0 setsid nohup uv run python train_mdm.py \
 #     --config config_mdm_512.yaml > logs/train_mdm_512.log 2>&1 &
 
 data:
@@ -49,7 +49,7 @@ mask:
 
 train:
   devices: 1
-  minutes: 480
+  minutes: 1440
   lr: 3.0e-4
   lr_pct_start: 0.05
   lr_div_factor: 25.0

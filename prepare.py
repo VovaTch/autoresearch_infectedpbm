@@ -63,6 +63,7 @@ class LearningParameters:
     limit_eval_batches: int | float | None = None
     limit_test_batches: int | float | None = None
     pin_memory: bool = True
+    split_seed: int = 1234
 
 
 @dataclass
@@ -360,8 +361,16 @@ class SplitDatasetModule(L.LightningDataModule):
         test_len = int(training_len * self._learning_params.test_split)
         val_len = len(self._dataset) - training_len - test_len  # type: ignore
 
+        # Explicit generator: random_split used to draw from the global RNG,
+        # which model construction has already advanced by an amount that
+        # depends on the PARAMETER COUNT. Any width change therefore reshuffled
+        # the train/val/test partition and silently invalidated the A/B (see the
+        # disc_width confound, 3.8% train-set overlap between arms). Seeding the
+        # split independently makes the partition a property of the data alone.
         self.train_dataset, self.val_dataset, self.test_dataset = random_split(
-            self._dataset, lengths=(training_len, val_len, test_len)
+            self._dataset,
+            lengths=(training_len, val_len, test_len),
+            generator=torch.Generator().manual_seed(self._learning_params.split_seed),
         )
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
