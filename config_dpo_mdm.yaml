@@ -1,0 +1,57 @@
+# DPO of the mdm generator on the A/B bank (train_dpo.py, mdm scorer), 2026-09-30.
+#
+# Every banked pair trains this model, not only the ones it sampled: DPO needs
+# the likelihood of a banked token grid under its conditioning, and ~90% of the
+# pairs are AR clips (off-policy). Scored on 512-frame windows opening with 256
+# clean frames of the clip's own history, as the sampler chained them.
+# log p is the summed log-prob of one level's masked cells, a sequence quantity like the AR's, so beta stays at the AR's 0.1.
+#
+# Commands:
+#   uv run python train_dpo.py --config config_dpo_mdm.yaml --dry-run
+#   uv run python train_dpo.py --config config_dpo_mdm.yaml --smoke
+#   CUDA_VISIBLE_DEVICES=0 setsid nohup uv run python train_dpo.py \
+#     --config config_dpo_mdm.yaml > logs/train_dpo_mdm.log 2>&1 &
+
+pairs:
+  bank_root: ~/.cache/infected_pbm/ab_dsteps2_24h
+  reference_checkpoint: saved_mdm_512/mdm_latest.ckpt
+  restrict_to_reference_checkpoint: false
+  min_anchor_acc: 0.6
+  min_pairs: 200
+  # 5 sessions, one of them 148 of the 231 pairs; seed 1235 holds out two small
+  # ones (39 pairs) instead of the big one (which left 83 to train on).
+  val_frac: 0.4
+  tiers: null
+  split_seed: 1235
+
+dpo:
+  beta: 0.1
+  # bulk self-agreement 0.739 over 23 repeats -> ~15% flipped labels
+  # ((1-e)^2 + e^2 = 0.74); conservative DPO spends part of that.
+  label_smoothing: 0.1
+  sft_weight: 0.0
+  length_normalize: false
+  trainable_blocks: 4
+  cache_ref: false          # stochastic scorer: the reference moves with every draw
+  context_frac: 0.5         # capped at the trained prefix_max_frac
+  disable_dropout: true
+
+train:
+  # A few hundred pairs is a nudge; the time cap and the diversity gate stop
+  # it, and dpo_best.ckpt (val/acc on held-out sessions) is the one to rate.
+  epochs: 30
+  max_hours: 2.0
+  batch_pairs: 8
+  accumulate: 2
+  lr: 1.0e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+  precision: bf16-mixed
+  num_workers: 0
+  seed: 42
+  device: cuda:0
+  save_path: saved_mdm_dpo_<date>/
+  diversity_every: 10
+  diversity_clips: 6
+  diversity_seconds: 10.0
+  diversity_gate: 0.8

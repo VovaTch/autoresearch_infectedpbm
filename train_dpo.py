@@ -1,8 +1,23 @@
 """
-Direct preference optimization of the AR model on A/B judgements.
+Direct preference optimization of a token generator on A/B judgements.
 
 Implements PLAN_generative_stage.md section 7.4 -- rung 5 of the preference
-ladder. Rung 1 (the A/B harness) already emits exactly what this needs: every
+ladder -- for all three backends, picked by the reference checkpoint's family
+(ab_harness.checkpoints.backend_of):
+
+- ar: exact sequence log-probability (the original recipe).
+- zflow: Diffusion-DPO. log p is replaced by the flow-matching ELBO proxy
+  -0.5 ||v_hat - (x1 - eps)||^2 on one (t, eps) draw, shared by both sides of
+  a pair and by policy and reference, so the noise cancels in the margin.
+- mdm: the same with the SoundStorm masked-token CE on one shared corruption.
+
+DPO only needs the likelihood of a banked token grid under its conditioning,
+not the sampler that produced it, so every pair trains every backend (pairs
+drawn from another backend are off-policy, which DPO tolerates). zflow and
+MDM see 512-frame windows: each is scored with the frames before it held
+clean as a prefix, exactly how their samplers chained windows.
+
+Rung 1 (the A/B harness) already emits exactly what this needs: every
 generated clip's tokens are banked as (T, R) int16 next to a reproducible
 ClipSpec, and both sides of a comparison provably share their Conditioning
 (same group_id) and differ only in Sampling.seed. That shared-conditioning
@@ -41,7 +56,8 @@ import json
 import math
 import random
 import time
-from collections import Counter, defaultdict
+from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -50,27 +66,31 @@ from typing import Any, Iterator, Sequence
 import lightning as L
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader, Dataset, Sampler
 
+from ab_harness.config import GeneratorCfg
 from ab_harness.model.bank import ClipBank
 from ab_harness.model.judgement import read_all
-from ab_harness.model.stats import anchor_accuracy, self_agreement
-from ab_harness.model.types import ClipSpec, Judgement, Tier
-from ab_harness.worker.generator import ArGenerator, SampleRequest
-from ab_harness.worker.service import style_vector
-from generate_ar import config_from_ckpt
-from train_ar import (
-    ArConfig,
-    ArTransformer,
-    DataCfg,
-    TrackTokens,
-    _build_section,
-    build_model,
-    load_token_cache,
-    prepare_grid,
+from ab_harness.model.preferences import (
+    PairsCfg,
+    PrefPair,
+    load_preference_pairs,
+    split_by_session,
 )
+from ab_harness.model.protocols import SampleSource
+from ab_harness.model.stats import anchor_accuracy, self_agreement
+from ab_harness.model.types import ClipSpec, Tier
+from ab_harness.worker.generator import ArGenerator, SampleRequest
+from ab_harness.worker.loading import LoadedModel, load_checkpoint
+from ab_harness.worker.mdm_gen import MdmGenerator
+from ab_harness.worker.service import style_vector
+from ab_harness.worker.zflow_gen import ZFlowGenerator
+from train_ar import ArTransformer, TrackTokens, _build_section, prepare_grid
+from train_mdm import MaskedDenoiser, mask_ratio
+from train_zflow import FlowCfg, ZFlowModule, clamp_prefix, embed_zq
 
 REPO = Path(__file__).resolve().parent
 
@@ -78,40 +98,6 @@ REPO = Path(__file__).resolve().parent
 # ===========================================================================
 # Configuration
 # ===========================================================================
-
-
-@dataclass
-class PairsCfg:
-    """
-    Where the preference pairs come from and which ones survive filtering.
-
-    Args:
-      bank_root (str): the A/B bank written by ab_harness.
-      reference_checkpoint (str): the AR checkpoint that is both the policy
-        initialization and the frozen DPO reference.
-      restrict_to_reference_checkpoint (bool): keep only pairs sampled from
-        reference_checkpoint. DPO tolerates off-policy pairs and today this
-        would discard a third of the data, so it defaults off.
-      min_anchor_acc (float): sessions scoring below this on anchor pairs are
-        discarded as fatigued (section 7.6). Sessions with no anchors pass.
-      min_pairs (int): refuse to train below this many usable pairs. Section
-        7.5 puts DPO signal at 200-500 pairs; --min-pairs overrides for smoke
-        runs.
-      val_frac (float): share of *sessions* held out. Splitting by session, not
-        by row, is what makes the held-out number mean "agrees with a listening
-        session it never trained on".
-      tiers (list[str] | None): restrict to some tiers, or None for all.
-      split_seed (int): seed for the session split.
-    """
-
-    bank_root: str = "~/.cache/infected_pbm/ab"
-    reference_checkpoint: str = "saved_ar_20260829_24h/ar_frozen_0829.ckpt"
-    restrict_to_reference_checkpoint: bool = False
-    min_anchor_acc: float = 0.6
-    min_pairs: int = 200
-    val_frac: float = 0.25
-    tiers: list[str] | None = None
-    split_seed: int = 1234
 
 
 @dataclass
@@ -136,7 +122,14 @@ class DpoCfg:
         n_layers for the full-model recipe.
       cache_ref (bool): memoize reference log-probabilities per (item, window).
         The bulk tier fits in one window, so its references are computed once
-        and reused for the rest of the run.
+        and reused for the rest of the run. Ignored by the stochastic
+        (zflow, MDM) scorers, whose reference changes with every noise draw.
+      context_frac (float): share of the window held as clean context before
+        the scored frames, capped at the longest prefix the model was trained
+        with. Without it a 512-frame window over a 516-frame prompt scores
+        nothing, and a later window is scored with no history at all.
+      disable_dropout (bool): keep the policy in eval mode. Dropout makes the
+        policy/reference ratio noisy even at step 0.
     """
 
     beta: float = 0.1
@@ -145,6 +138,8 @@ class DpoCfg:
     length_normalize: bool = False
     trainable_blocks: int = 4
     cache_ref: bool = True
+    context_frac: float = 0.5
+    disable_dropout: bool = True
 
 
 @dataclass
@@ -238,248 +233,6 @@ def load_config(path: str | Path) -> DpoConfig:
 
 
 # ===========================================================================
-# Pair extraction
-# ===========================================================================
-
-
-@dataclass(frozen=True)
-class PrefPair:
-    """
-    One human preference over two clips that share their conditioning.
-
-    Args:
-      pair_id (str): the comparison this came from.
-      session_id (str): rating session, the unit the train/val split uses.
-      tier (Tier): which question was asked.
-      group_id (str): shared conditioning group; equal for both sides by
-        construction (section 7.4).
-      winner (ClipSpec): the chosen clip.
-      loser (ClipSpec): the rejected clip.
-    """
-
-    pair_id: str
-    session_id: str
-    tier: Tier
-    group_id: str
-    winner: ClipSpec
-    loser: ClipSpec
-
-    @property
-    def n_frames(self) -> int:
-        """
-        Returns:
-          int: clip length in tokenizer frames, equal on both sides.
-        """
-        return self.winner.n_frames
-
-
-@dataclass
-class FilterReport:
-    """
-    Why each judgement did or did not become a training pair.
-
-    Args:
-      total (int): judgements read.
-      kept (int): pairs surviving every stage.
-      dropped (Counter[str]): count per drop reason.
-      sessions (dict[str, int]): kept pairs per session.
-      tiers (Counter[str]): kept pairs per tier.
-      failed_sessions (list[str]): sessions discarded on anchor accuracy.
-    """
-
-    total: int = 0
-    kept: int = 0
-    dropped: Counter = field(default_factory=Counter)
-    sessions: dict[str, int] = field(default_factory=dict)
-    tiers: Counter = field(default_factory=Counter)
-    failed_sessions: list[str] = field(default_factory=list)
-
-    def render(self) -> str:
-        """
-        Returns:
-          str: a human-readable summary block.
-        """
-        lines = [f"judgements read      {self.total}"]
-        for reason, count in sorted(self.dropped.items(), key=lambda kv: -kv[1]):
-            lines.append(f"  dropped {reason:<28s} {count}")
-        lines.append(f"usable pairs         {self.kept}")
-        for tier, count in sorted(self.tiers.items()):
-            lines.append(f"  tier {tier:<24s} {count}")
-        for session, count in sorted(self.sessions.items()):
-            lines.append(f"  session {session:<21s} {count}")
-        if self.failed_sessions:
-            lines.append(f"  anchor-failed sessions   {self.failed_sessions}")
-        return "\n".join(lines)
-
-
-def _session_anchor_pass(
-    judgements: Sequence[Judgement], min_acc: float
-) -> tuple[set[str], list[str]]:
-    """
-    Split sessions on anchor accuracy (section 7.6).
-
-    An anchor puts a generation against real tokens, so the reference is the
-    expected winner. A session that fails them was a fatigued session and its
-    other rows are suspect too. Sessions with no anchors cannot be judged and
-    are kept.
-
-    Args:
-      judgements (Sequence[Judgement]): every decision.
-      min_acc (float): minimum share of anchors answered as expected.
-
-    Returns:
-      tuple[set[str], list[str]]: sessions to keep, and those discarded.
-    """
-    by_session: dict[str, list[Judgement]] = defaultdict(list)
-    for judgement in judgements:
-        by_session[judgement.session_id].append(judgement)
-    keep, failed = set(), []
-    for session, rows in by_session.items():
-        correct, total = anchor_accuracy(rows)
-        if total and correct / total < min_acc:
-            failed.append(session)
-        else:
-            keep.add(session)
-    return keep, sorted(failed)
-
-
-def _unordered(judgement: Judgement) -> tuple[str, str]:
-    """
-    Args:
-      judgement (Judgement): a decision.
-
-    Returns:
-      tuple[str, str]: the two item ids, order-independent, so a repeat shown
-        with the sides swapped still matches its original.
-    """
-    return tuple(sorted((judgement.item_left, judgement.item_right)))  # type: ignore[return-value]
-
-
-def load_preference_pairs(
-    bank: ClipBank, cfg: PairsCfg
-) -> tuple[list[PrefPair], FilterReport]:
-    """
-    Turn banked judgements into DPO training pairs.
-
-    Args:
-      bank (ClipBank): the A/B bank.
-      cfg (PairsCfg): filtering settings.
-
-    Returns:
-      tuple[list[PrefPair], FilterReport]: surviving pairs and the audit trail.
-    """
-    judgements = read_all(bank.sessions_dir)
-    report = FilterReport(total=len(judgements))
-    live_sessions, failed = _session_anchor_pass(judgements, cfg.min_anchor_acc)
-    report.failed_sessions = failed
-
-    wanted = {Tier(t) for t in cfg.tiers} if cfg.tiers else None
-
-    # A repeat the rater answered both ways carries no signal, so a comparison
-    # is only usable when every showing of it agreed (section 7.6).
-    verdicts: dict[tuple[str, str], set[str]] = defaultdict(set)
-    for judgement in judgements:
-        if judgement.session_id in live_sessions and judgement.chosen_item_id:
-            verdicts[_unordered(judgement)].add(judgement.chosen_item_id)
-
-    pairs: dict[tuple[str, str], PrefPair] = {}
-    for judgement in judgements:
-        key = _unordered(judgement)
-        if judgement.session_id not in live_sessions:
-            report.dropped["anchor-failed session"] += 1
-            continue
-        if judgement.choice == "tie":
-            report.dropped["tie"] += 1
-            continue
-        if judgement.is_anchor:
-            # The loser of an anchor is real audio, not a policy sample;
-            # training on it is SFT-on-real wearing a DPO costume.
-            report.dropped["anchor pair"] += 1
-            continue
-        if len(verdicts[key]) > 1:
-            report.dropped["contradictory repeat"] += 1
-            continue
-        if key in pairs:
-            report.dropped["consistent repeat"] += 1
-            continue
-        if not (bank.has(judgement.item_left) and bank.has(judgement.item_right)):
-            report.dropped["missing tokens"] += 1
-            continue
-        left, right = bank.spec(judgement.item_left), bank.spec(judgement.item_right)
-        if left.group_id != right.group_id:
-            report.dropped["conditioning differs"] += 1
-            continue
-        if left.n_frames != right.n_frames:
-            report.dropped["length differs"] += 1
-            continue
-        if left.is_reference or right.is_reference:
-            report.dropped["reference clip"] += 1
-            continue
-        if left.conditioning.walking:
-            # The bank keeps a walking clip's tokens but not the descriptors its
-            # later segments were sampled under; scoring it against the first
-            # segment's style alone would train on the wrong conditioning.
-            report.dropped["style walk"] += 1
-            continue
-        if wanted is not None and judgement.tier not in wanted:
-            report.dropped["tier excluded"] += 1
-            continue
-        if cfg.restrict_to_reference_checkpoint and (
-            left.checkpoint != cfg.reference_checkpoint
-            or right.checkpoint != cfg.reference_checkpoint
-        ):
-            report.dropped["off-policy checkpoint"] += 1
-            continue
-        winner = left if judgement.chosen_item_id == left.item_id else right
-        loser = right if winner is left else left
-        pairs[key] = PrefPair(
-            pair_id=judgement.pair_id,
-            session_id=judgement.session_id,
-            tier=judgement.tier,
-            group_id=left.group_id,
-            winner=winner,
-            loser=loser,
-        )
-
-    kept = list(pairs.values())
-    report.kept = len(kept)
-    report.tiers = Counter(str(p.tier) for p in kept)
-    report.sessions = dict(Counter(p.session_id for p in kept))
-    return kept, report
-
-
-def split_by_session(
-    pairs: Sequence[PrefPair], val_frac: float, seed: int
-) -> tuple[list[PrefPair], list[PrefPair]]:
-    """
-    Hold out whole sessions, never individual rows.
-
-    A row-level split leaks: both showings of a repeated comparison, and every
-    pair drawn during one sitting, share the rater's state at that moment.
-
-    Args:
-      pairs (Sequence[PrefPair]): every usable pair.
-      val_frac (float): target share of sessions held out.
-      seed (int): split seed.
-
-    Returns:
-      tuple[list[PrefPair], list[PrefPair]]: train and val pairs. Val is empty
-        when there is only one session, since holding it out leaves nothing to
-        train on.
-    """
-    sessions = sorted({p.session_id for p in pairs})
-    if len(sessions) < 2 or val_frac <= 0:
-        return list(pairs), []
-    rng = random.Random(seed)
-    shuffled = sessions[:]
-    rng.shuffle(shuffled)
-    n_val = max(1, min(len(sessions) - 1, round(val_frac * len(sessions))))
-    held = set(shuffled[:n_val])
-    train = [p for p in pairs if p.session_id not in held]
-    val = [p for p in pairs if p.session_id in held]
-    return train, val
-
-
 # ===========================================================================
 # Dataset
 # ===========================================================================
@@ -496,6 +249,11 @@ class PreferenceDataset(Dataset):
     epoch: scoring them whole would extrapolate rotary positions far past
     anything training saw, which is the same reason the sampler re-primes.
 
+    A window starting after the clip's first frame opens with `context_frames`
+    of the clip's own history, flagged in "prefix" and never scored: that is
+    how the samplers chained windows, and it keeps the scored frames
+    conditioned on what actually preceded them.
+
     Args:
       pairs (Sequence[PrefPair]): the comparisons.
       tracks (dict[int, TrackTokens]): corpus by track index, for style vectors.
@@ -504,6 +262,8 @@ class PreferenceDataset(Dataset):
       seed (int): base seed for window draws.
       fixed_window (bool): always take the first window instead of a random
         one. Validation uses it so the held-out number does not wobble.
+      context_frames (int): clean history held at the head of a window.
+      patch (int): window starts and prefix lengths are multiples of this.
     """
 
     def __init__(
@@ -514,6 +274,8 @@ class PreferenceDataset(Dataset):
         crop_frames: int,
         seed: int = 0,
         fixed_window: bool = False,
+        context_frames: int = 0,
+        patch: int = 1,
     ) -> None:
         self.pairs = list(pairs)
         self.tracks = tracks
@@ -521,6 +283,8 @@ class PreferenceDataset(Dataset):
         self.crop_frames = crop_frames
         self.seed = seed
         self.fixed_window = fixed_window
+        self.patch = max(1, patch)
+        self.context_frames = context_frames - context_frames % self.patch
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -555,12 +319,21 @@ class PreferenceDataset(Dataset):
           index (int): pair index, part of the window seed.
 
         Returns:
-          int: first frame of the scored window, shared by both sides.
+          int: first frame of the scored window, shared by both sides. The
+            earliest start is the one whose context just covers the prompt,
+            so no window is spent on prompt frames nobody scores.
         """
         slack = pair.n_frames - self.crop_frames
-        if slack <= 0 or self.fixed_window:
+        if slack <= 0:
             return 0
-        return random.Random(f"{self.seed}:{self.epoch}:{index}").randrange(slack + 1)
+        top = slack - slack % self.patch
+        prompt = pair.winner.conditioning.prompt_frames
+        low = max(0, prompt - self.context_frames)
+        low = min(top, low + (-low) % self.patch)
+        if self.fixed_window:
+            return low
+        rng = random.Random(f"{self.seed}:{self.epoch}:{index}")
+        return low + rng.randrange((top - low) // self.patch + 1) * self.patch
 
     def _side(self, spec: ClipSpec, start: int, length: int) -> dict[str, Any]:
         """
@@ -570,7 +343,8 @@ class PreferenceDataset(Dataset):
           length (int): frames to score.
 
         Returns:
-          dict[str, Any]: tokens, the score mask and the conditioning tensors.
+          dict[str, Any]: tokens, the score and prefix masks and the
+            conditioning tensors.
         """
         tokens = torch.from_numpy(
             np.asarray(self.bank.tokens(spec.item_id), dtype=np.int64)
@@ -581,13 +355,21 @@ class PreferenceDataset(Dataset):
             window = torch.cat([window, window[-1:].expand(pad, -1)], dim=0)
         # Forced prompt frames are identical on both sides; scoring them would
         # teach a preference for a prefix the model did not choose.
-        absolute = torch.arange(start, start + length)
-        score = absolute >= spec.conditioning.prompt_frames
         cond = spec.conditioning
+        held = (
+            self.context_frames
+            if start > 0
+            else min(cond.prompt_frames, self.context_frames)
+        )
+        held -= held % self.patch
+        prefix = torch.arange(length) < held
+        absolute = torch.arange(start, start + length)
+        score = (absolute >= cond.prompt_frames) & ~prefix
         return {
             "item_id": spec.item_id,
             "tokens": window,
             "score": score,
+            "prefix": prefix,
             "track_idx": torch.tensor(cond.id_track, dtype=torch.long),
             "style": style_vector(self.tracks[cond.style_track], spec).float(),
             "drop_id": torch.tensor(not cond.use_track_id),
@@ -799,27 +581,277 @@ def dpo_loss(
     return loss, metrics
 
 
-def freeze_trunk(model: ArTransformer, trainable_blocks: int) -> tuple[int, int]:
+class PairScorer(ABC):
     """
-    Leave only the top N blocks, the output norm and the heads trainable.
+    Per-backend likelihood of a side under a model: the only thing DPO needs.
+
+    A stochastic scorer estimates log p from one noise draw. `draw` makes it
+    once per batch and the same draw scores winner and loser under policy and
+    reference, so the draw's own variance cancels in the DPO margin (the
+    Diffusion-DPO recipe).
+
+    Attributes:
+      stochastic (bool): scores depend on the draw, so references are never
+        cached.
+      head_names (tuple[str, ...]): output modules of `net` left trainable by
+        freeze_trunk.
+      state_prefix (str): key prefix that makes the policy's state_dict load
+        as the backend's own checkpoint.
+    """
+
+    stochastic: bool = False
+    head_names: tuple[str, ...] = ("norm_out", "heads")
+    state_prefix: str = "model."
+
+    def draw(
+        self, side: dict[str, Any], generator: torch.Generator | None
+    ) -> dict[str, torch.Tensor]:
+        """
+        Args:
+          side (dict[str, Any]): one collated side, for shapes and device.
+          generator (torch.Generator | None): RNG; None = global.
+
+        Returns:
+          dict[str, torch.Tensor]: the noise shared by every score this batch.
+        """
+        return {}
+
+    def net(self, model: nn.Module) -> nn.Module:
+        """
+        Args:
+          model (nn.Module): policy or reference.
+
+        Returns:
+          nn.Module: the transformer holding `blocks` and the heads.
+        """
+        return model
+
+    @abstractmethod
+    def score(
+        self, model: nn.Module, side: dict[str, Any], noise: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+          model (nn.Module): policy or reference.
+          side (dict[str, Any]): one collated side (see PreferenceDataset).
+          noise (dict[str, torch.Tensor]): this batch's draw.
+
+        Returns:
+          tuple[torch.Tensor, torch.Tensor]: (B,) float32 log-likelihood (or
+            its proxy) over scored frames and (B,) float32 scored-unit count.
+        """
+
+
+class ArScorer(PairScorer):
+    """Exact autoregressive log-probability; deterministic."""
+
+    def score(
+        self, model: nn.Module, side: dict[str, Any], noise: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+          model (nn.Module): an ArTransformer.
+          side (dict[str, Any]): one collated side.
+          noise (dict[str, torch.Tensor]): unused.
+
+        Returns:
+          tuple[torch.Tensor, torch.Tensor]: see sequence_logprob.
+        """
+        assert isinstance(model, ArTransformer)
+        return sequence_logprob(model, side)
+
+
+class ZFlowScorer(PairScorer):
+    """
+    Diffusion-DPO proxy for a latent flow: -0.5 x velocity error.
+
+    Rectified-flow training minimizes ||v_hat - (x1 - eps)||^2, a weighted ELBO
+    up to constants that cancel between policy and reference; summing over
+    scored frames and latent dims makes it a sequence-level quantity like the
+    AR's summed log-probability.
 
     Args:
-      model (ArTransformer): the policy.
+      flow (FlowCfg): the checkpoint's t distribution.
+      dims (int): whitened latent width.
+    """
+
+    stochastic = True
+    head_names = ("norm_out", "ada_out", "out_proj")
+    state_prefix = ""
+
+    def __init__(self, flow: FlowCfg, dims: int) -> None:
+        self.flow = flow
+        self.dims = dims
+
+    def draw(
+        self, side: dict[str, Any], generator: torch.Generator | None
+    ) -> dict[str, torch.Tensor]:
+        """
+        Args:
+          side (dict[str, Any]): one collated side.
+          generator (torch.Generator | None): RNG.
+
+        Returns:
+          dict[str, torch.Tensor]: "t" (B,) flow times, "eps" (B, dims, T).
+        """
+        batch, frames = side["tokens"].shape[:2]
+        device = side["tokens"].device
+        flow = self.flow
+        if flow.t_sampling == "logit_normal":
+            normal = torch.randn(batch, generator=generator, device=device)
+            t = torch.sigmoid(normal * flow.t_std + flow.t_mean)
+        else:
+            t = torch.rand(batch, generator=generator, device=device)
+        eps = torch.randn(batch, self.dims, frames, generator=generator, device=device)
+        return {"t": t.clamp(flow.t_eps, 1.0 - flow.t_eps), "eps": eps}
+
+    def net(self, model: nn.Module) -> nn.Module:
+        """
+        Args:
+          model (nn.Module): a ZFlowModule.
+
+        Returns:
+          nn.Module: its LatentDiT.
+        """
+        assert isinstance(model, ZFlowModule)
+        return model.net
+
+    def score(
+        self, model: nn.Module, side: dict[str, Any], noise: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+          model (nn.Module): a ZFlowModule.
+          side (dict[str, Any]): one collated side.
+          noise (dict[str, torch.Tensor]): "t" and "eps" from draw.
+
+        Returns:
+          tuple[torch.Tensor, torch.Tensor]: (B,) -0.5 x summed squared
+            velocity error over scored frames, and (B,) scored elements.
+        """
+        assert isinstance(model, ZFlowModule)
+        z = embed_zq(side["tokens"].long(), model.codebooks)  # type: ignore[arg-type]
+        x1 = model.stats.whiten(z.transpose(1, 2))
+        eps, t = noise["eps"], noise["t"]
+        prefix = side["prefix"].bool()
+        x_t = clamp_prefix(model.interpolate(eps, x1, t), x1, prefix)
+        v_hat = model.net(
+            x_t,
+            t,
+            side["style"].float(),
+            side["drop_style"].bool(),
+            side["track_idx"].long(),
+            side["drop_id"].bool(),
+            prefix if model.net.prefix else None,
+        )
+        weight = side["score"].float()
+        err = (v_hat.float() - (x1 - eps)).pow(2).sum(dim=1)
+        return -0.5 * (err * weight).sum(dim=1), weight.sum(dim=1) * x1.shape[1]
+
+
+class MdmScorer(PairScorer):
+    """
+    Masked-diffusion proxy: log-probability of one level's masked cells.
+
+    One SoundStorm corruption per batch (level l, ratio, cell pattern) is
+    applied identically to both sides; levels above l are fully masked and the
+    prefix is never masked, as in train_mdm.MdmModule.corrupt.
+
+    Args:
+      schedule (str): the checkpoint's mask schedule.
+    """
+
+    stochastic = True
+    state_prefix = "net."
+
+    def __init__(self, schedule: str) -> None:
+        self.schedule = schedule
+
+    def draw(
+        self, side: dict[str, Any], generator: torch.Generator | None
+    ) -> dict[str, torch.Tensor]:
+        """
+        Args:
+          side (dict[str, Any]): one collated side.
+          generator (torch.Generator | None): RNG.
+
+        Returns:
+          dict[str, torch.Tensor]: "level" (B,), "ratio" (B,), "cells" (B, T)
+            uniforms deciding which cells of the level are masked.
+        """
+        batch, frames, levels = side["tokens"].shape
+        device = side["tokens"].device
+        level = torch.randint(0, levels, (batch,), generator=generator, device=device)
+        u = torch.rand(batch, generator=generator, device=device)
+        cells = torch.rand(batch, frames, generator=generator, device=device)
+        return {"level": level, "ratio": mask_ratio(u, self.schedule), "cells": cells}
+
+    def score(
+        self, model: nn.Module, side: dict[str, Any], noise: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+          model (nn.Module): a MaskedDenoiser.
+          side (dict[str, Any]): one collated side.
+          noise (dict[str, torch.Tensor]): the corruption from draw.
+
+        Returns:
+          tuple[torch.Tensor, torch.Tensor]: (B,) summed log-probability of the
+            masked, scored cells of level l, and (B,) their count.
+        """
+        assert isinstance(model, MaskedDenoiser)
+        tokens = side["tokens"].long()
+        batch, frames, levels = tokens.shape
+        level = noise["level"].reshape(-1, 1, 1)
+        at_level = noise["cells"] < noise["ratio"].unsqueeze(1)
+        idx = torch.arange(levels, device=tokens.device).reshape(1, 1, -1)
+        masked = (idx > level) | ((idx == level) & at_level.unsqueeze(-1))
+        masked = masked & ~side["prefix"].bool().unsqueeze(-1)
+        logits = model(
+            torch.where(masked, model.mask_id, tokens),
+            side["track_idx"].long(),
+            side["style"].float(),
+            side["drop_id"].bool(),
+            side["drop_style"].bool(),
+        )
+        pick = level.unsqueeze(-1).expand(-1, frames, 1, logits.shape[-1])
+        chosen = logits.gather(2, pick).squeeze(2).float()
+        truth = tokens.gather(2, level.expand(-1, frames, 1)).squeeze(2)
+        logprob = -F.cross_entropy(
+            chosen.reshape(-1, chosen.shape[-1]), truth.reshape(-1), reduction="none"
+        ).reshape(batch, frames)
+        weight = (at_level & side["score"].bool()).float()
+        return (logprob * weight).sum(dim=1), weight.sum(dim=1)
+
+
+def freeze_trunk(
+    model: nn.Module,
+    trainable_blocks: int,
+    heads: Sequence[str] = ("norm_out", "heads"),
+) -> tuple[int, int]:
+    """
+    Leave only the top N blocks and the output modules trainable.
+
+    Args:
+      model (nn.Module): the policy's transformer, with a `blocks` list.
       trainable_blocks (int): blocks to keep trainable, counted from the top.
         Values at or above the depth train everything.
+      heads (Sequence[str]): attribute names of the output modules.
 
     Returns:
       tuple[int, int]: trainable and total parameter counts.
     """
-    depth = len(model.blocks)
+    blocks = model.blocks
+    assert isinstance(blocks, nn.ModuleList)
+    depth = len(blocks)
     if trainable_blocks < depth:
         for param in model.parameters():
             param.requires_grad_(False)
-        for block in model.blocks[depth - max(0, trainable_blocks) :]:
+        for block in blocks[depth - max(0, trainable_blocks) :]:
             for param in block.parameters():
                 param.requires_grad_(True)
-        for module in (model.norm_out, model.heads):
-            for param in module.parameters():
+        for name in heads:
+            for param in getattr(model, name).parameters():
                 param.requires_grad_(True)
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -836,23 +868,31 @@ class DpoLightningModule(L.LightningModule):
     Policy and frozen reference, scored side by side.
 
     Args:
-      policy (ArTransformer): the model being updated.
-      reference (ArTransformer): a frozen copy of the same checkpoint.
+      policy (nn.Module): the model being updated.
+      reference (nn.Module): a frozen copy of the same checkpoint.
       cfg (DpoConfig): full config.
+      scorer (PairScorer | None): the backend's likelihood; None = AR.
     """
 
     def __init__(
-        self, policy: ArTransformer, reference: ArTransformer, cfg: DpoConfig
+        self,
+        policy: nn.Module,
+        reference: nn.Module,
+        cfg: DpoConfig,
+        scorer: PairScorer | None = None,
     ) -> None:
         super().__init__()
         self.policy = policy
         self.reference = reference.requires_grad_(False).eval()
         self.cfg = cfg
+        self.scorer = scorer if scorer is not None else ArScorer()
+        self.cache_ref = cfg.dpo.cache_ref and not self.scorer.stochastic
         self._ref_cache: dict[tuple[str, int], float] = {}
 
     def train(self, mode: bool = True):  # type: ignore[override]
         """
-        Keep the reference in eval no matter what Lightning does to the module.
+        Keep the reference in eval no matter what Lightning does to the module,
+        and the policy too when dropout is disabled.
 
         Args:
           mode (bool): training mode for the policy.
@@ -862,6 +902,8 @@ class DpoLightningModule(L.LightningModule):
         """
         super().train(mode)
         self.reference.eval()
+        if self.cfg.dpo.disable_dropout:
+            self.policy.eval()
         return self
 
     def _normalize(self, logprob: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
@@ -879,12 +921,15 @@ class DpoLightningModule(L.LightningModule):
         return logprob / counts.clamp(min=1.0)
 
     @torch.no_grad()
-    def _reference_logprob(self, side: dict[str, Any]) -> torch.Tensor:
+    def _reference_logprob(
+        self, side: dict[str, Any], noise: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
         """
         Reference log-probabilities, memoized per (item, window) when enabled.
 
         Args:
           side (dict[str, Any]): one collated side.
+          noise (dict[str, torch.Tensor]): this batch's scorer draw.
 
         Returns:
           torch.Tensor: (B,) reference log-probability, already normalized.
@@ -893,34 +938,56 @@ class DpoLightningModule(L.LightningModule):
             (item, int(start))
             for item, start in zip(side["item_id"], side["start"].tolist())
         ]
-        if self.cfg.dpo.cache_ref and all(k in self._ref_cache for k in keys):
+        if self.cache_ref and all(k in self._ref_cache for k in keys):
             return torch.tensor(
                 [self._ref_cache[k] for k in keys],
                 dtype=torch.float32,
                 device=side["tokens"].device,
             )
-        logprob, counts = sequence_logprob(self.reference, side)
+        logprob, counts = self.scorer.score(self.reference, side, noise)
         value = self._normalize(logprob, counts)
-        if self.cfg.dpo.cache_ref:
+        if self.cache_ref:
             for key, item in zip(keys, value.tolist()):
                 self._ref_cache[key] = item
         return value
 
-    def _step(self, batch: dict[str, Any], stage: str) -> torch.Tensor:
+    def _draw(
+        self, batch: dict[str, Any], stage: str, batch_idx: int
+    ) -> dict[str, torch.Tensor]:
         """
         Args:
           batch (dict[str, Any]): collated pair batch.
           stage (str): "train" or "val".
+          batch_idx (int): index within the epoch; seeds the val draw so the
+            held-out number compares like with like across epochs.
+
+        Returns:
+          dict[str, torch.Tensor]: the scorer's noise for both sides.
+        """
+        generator = None
+        if stage == "val":
+            device = batch["win"]["tokens"].device
+            generator = torch.Generator(device=device)
+            generator.manual_seed(self.cfg.train.seed * 7919 + batch_idx)
+        return self.scorer.draw(batch["win"], generator)
+
+    def _step(self, batch: dict[str, Any], stage: str, batch_idx: int) -> torch.Tensor:
+        """
+        Args:
+          batch (dict[str, Any]): collated pair batch.
+          stage (str): "train" or "val".
+          batch_idx (int): index within the epoch.
 
         Returns:
           torch.Tensor: scalar DPO loss.
         """
-        lp_win, count_win = sequence_logprob(self.policy, batch["win"])
-        lp_lose, count_lose = sequence_logprob(self.policy, batch["lose"])
+        noise = self._draw(batch, stage, batch_idx)
+        lp_win, count_win = self.scorer.score(self.policy, batch["win"], noise)
+        lp_lose, count_lose = self.scorer.score(self.policy, batch["lose"], noise)
         lp_win = self._normalize(lp_win, count_win)
         lp_lose = self._normalize(lp_lose, count_lose)
-        ref_win = self._reference_logprob(batch["win"])
-        ref_lose = self._reference_logprob(batch["lose"])
+        ref_win = self._reference_logprob(batch["win"], noise)
+        ref_lose = self._reference_logprob(batch["lose"], noise)
 
         loss, metrics = dpo_loss(
             lp_win,
@@ -961,7 +1028,7 @@ class DpoLightningModule(L.LightningModule):
         Returns:
           torch.Tensor: training loss.
         """
-        return self._step(batch, "train")
+        return self._step(batch, "train", batch_idx)
 
     def validation_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         """
@@ -973,7 +1040,7 @@ class DpoLightningModule(L.LightningModule):
           torch.Tensor: validation loss. val/acc is the number that matters:
             the share of unseen human calls the policy now agrees with.
         """
-        return self._step(batch, "val")
+        return self._step(batch, "val", batch_idx)
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         """
@@ -1069,7 +1136,7 @@ class DiversityMonitor(L.Callback):
     wins its pair. This callback is the only thing in the run that would notice.
 
     Args:
-      generator (ArGenerator): sampler wrapping the policy being trained.
+      generator (SampleSource): sampler wrapping the policy being trained.
       request (SampleRequest): the conditioning to draw from; seeds are varied.
       clips (int): candidates per probe.
       every (int): steps between probes; 0 disables.
@@ -1080,7 +1147,7 @@ class DiversityMonitor(L.Callback):
 
     def __init__(
         self,
-        generator: ArGenerator,
+        generator: SampleSource,
         request: SampleRequest,
         clips: int = 6,
         every: int = 25,
@@ -1194,26 +1261,35 @@ def asdict_shallow(request: SampleRequest) -> dict[str, Any]:
 # ===========================================================================
 
 
-class ArCheckpointWriter(L.Callback):
+class PolicyCheckpointWriter(L.Callback):
     """
-    Write checkpoints in the ArLightningModule layout, not the DPO one.
+    Write checkpoints in the backend's own layout, not the DPO one.
 
     A plain Lightning save would carry "policy." and "reference." prefixes and a
     second copy of the weights, and nothing downstream could load it. Writing
-    the AR layout instead is what lets the result be sampled by generate_ar.py
-    and rated in the harness that produced the pairs.
+    the reference checkpoint's layout instead -- its hyper_parameters and the
+    policy's state under the backend's key prefix -- is what lets the result be
+    sampled by the harness that produced the pairs. No optimizer state is
+    written, so loaders that prefer EMA weights fall back to these.
 
     Args:
-      save_dir (Path): destination directory.
-      ar_cfg (ArConfig): the config the checkpoint was trained under.
+      save_dir (Path): destination directory; its name must stay in the
+        backend's checkpoint family (saved_dpo_*, saved_zflow_*, saved_mdm_*).
+      hyper_parameters (dict[str, Any]): the reference checkpoint's.
+      state_prefix (str): key prefix of the backend's state_dict.
       monitor (str): validation metric to select the best epoch on.
     """
 
     def __init__(
-        self, save_dir: Path, ar_cfg: ArConfig, monitor: str = "val/acc"
+        self,
+        save_dir: Path,
+        hyper_parameters: dict[str, Any],
+        state_prefix: str = "model.",
+        monitor: str = "val/acc",
     ) -> None:
         self.save_dir = Path(save_dir)
-        self.ar_cfg = ar_cfg
+        self.hyper_parameters = hyper_parameters
+        self.state_prefix = state_prefix
         self.monitor = monitor
         self.best = -float("inf")
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -1232,13 +1308,10 @@ class ArCheckpointWriter(L.Callback):
         torch.save(
             {
                 "state_dict": {
-                    f"model.{k}": v.detach().cpu()
+                    f"{self.state_prefix}{k}": v.detach().cpu()
                     for k, v in module.policy.state_dict().items()
                 },
-                "hyper_parameters": {
-                    "config": asdict(self.ar_cfg),
-                    "shuffle_cond": False,
-                },
+                "hyper_parameters": self.hyper_parameters,
                 "epoch": trainer.current_epoch,
                 "global_step": trainer.global_step,
                 "dpo_config": asdict(module.cfg),
@@ -1278,55 +1351,83 @@ class ArCheckpointWriter(L.Callback):
 # ===========================================================================
 
 
-def load_reference(
-    cfg: DpoConfig,
-) -> tuple[
-    ArTransformer, ArTransformer, ArConfig, dict[int, TrackTokens], dict[str, Any], Path
-]:
+@dataclass
+class PolicyBundle:
     """
-    Build the policy, the frozen reference and the corpus they condition on.
+    Policy, frozen reference and everything scoring them needs.
+
+    Args:
+      policy (nn.Module): the model being trained, wrapped by loaded.generator.
+      reference (nn.Module): a frozen copy of the same checkpoint.
+      scorer (PairScorer): the backend's likelihood.
+      loaded (LoadedModel): the policy's sampler, corpus and manifest.
+      window (int): frames per scored window (the training crop).
+      context (int): clean history frames held at a window's head.
+      patch (int): frame granularity of windows and prefixes.
+      hyper_parameters (dict[str, Any]): the reference checkpoint's.
+    """
+
+    policy: nn.Module
+    reference: nn.Module
+    scorer: PairScorer
+    loaded: LoadedModel
+    window: int
+    context: int
+    patch: int
+    hyper_parameters: dict[str, Any]
+
+
+def load_policy(cfg: DpoConfig) -> PolicyBundle:
+    """
+    Load the reference checkpoint twice -- policy and frozen reference -- with
+    the scorer and window geometry of its backend.
 
     Args:
       cfg (DpoConfig): full config.
 
     Returns:
-      tuple: policy, reference, the checkpoint's ArConfig, tracks by index,
-        the token-cache manifest and the cache directory.
+      PolicyBundle: models, scorer, corpus and geometry.
     """
-    ckpt_path = REPO / cfg.pairs.reference_checkpoint
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    ar_cfg = config_from_ckpt(ckpt)
-
-    cache_root = Path(ar_cfg.tokenizer.cache_root).expanduser()
-    caches = sorted(cache_root.glob("tokens_*"))
-    if not caches:
-        raise FileNotFoundError(f"no token cache under {cache_root}")
-    cache_dir = caches[-1]
-    # single_track would hide most of the corpus, and specs reference all of it
-    data_cfg = DataCfg(**{**vars(ar_cfg.data), "single_track": None})
-    tracks, manifest = load_token_cache(cache_dir, data_cfg)
-
-    state = {
-        k[len("model.") :]: v
-        for k, v in ckpt["state_dict"].items()
-        if k.startswith("model.")
-    }
-    models = []
-    for _ in range(2):
-        model = build_model(ar_cfg, tracks, manifest)
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing or unexpected:
-            print(
-                f"  WARN missing={list(missing)[:3]} unexpected={list(unexpected)[:3]}"
-            )
-        models.append(model)
-    return (
-        models[0],
-        models[1],
-        ar_cfg,
-        {t.track_idx: t for t in tracks},
-        manifest,
-        cache_dir,
+    checkpoint = cfg.pairs.reference_checkpoint
+    gen_cfg = GeneratorCfg(device=cfg.train.device, window_frames=1 << 20)
+    loaded = load_checkpoint(checkpoint, gen_cfg)
+    frozen = load_checkpoint(checkpoint, gen_cfg, previous=loaded).generator
+    hyper_parameters = torch.load(
+        REPO / checkpoint, map_location="cpu", mmap=True, weights_only=False
+    )["hyper_parameters"]
+    generator = loaded.generator
+    patch = 1
+    scorer: PairScorer
+    if isinstance(generator, ZFlowGenerator) and isinstance(frozen, ZFlowGenerator):
+        policy, reference = generator.module, frozen.module
+        window = generator.window
+        model = policy.cfg.model
+        scorer = ZFlowScorer(policy.cfg.flow, policy.stats.dims)
+        patch = model.patch
+        longest = int(model.prefix_max_frac * window) if policy.net.prefix else 0
+    elif isinstance(generator, MdmGenerator) and isinstance(frozen, MdmGenerator):
+        policy, reference = generator.net, frozen.net
+        window = generator.window
+        scorer = MdmScorer(generator.mask_cfg.schedule)
+        frac = float(hyper_parameters["cfg"]["model"]["prefix_max_frac"])
+        longest = int(frac * window)
+    elif isinstance(generator, ArGenerator) and isinstance(frozen, ArGenerator):
+        policy, reference = generator.model, frozen.model
+        window = generator.window_frames
+        scorer = ArScorer()
+        longest = window - 1
+    else:
+        raise TypeError(f"no DPO scorer for {type(generator).__name__}")
+    context = min(longest, int(cfg.dpo.context_frac * window))
+    return PolicyBundle(
+        policy=policy,
+        reference=reference,
+        scorer=scorer,
+        loaded=loaded,
+        window=window,
+        context=context - context % patch,
+        patch=patch,
+        hyper_parameters=hyper_parameters,
     )
 
 
@@ -1369,6 +1470,28 @@ def diversity_request(
     )
 
 
+def run_metrics(trainer: L.Trainer, writer: PolicyCheckpointWriter) -> dict[str, float]:
+    """
+    Summarize a finished run for pairs.json, which dpo_round.py and the harness
+    read instead of the tensorboard logs.
+
+    Args:
+      trainer (L.Trainer): the trainer after fit.
+      writer (PolicyCheckpointWriter): holds the best monitored score.
+
+    Returns:
+      dict[str, float]: best/final monitored score, final val loss and epochs run.
+    """
+    final = trainer.callback_metrics
+    out = {"epochs": float(trainer.current_epoch)}
+    if writer.best > -float("inf"):
+        out["best_" + writer.monitor.replace("/", "_")] = writer.best
+    for key in (writer.monitor, "val/loss"):
+        if key in final:
+            out["final_" + key.replace("/", "_")] = float(final[key])
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     """
     Returns:
@@ -1388,6 +1511,10 @@ def parse_args() -> argparse.Namespace:
         "--min-pairs", type=int, default=None, help="override pairs.min_pairs"
     )
     parser.add_argument("--device", default=None, help="override train.device")
+    parser.add_argument("--bank-root", default=None, help="override pairs.bank_root")
+    parser.add_argument(
+        "--save-path", default=None, help="override train.save_path (<date> expands)"
+    )
     return parser.parse_args()
 
 
@@ -1399,6 +1526,10 @@ def main() -> None:
         cfg.pairs.min_pairs = args.min_pairs
     if args.device is not None:
         cfg.train.device = args.device
+    if args.bank_root is not None:
+        cfg.pairs.bank_root = args.bank_root
+    if args.save_path is not None:
+        cfg.train.save_path = args.save_path
     if args.smoke:
         cfg.train.epochs = 1
         cfg.train.batch_pairs = 1
@@ -1436,20 +1567,37 @@ def main() -> None:
             "--min-pairs to override deliberately."
         )
 
-    policy, reference, ar_cfg, tracks, manifest, cache_dir = load_reference(cfg)
-    bank.require_tokenizer(cache_dir.name)
-    trainable, total_params = freeze_trunk(policy, cfg.dpo.trainable_blocks)
+    bundle = load_policy(cfg)
+    loaded, scorer = bundle.loaded, bundle.scorer
+    bank.require_tokenizer(loaded.cache_dir.name)
+    net = scorer.net(bundle.policy)
+    trainable, total_params = freeze_trunk(
+        net, cfg.dpo.trainable_blocks, scorer.head_names
+    )
     print(
-        f"policy {total_params/1e6:.1f}M params, "
+        f"{loaded.backend} policy {total_params/1e6:.1f}M params, "
         f"{trainable/1e6:.1f}M trainable "
-        f"(top {cfg.dpo.trainable_blocks} of {len(policy.blocks)} blocks)"
+        f"(top {cfg.dpo.trainable_blocks} of "
+        f"{len(list(net.get_submodule('blocks').children()))} blocks); "
+        f"window {bundle.window}, context {bundle.context}"
     )
 
-    device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
-    reference.to(device)
+    device = loaded.device
+    tracks = loaded.by_idx
 
-    crop = ar_cfg.data.crop_frames
-    train_set = PreferenceDataset(train_pairs, tracks, bank, crop, seed=cfg.train.seed)
+    def dataset(pairs: list[PrefPair], fixed: bool) -> PreferenceDataset:
+        return PreferenceDataset(
+            pairs,
+            tracks,
+            bank,
+            bundle.window,
+            seed=cfg.train.seed,
+            fixed_window=fixed,
+            context_frames=bundle.context,
+            patch=bundle.patch,
+        )
+
+    train_set = dataset(train_pairs, fixed=False)
     train_sampler = LengthBucketSampler(
         train_set, cfg.train.batch_pairs, shuffle=True, seed=cfg.train.seed
     )
@@ -1462,9 +1610,7 @@ def main() -> None:
         )
     }
     if val_pairs:
-        val_set = PreferenceDataset(
-            val_pairs, tracks, bank, crop, seed=cfg.train.seed, fixed_window=True
-        )
+        val_set = dataset(val_pairs, fixed=True)
         loaders["val_dataloaders"] = DataLoader(
             val_set,
             batch_sampler=LengthBucketSampler(
@@ -1474,27 +1620,31 @@ def main() -> None:
             num_workers=cfg.train.num_workers,
         )
 
-    module = DpoLightningModule(policy, reference, cfg)
+    module = DpoLightningModule(bundle.policy, bundle.reference, cfg, scorer)
     save_dir = REPO / cfg.train.save_path.replace(
         "<date>", date.today().strftime("%Y%m%d")
     )
-    callbacks: list[L.Callback] = [
-        ArCheckpointWriter(save_dir, ar_cfg, "val/acc" if val_pairs else "train/acc")
-    ]
+    writer = PolicyCheckpointWriter(
+        save_dir,
+        bundle.hyper_parameters,
+        scorer.state_prefix,
+        "val/acc" if val_pairs else "train/acc",
+    )
+    callbacks: list[L.Callback] = [writer]
     if cfg.train.diversity_every:
         callbacks.append(
             DiversityMonitor(
-                ArGenerator(policy, device, window_frames=crop),
+                loaded.generator,
                 diversity_request(
                     train_pairs,
                     tracks,
                     cfg.train.diversity_seconds,
-                    float(manifest["tokenizer_meta"]["frames_per_second"]),
+                    loaded.fps,
                 ),
                 clips=cfg.train.diversity_clips,
                 every=cfg.train.diversity_every,
                 gate=cfg.train.diversity_gate,
-                num_tokens=int(manifest["tokenizer_meta"]["num_tokens"]),
+                num_tokens=int(loaded.meta["num_tokens"]),
             )
         )
 
@@ -1536,6 +1686,7 @@ def main() -> None:
                     "kept": report.kept,
                     "dropped": dict(report.dropped),
                 },
+                "metrics": run_metrics(trainer, writer),
             },
             indent=2,
         )

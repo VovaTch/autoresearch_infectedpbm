@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     # drag it into the UI process, which the process split exists to prevent.
     import torch
 
+    from ab_harness.model.auto_train import RoundStatus, TrainEvent
+
 
 @runtime_checkable
 class SampleSource(Protocol):
@@ -183,5 +185,23 @@ class JudgementSink(Protocol):
         """
         Args:
           judgement (Judgement): the decision to persist. Flushed immediately.
+        """
+        ...
+
+
+class RoundTrigger(Protocol):
+    """Launches preference-training rounds as judgements accumulate."""
+
+    def on_rated(self) -> RoundStatus | None:
+        """
+        Returns:
+          RoundStatus | None: a round launched by this judgement, if any.
+        """
+        ...
+
+    def poll(self) -> TrainEvent | None:
+        """
+        Returns:
+          TrainEvent | None: current training status, None while throttled.
         """
         ...

@@ -18,7 +18,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 from ab_harness.model.judgement import utc_now
 from ab_harness.model.pipeline import PairPipeline, WorkItem
-from ab_harness.model.protocols import JudgementSink
+from ab_harness.model.protocols import JudgementSink, RoundTrigger
 from ab_harness.model.types import Choice, Judgement, Pair, Side, Tier
 
 PUMP_MS = 250
@@ -34,6 +34,8 @@ class SessionViewModel(QObject):
       target_lufs (float): loudness both clips were matched to; logged so a
         later change to the target is visible in the data.
       session_id (str | None): identifier, generated when omitted.
+      trainer (RoundTrigger | None): launches DPO rounds as pairs accumulate;
+        None disables automatic training.
       parent (QObject | None): Qt parent.
     """
 
@@ -45,6 +47,8 @@ class SessionViewModel(QObject):
     counts_changed = Signal(int)
     worklist_changed = Signal(list)
     checkpoint_changed = Signal(str, str)
+    training_status = Signal(str)
+    round_finished = Signal(str)
 
     def __init__(
         self,
@@ -52,6 +56,7 @@ class SessionViewModel(QObject):
         sink: JudgementSink,
         target_lufs: float = -23.0,
         session_id: str | None = None,
+        trainer: RoundTrigger | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -59,6 +64,7 @@ class SessionViewModel(QObject):
         self.sink = sink
         self.target_lufs = target_lufs
         self.session_id = session_id or uuid.uuid4().hex[:12]
+        self.trainer = trainer
         self._pair: Pair | None = None
         self._shown_at = 0.0
         self._rated = 0
@@ -119,6 +125,7 @@ class SessionViewModel(QObject):
     def _pump(self) -> None:
         """Keep the queue moving, and pick up a pair if one was being waited on."""
         self._poll_checkpoint()
+        self._poll_training()
         if self._pair is None or self._waiting:
             self.advance()
             return
@@ -174,6 +181,15 @@ class SessionViewModel(QObject):
             # The worker kept the model it had; follow it rather than pretending.
             self.pipeline.set_checkpoint(loaded)
         self.checkpoint_changed.emit(loaded, error)
+
+    def _poll_training(self) -> None:
+        """Publish training progress, and announce a round once it ends."""
+        event = self.trainer.poll() if self.trainer is not None else None
+        if event is None:
+            return
+        self.training_status.emit(event.status)
+        if event.finished is not None:
+            self.round_finished.emit(event.finished.summary())
 
     def _set_waiting(self, value: bool) -> None:
         """
@@ -284,6 +300,8 @@ class SessionViewModel(QObject):
             )
         )
         self.pipeline.mark_rated(spec)
+        if self.trainer is not None and (launched := self.trainer.on_rated()):
+            self.training_status.emit(launched.progress())
         self._rated += 1
         self.counts_changed.emit(self._rated)
         self._pair = None

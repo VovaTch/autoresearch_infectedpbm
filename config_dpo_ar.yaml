@@ -1,0 +1,54 @@
+# DPO of the 512-ctx AR generator on the A/B bank (train_dpo.py, ar scorer), 2026-10-01.
+#
+# The current-tokenizer AR (the one in ab_dsteps2_24h's manifest); config_dpo.yaml
+# still points at the old-tokenizer bank. Same pairs, split and schedule as
+# config_dpo_mdm.yaml, so the three backends of one auto round (dpo_round.py)
+# are comparable. saved_dpo_* keeps it in the AR checkpoint family.
+#
+# Commands:
+#   uv run python train_dpo.py --config config_dpo_ar.yaml --dry-run
+#   uv run python train_dpo.py --config config_dpo_ar.yaml --smoke
+
+pairs:
+  bank_root: ~/.cache/infected_pbm/ab_dsteps2_24h
+  reference_checkpoint: saved_ar_20260915_512_aligned/ar_final.ckpt
+  restrict_to_reference_checkpoint: false
+  min_anchor_acc: 0.6
+  min_pairs: 200
+  # 5 sessions, one of them 148 of the 231 pairs; seed 1235 holds out two small
+  # ones (39 pairs) instead of the big one (which left 83 to train on).
+  val_frac: 0.4
+  tiers: null
+  split_seed: 1235
+
+dpo:
+  beta: 0.1
+  # bulk self-agreement 0.739 over 23 repeats -> ~15% flipped labels
+  # ((1-e)^2 + e^2 = 0.74); conservative DPO spends part of that.
+  label_smoothing: 0.1
+  sft_weight: 0.0
+  length_normalize: false
+  trainable_blocks: 4
+  cache_ref: true           # exact scorer: reference log-probs are fixed per window
+  context_frac: 0.5         # capped at the trained prefix_max_frac
+  disable_dropout: true
+
+train:
+  # A few hundred pairs is a nudge; the time cap and the diversity gate stop
+  # it, and dpo_best.ckpt (val/acc on held-out sessions) is the one to rate.
+  epochs: 30
+  max_hours: 2.0
+  batch_pairs: 8
+  accumulate: 2
+  lr: 1.0e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+  precision: bf16-mixed
+  num_workers: 0
+  seed: 42
+  device: cuda:0
+  save_path: saved_dpo_<date>/
+  diversity_every: 10
+  diversity_clips: 6
+  diversity_seconds: 10.0
+  diversity_gate: 0.8

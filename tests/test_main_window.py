@@ -305,4 +305,47 @@ def test_backend_picker_switches_to_that_backends_newest_checkpoint(
 
     # a switch arriving from elsewhere re-homes both selectors
     window._on_checkpoint_changed("saved_ar_x/ar_latest.ckpt", "")
-    assert backends.currentData() == "ar" and combo.currentData() == "saved_ar_x/ar_latest.ckpt"
+    assert (
+        backends.currentData() == "ar"
+        and combo.currentData() == "saved_ar_x/ar_latest.ckpt"
+    )
+
+
+def test_a_finished_dpo_round_adds_its_checkpoints_without_switching(
+    qapp, sampler: PairSampler, bank: ClipBank, fake_sink: FakeSink
+) -> None:
+    from PySide6.QtWidgets import QComboBox
+
+    from ab_harness.view.main_window import MainWindow
+    from ab_harness.viewmodel.player_vm import PlayerViewModel
+
+    pipeline = PairPipeline(
+        sampler, FakeProducer(store=bank), bank, depth=1, structure_live=True
+    )
+    session = SessionViewModel(pipeline, fake_sink)
+    after = {
+        "ar": ["saved_dpo_r01/dpo_latest.ckpt", "ckpt_test"],
+        "zflow": ["saved_zflow_dpo_r01/dpo_latest.ckpt"],
+        "mdm": ["saved_mdm_dpo_r01/dpo_latest.ckpt"],
+    }
+    window = MainWindow(
+        session,
+        PlayerViewModel(),
+        checkpoints={"ar": ["ckpt_test"], "zflow": [], "mdm": []},
+        discover=lambda current: after,
+    )
+    backends = window.findChild(QComboBox, "backends")
+    combo = window.findChild(QComboBox, "checkpoints")
+    assert backends is not None and combo is not None
+    assert backends.count() == 1
+
+    session.round_finished.emit("DPO r1 (331 pairs): ar val acc 0.55")
+    assert [backends.itemText(i) for i in range(backends.count())] == [
+        "ar",
+        "zflow",
+        "mdm",
+    ]
+    assert backends.isVisibleTo(window)
+    assert combo.count() == 2
+    assert combo.currentData() == "ckpt_test"
+    assert session.checkpoint == "ckpt_test"

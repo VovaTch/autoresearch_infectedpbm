@@ -22,7 +22,8 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
-from ab_harness.config import REPO, AbConfig, load_config
+from ab_harness.config import REPO, AbConfig, checkpoint_menus, load_config
+from ab_harness.model.auto_train import AutoTrainer, DetachedLauncher
 from ab_harness.model.bank import ClipBank
 from ab_harness.model.judgement import JudgementLog, read_all
 from ab_harness.model.pair_sampler import PairSampler, TrackInfo, load_corpus
@@ -144,12 +145,20 @@ def main() -> int:
         bank.manifest().get("tokenizer_meta", {}).get("sample_rate", 44100)
     )
     player = PlayerViewModel(sample_rate, cfg.session.crossfade_ms)
-    session = SessionViewModel(pipeline, log, cfg.session.target_lufs, session_id)
+    trainer = (
+        AutoTrainer(bank, cfg.auto_train, DetachedLauncher(bank.root, cfg.auto_train))
+        if cfg.auto_train.enabled
+        else None
+    )
+    session = SessionViewModel(
+        pipeline, log, cfg.session.target_lufs, session_id, trainer=trainer
+    )
     window = MainWindow(
         session,
         player,
         quiet_fill=cfg.session.quiet_fill,
         checkpoints=cfg.checkpoints_by_backend,
+        discover=checkpoint_menus,
     )
     window.show()
     session.start()

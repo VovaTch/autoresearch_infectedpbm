@@ -7,6 +7,8 @@ status, which is what keeps the rating loop testable without a display.
 
 from __future__ import annotations
 
+from typing import Callable
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
@@ -73,6 +75,9 @@ class MainWindow(QMainWindow):
         when more than one backend has something trained. None hides the
         selectors entirely, which is what tests and a repo with nothing
         trained get.
+      discover (Callable[[str], dict[str, list[str]]] | None): rebuilds the
+        per-backend menus around the current checkpoint when a DPO round ends,
+        so its checkpoints become selectable without a restart.
     """
 
     def __init__(
@@ -81,8 +86,10 @@ class MainWindow(QMainWindow):
         player: PlayerViewModel,
         quiet_fill: float = DEFAULT_QUIET_FILL,
         checkpoints: list[str] | dict[str, list[str]] | None = None,
+        discover: Callable[[str], dict[str, list[str]]] | None = None,
     ) -> None:
         super().__init__()
+        self._discover = discover
         self.session = session
         self.player = player
         self.view = RatingView(self, quiet_fill=quiet_fill)
@@ -115,7 +122,10 @@ class MainWindow(QMainWindow):
         self._queue = QLabel("queue 0/0", self)
         self._structure = QLabel("90 s: 0 banked", self)
         self._rejected = QLabel("", self)
+        self._training = QLabel("", self)
+        self._training.setToolTip("automatic DPO rounds (config auto_train)")
         status = QStatusBar(self)
+        status.addPermanentWidget(self._training)
         status.addPermanentWidget(self._rejected)
         status.addPermanentWidget(self._structure)
         status.addPermanentWidget(self._queue)
@@ -143,6 +153,8 @@ class MainWindow(QMainWindow):
         session.counts_changed.connect(lambda n: self._rated.setText(f"{n} rated"))
         session.worklist_changed.connect(self.view.set_worklist)
         session.checkpoint_changed.connect(self._on_checkpoint_changed)
+        session.training_status.connect(self._training.setText)
+        session.round_finished.connect(self._on_round_finished)
 
         player.position_changed.connect(self.view.set_position)
         player.side_changed.connect(self.view.set_active_side)
@@ -202,6 +214,26 @@ class MainWindow(QMainWindow):
             self._checkpoints.setCurrentIndex(index)
         if error and (bar := self.statusBar()) is not None:
             bar.showMessage(f"checkpoint load failed: {error}", 10000)
+
+    def _on_round_finished(self, summary: str) -> None:
+        """
+        Args:
+          summary (str): per-backend outcome of the round; shown, and its
+            checkpoints added to the selectors. Nothing is switched to.
+        """
+        if (bar := self.statusBar()) is not None:
+            bar.showMessage(summary, 60000)
+        if self._discover is None:
+            return
+        current = self.session.checkpoint
+        self._menus = _menus(self._discover(current))
+        for backend in self._menus:
+            if self._backends.findData(backend) < 0 and self._menus[backend]:
+                self._backends.addItem(backend, backend)
+        self._backends.setVisible(self._backends.count() > 1)
+        self._checkpoints.setVisible(True)
+        self._show_backend(backend_of(current))
+        self._checkpoints.setCurrentIndex(max(0, self._checkpoints.findData(current)))
 
     def _on_pair(self, pair: Pair) -> None:
         """

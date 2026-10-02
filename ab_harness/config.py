@@ -27,6 +27,7 @@ from ab_harness.checkpoints import (
     discover_all,
     resolve_checkpoint,
 )
+from ab_harness.model.auto_train import AutoTrainCfg
 from ab_harness.model.pair_sampler import SamplerCfg
 
 REPO = Path(__file__).resolve().parent.parent
@@ -171,12 +172,14 @@ class AbConfig:
       generator (GeneratorCfg): worker settings.
       sampler (SamplerCfg): tier mix and conditioning odds.
       session (SessionCfg): rating-loop settings.
+      auto_train (AutoTrainCfg): automatic DPO rounds every N usable pairs.
     """
 
     bank: BankCfg = field(default_factory=BankCfg)
     generator: GeneratorCfg = field(default_factory=GeneratorCfg)
     sampler: SamplerCfg = field(default_factory=SamplerCfg)
     session: SessionCfg = field(default_factory=SessionCfg)
+    auto_train: AutoTrainCfg = field(default_factory=AutoTrainCfg)
 
     def __post_init__(self) -> None:
         """Resolve an "auto" checkpoint once, so no caller sees the sentinel."""
@@ -252,7 +255,13 @@ def load_config(path: str | Path) -> AbConfig:
       AbConfig: the parsed config.
     """
     raw: dict[str, Any] = yaml.safe_load(Path(path).read_text()) or {}
-    if unknown := set(raw) - {"bank", "generator", "sampler", "session"}:
+    if unknown := set(raw) - {
+        "bank",
+        "generator",
+        "sampler",
+        "session",
+        "auto_train",
+    }:
         raise ValueError(f"unknown config sections: {sorted(unknown)}")
     sampler = _section(SamplerCfg, raw.get("sampler"), "sampler")
     # YAML gives a list where the dataclass wants a tuple
@@ -262,4 +271,5 @@ def load_config(path: str | Path) -> AbConfig:
         generator=_section(GeneratorCfg, raw.get("generator"), "generator"),
         sampler=sampler,
         session=_section(SessionCfg, raw.get("session"), "session"),
+        auto_train=_section(AutoTrainCfg, raw.get("auto_train"), "auto_train"),
     )

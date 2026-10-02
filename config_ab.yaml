@@ -153,3 +153,18 @@ session:
   # the clip above the near-silence floor, a generation is not worth a listen --
   # and at 90 s it is not worth two minutes of one either.
   quiet_fill: 0.25
+
+# Automatic DPO rounds (ab_harness.model.auto_train, dpo_round.py). Every
+# every_pairs new USABLE pairs (the train_dpo filter: no ties, anchors, repeats
+# or style walks), every config below trains in turn on `device`, each from its
+# own fixed base checkpoint on the whole bank -- rounds never chain. Runs
+# detached, so it survives closing the app. The first session on a bank takes
+# the current count as its baseline. Progress in the status bar and
+# <bank>/dpo_rounds/rNN.json; new checkpoints join the selector when a round
+# ends (nothing switches by itself).
+auto_train:
+  enabled: true
+  every_pairs: 100
+  device: cuda:1            # the worker samples on cuda:0
+  configs: [config_dpo_ar.yaml, config_dpo_zflow.yaml, config_dpo_mdm.yaml]
+  poll_s: 5.0

@@ -9,6 +9,7 @@ parameters freezing was supposed to leave alone.
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +21,6 @@ from ab_harness.model.judgement import JudgementLog
 from ab_harness.model.types import ClipSpec, Conditioning, Judgement, Sampling, Tier
 from train_ar import ArConfig, ArTransformer, ModelCfg, prepare_grid
 from train_dpo import (
-    ArCheckpointWriter,
     DpoCfg,
     LengthBucketSampler,
     PairsCfg,
@@ -28,6 +28,9 @@ from train_dpo import (
     collate_pairs,
     dpo_loss,
     freeze_trunk,
+    MdmScorer,
+    PolicyCheckpointWriter,
+    ZFlowScorer,
     load_preference_pairs,
     measure_diversity,
     sequence_logprob,
@@ -580,7 +583,8 @@ def test_the_written_checkpoint_loads_as_an_ar_checkpoint(tmp_path: Path) -> Non
     from train_dpo import DpoConfig, DpoLightningModule
 
     module = DpoLightningModule(_model(), _model(), DpoConfig())
-    writer = ArCheckpointWriter(tmp_path, ArConfig())
+    hparams = {"config": asdict(ArConfig()), "shuffle_cond": False}
+    writer = PolicyCheckpointWriter(tmp_path, hparams)
 
     class _Trainer:
         current_epoch = 3
@@ -598,3 +602,123 @@ def test_the_written_checkpoint_loads_as_an_ar_checkpoint(tmp_path: Path) -> Non
     missing, unexpected = _model().load_state_dict(state, strict=True)
     assert not missing and not unexpected
     assert ckpt["dpo_config"]["dpo"]["beta"] == DpoCfg().beta
+
+
+# -- windowed backends (zflow, MDM) ------------------------------------------
+
+
+def _pair(frames: int, prompt: int) -> list[object]:
+    """
+    Args:
+      frames (int): clip length.
+      prompt (int): forced prefix frames.
+
+    Returns:
+      list[object]: one PrefPair over gen_a / gen_b with those geometries.
+    """
+    from train_dpo import PrefPair
+
+    return [
+        PrefPair(
+            pair_id="p1",
+            session_id="s1",
+            tier=Tier.BULK,
+            group_id="g0",
+            winner=_spec("gen_a", frames=frames, prompt=prompt),
+            loser=_spec("gen_b", frames=frames, prompt=prompt),
+        )
+    ]
+
+
+def test_a_later_window_opens_with_unscored_clean_context(
+    loaded_bank: ClipBank,
+) -> None:
+    for seed in range(8):
+        dataset = PreferenceDataset(
+            _pair(frames=12, prompt=5),  # type: ignore[arg-type]
+            _tracks(),
+            loaded_bank,
+            crop_frames=6,
+            seed=seed,
+            context_frames=3,
+            patch=2,
+        )
+        side = dataset[0]["win"]
+        start = int(side["start"])
+        # context rounds to the patch; the prompt is covered by it
+        assert start % 2 == 0 and 5 - 2 <= start <= 6
+        assert torch.equal(side["prefix"], torch.arange(6) < 2)
+        expected = (torch.arange(start, start + 6) >= 5) & ~side["prefix"]
+        assert torch.equal(side["score"], expected)
+
+
+def test_the_fixed_window_is_the_first_one_that_scores_anything(
+    loaded_bank: ClipBank,
+) -> None:
+    dataset = PreferenceDataset(
+        _pair(frames=12, prompt=5),  # type: ignore[arg-type]
+        _tracks(),
+        loaded_bank,
+        crop_frames=6,
+        fixed_window=True,
+        context_frames=2,
+        patch=2,
+    )
+    side = dataset[0]["win"]
+    assert int(side["start"]) == 4
+    assert side["score"].any()
+
+
+def _windowed_side(frames: int, prefix: int, style_dim: int) -> dict[str, object]:
+    """
+    Args:
+      frames (int): window length.
+      prefix (int): clean frames at its head.
+      style_dim (int): descriptor width.
+
+    Returns:
+      dict[str, object]: a collated one-pair side with a prefix.
+    """
+    held = (torch.arange(frames) < prefix).unsqueeze(0)
+    return {
+        "tokens": torch.randint(0, 32, (1, frames, 3)),
+        "score": ~held,
+        "prefix": held,
+        "track_idx": torch.tensor([1]),
+        "style": torch.nn.functional.normalize(torch.randn(1, style_dim), dim=-1),
+        "drop_id": torch.tensor([False]),
+        "drop_style": torch.tensor([False]),
+    }
+
+
+def test_mdm_scores_only_masked_cells_of_the_drawn_level() -> None:
+    from tests.test_mdm import DIM, tiny_module
+
+    net = tiny_module(prefix_max_frac=0.5).net.eval()
+    side = _windowed_side(frames=8, prefix=2, style_dim=DIM)
+    scorer = MdmScorer("cosine")
+    noise = scorer.draw(side, torch.Generator().manual_seed(0))
+    noise["ratio"] = torch.ones(1)  # every cell of the level masked
+
+    logprob, count = scorer.score(net, side, noise)
+    again, _ = scorer.score(net, side, noise)
+
+    assert count.item() == 6  # the two prefix frames are never scored
+    assert logprob.item() < 0 and torch.equal(logprob, again)
+
+
+def test_zflow_score_is_deterministic_given_the_draw_and_ignores_the_prefix() -> None:
+    from tests.test_zflow import DIM, tiny_module
+
+    module = tiny_module(cond_mode="xattn", prefix_max_frac=0.5, num_tracks=4)
+    module = module.eval()
+    torch.nn.init.normal_(module.net.out_proj.weight, std=0.1)  # nonzero output
+    side = _windowed_side(frames=8, prefix=2, style_dim=DIM)
+    scorer = ZFlowScorer(module.cfg.flow, module.stats.dims)
+    noise = scorer.draw(side, torch.Generator().manual_seed(0))
+
+    logprob, count = scorer.score(module, side, noise)
+    again, _ = scorer.score(module, side, noise)
+
+    assert count.item() == 6 * module.stats.dims
+    assert logprob.item() < 0 and torch.equal(logprob, again)
